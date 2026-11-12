@@ -3176,15 +3176,16 @@ after_locate:
   }
   {
     char *q = rep->line2;
-    uint32_t v = (rep->reading_e6 + 5U) / 10U; /* liters * 100, rounded */
-    uint32_t lit = v / 100U;
-    uint32_t frac = v % 100U;
+    /* reading_e6 is millionths of a m3, i.e. milliliters; 3 decimal liters */
+    uint32_t v = rep->reading_e6;
+    uint32_t lit = v / 1000U;
+    uint32_t frac = v % 1000U;
     int nd = 1;
     uint32_t t = lit;
     while (t >= 10U) { t /= 10U; nd++; }
     q = put_n(q, lit, nd);
     *q++ = '.';
-    q = put_n(q, frac, 2);
+    q = put_n(q, frac, 3);
     *q++ = ' ';
     *q++ = 'L';
     *q = 0;

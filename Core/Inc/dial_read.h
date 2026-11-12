@@ -99,10 +99,10 @@ typedef struct
   uint8_t  n_dials;              /* valid dials                            */
   uint8_t  n_scale_bad;
   dial_info_t dial[DIAL_MAX_FOUND];
-  uint32_t reading_e6;           /* 714889 -> 0.714889 m3, shown as 714.89 L */
+  uint32_t reading_e6;           /* 714889 -> 0.714889 m3, shown as 714.889 L */
   dial_time_t ts;
   char     line1[56];            /* "2026-11-11 11:28:50 [007]    5234 ms  10" */
-  char     line2[24];            /* "714.89 L"                              */
+  char     line2[24];            /* "714.889 L"                             */
   char     line3[16];            /* "5234 ms" interval, empty if first     */
   uint32_t interval_ms;          /* this stamp minus previous, 0 if first  */
   char     ts_name[20];          /* "20261110_172939"                      */
