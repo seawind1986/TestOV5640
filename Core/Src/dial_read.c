@@ -2101,6 +2101,33 @@ static void paint_live_dials(uint16_t *fb, uint16_t w, uint16_t h, const dial_re
       live_plot_w(fb, (int)((rx + 128) >> 8), (int)((ry + 128) >> 8),
                   LIVE_CIRC, 3, (int)w, (int)h, seam, mode);
     }
+    /* ticks: from inside the face, extended well past the rim for alignment */
+    {
+      const dial_ovl_t *ov = &rep->ovl[i];
+      int k, nt = (int)ov->n_tick;
+      for (k = 0; k < nt; k++)
+      {
+        int is_maj, tw;
+        int32_t rin, rout, ix, iy, ox, oy, irx, iry, orx, ory;
+        if (ov->keep[k] == 0U) { continue; }
+        is_maj = ((ov->allow_half == 0U) || ((k % 2) == (int)ov->major_base)) ? 1 : 0;
+        rin = (int32_t)(((int64_t)d->r_q8 * (is_maj ? 84 : 90)) / 100);
+        rout = (int32_t)(((int64_t)d->r_q8 * (is_maj ? 124 : 114)) / 100);
+        c = cos_mdeg(ov->tick_mdeg[k]);
+        s = sin_mdeg(ov->tick_mdeg[k]);
+        ix = ray_q8(d->cx_q8, rin, c);
+        iy = ray_q8(d->cy_q8, rin, s);
+        ox = ray_q8(d->cx_q8, rout, c);
+        oy = ray_q8(d->cy_q8, rout, s);
+        inv_rectify_q8(ix, iy, &irx, &iry);
+        inv_rectify_q8(ox, oy, &orx, &ory);
+        tw = is_maj ? 3 : 2;
+        live_line(fb,
+                  (int)((irx + 128) >> 8), (int)((iry + 128) >> 8),
+                  (int)((orx + 128) >> 8), (int)((ory + 128) >> 8),
+                  LIVE_CIRC, tw, (int)w, (int)h, seam, mode);
+      }
+    }
     live_line(fb, x0, y0, x1, y1, LIVE_PTR, 3, (int)w, (int)h, seam, mode);
     live_plot_w(fb, x0, y0, LIVE_PTR, 7, (int)w, (int)h, seam, mode);
     live_plot_w(fb, x1, y1, LIVE_PTR, 5, (int)w, (int)h, seam, mode);
@@ -2549,6 +2576,28 @@ static int track_complete(const dial_report_t *rep, int nd)
     seen |= (1 << pl);
   }
   return (seen == ((1 << (int)DIAL_COUNT_CFG) - 1)) ? 1 : 0;
+}
+
+
+static void report_copy_ticks(dial_report_t *rep, const dial_geo_t *geo, int nd)
+{
+  int i, k;
+  memset(rep->ovl, 0, sizeof(rep->ovl));
+  if (nd < 0) { nd = 0; }
+  if (nd > (int)DIAL_MAX_FOUND) { nd = (int)DIAL_MAX_FOUND; }
+  for (i = 0; i < nd; i++)
+  {
+    int n = geo[i].T.n_tick ? geo[i].T.n_tick : N_TICK;
+    if (n > (int)DIAL_MAX_TICK) { n = (int)DIAL_MAX_TICK; }
+    rep->ovl[i].n_tick = (uint8_t)n;
+    rep->ovl[i].allow_half = (uint8_t)(geo[i].T.allow_half ? 1 : 0);
+    rep->ovl[i].major_base = (uint8_t)geo[i].T.major_base;
+    for (k = 0; k < n; k++)
+    {
+      rep->ovl[i].tick_mdeg[k] = geo[i].T.tick[k];
+      rep->ovl[i].keep[k] = geo[i].T.keep[k];
+    }
+  }
 }
 
 static void track_save(const dial_report_t *rep, const dial_geo_t *geo, int nd)
@@ -3210,6 +3259,7 @@ after_locate:
   /* Cache a complete 4-dial constellation. Boundary rules may still
    * mark AMBIG afterwards; the printed geometry stays usable. */
   track_save(rep, geo, nd);
+  report_copy_ticks(rep, geo, nd);
   if (rep->n_scale_bad) { rep->suspect_flags |= DIAL_SUS_SCALE; }
   if (nd != (int)DIAL_COUNT_CFG) { rep->suspect_flags |= DIAL_SUS_COUNT; }
   {

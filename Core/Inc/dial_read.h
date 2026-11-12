@@ -32,6 +32,7 @@
 #define DIAL_COUNT_CFG      4U      /* configured number of pointer dials           */
 #endif
 #define DIAL_MAX_FOUND      8U      /* pointer candidates examined                   */
+#define DIAL_MAX_TICK      20U      /* 10 majors, or 20 if x0.0001 has halves        */
 #define DIAL_MAX_BLOBS      16U
 
 /* seam restore: -1 = auto detect, 0 = off, >0 = fixed column (260 on the 17:29 frame) */
@@ -90,6 +91,15 @@ typedef struct
 
 typedef struct
 {
+  int32_t tick_mdeg[DIAL_MAX_TICK]; /* recognised tick angles, milli-degree */
+  uint8_t keep[DIAL_MAX_TICK];      /* 1 = draw this tick                  */
+  uint8_t n_tick;
+  uint8_t allow_half;
+  uint8_t major_base;
+} dial_ovl_t;
+
+typedef struct
+{
   int      status;               /* DIAL_OK / DIAL_SUSPECT / error         */
   uint32_t suspect_flags;
   uint8_t  ambig_places;         /* bit i: place i was ambiguous           */
@@ -109,6 +119,7 @@ typedef struct
   char     ts_name[20];          /* "20261110_172939"                      */
   uint8_t  track_mode;           /* 0 = full keyframe, 1 = fast track      */
   uint16_t track_fb;             /* 0=fast ok; else fallback code after ms */
+  dial_ovl_t ovl[DIAL_MAX_FOUND]; /* live tick overlay; not used for reading */
 } dial_report_t;
 
 /* work area needed for a w x h RGB565 frame (about 4.6 MB for 1024x600) */
@@ -133,7 +144,7 @@ void DialOrder_Reset(void);
 int  DialOrder_Feed(const dial_report_t *rep, uint32_t t_ms);
 int  DialOrder_Finish(dial_cal_t *cal_out, uint8_t *n_out);
 
-/* Paint timestamp, reading, recognised rims and pointer lines onto a live frame. */
+/* Paint timestamp, reading, rims, ticks (extended past the rim) and pointer lines. */
 void DialRead_PaintHud(uint16_t *fb, uint16_t w, uint16_t h, const dial_report_t *rep);
 
 /* hooks: weak defaults in dial_read.c, override in the board port */
