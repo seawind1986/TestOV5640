@@ -787,7 +787,13 @@ static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_
   }
   if (run_n > best_n) { best_n = run_n; best_s = run_s; }
   if (best_n > 360) { best_n = 360; }
-  if (best_n < ARC_SEED_MIN) { return -1; }
+  {
+    int x = hx >> 8, y = hy >> 8, near_edge, seed_min;
+    near_edge = ((x < 130) || (y < 130) ||
+                 (x > (int32_t)s_w - 130) || (y > (int32_t)s_h - 130));
+    seed_min = near_edge ? 24 : ARC_SEED_MIN;
+    if (best_n < seed_min) { return -1; }
+  }
   nseed = best_n;
   for (i = 0; i < nseed; i++)
   {
@@ -796,7 +802,13 @@ static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_
     s_seed[i].y = ray_q8(hy, s_rr[aa] * 256, sin_deg(aa));
   }
   if (kasa_fit(s_seed, nseed, &cx, &cy, &R) != 0) { return -1; }
-  if (circle_ss(s_seed, nseed, cx, cy, R) * 100 > (int64_t)ARC_SEED_RMS2_X100 * nseed * 65536) { return -1; }
+  {
+    int x = hx >> 8, y = hy >> 8, near_edge, rms100;
+    near_edge = ((x < 130) || (y < 130) ||
+                 (x > (int32_t)s_w - 130) || (y > (int32_t)s_h - 130));
+    rms100 = near_edge ? 250 : (int)ARC_SEED_RMS2_X100; /* 1.58 px vs 1.2 */
+    if (circle_ss(s_seed, nseed, cx, cy, R) * 100 > (int64_t)rms100 * nseed * 65536) { return -1; }
+  }
   {
     int32_t seed_cx = cx, seed_cy = cy, seed_R = R;
     int a_end = (atan2_mdeg(s_seed[nseed - 1].y - cy, s_seed[nseed - 1].x - cx) + 500) / 1000;
@@ -2622,10 +2634,23 @@ typedef struct
 
 static track_t s_track;
 
+/* Last successful rim for each place. Used when arc_circle fails
+ * (x0.1 sits near the right edge and the fit is intermittent). */
+typedef struct
+{
+  uint8_t valid;
+  uint8_t cov;
+  int16_t hx, hy;
+  int32_t cx, cy, R;
+} rim_cache_t;
+static rim_cache_t s_rim[4];
+
 void DialRead_ResetTrack(void)
 {
+  int i;
   s_track.valid = 0U;
   s_track.n = 0U;
+  for (i = 0; i < 4; i++) { s_rim[i].valid = 0U; }
 }
 
 static int track_complete(const dial_report_t *rep, int nd)
@@ -3415,20 +3440,38 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
              (int)hx, (int)hy, Wf, Df, s_arc_white, s_arc_t_strong, s_arc_contrast);
 #endif
     }
-    if ((arc_circle(cx0, cy0, &cx, &cy, &R, &cov) != 0) || (R < R_MIN_Q8) || (R > R_MAX_Q8))
-    {
-      rep->n_scale_bad++;
-      dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), (int16_t)hx, (int16_t)hy, bl[b].area, dtm,
-               dbg_place_of(b, hx, hy, cx0, cy0), DIAL_FAIL_ARC, 0U, 0U);
-      continue;
-    }
-    /* place from the rigidly shifted calibration (never left/right) */
+    /* place first, so a failed rim fit can reuse that place's last circle */
     di->place = (b < (int)DIAL_MAX_BLOBS) ? s_blob_place[b] : (int8_t)-1;
     if (di->place < 0)
     {
       int place_guess = match_cal((int32_t)hx * 256, (int32_t)hy * 256);
       if (place_guess < 0) { place_guess = match_cal(cx0, cy0); }
       di->place = (int8_t)place_guess;
+    }
+    if ((arc_circle(cx0, cy0, &cx, &cy, &R, &cov) != 0) || (R < R_MIN_Q8) || (R > R_MAX_Q8))
+    {
+      int used = 0;
+      int pl = (int)di->place;
+      if ((pl >= 0) && (pl < 4) && (s_rim[pl].valid != 0U))
+      {
+        int32_t dx = (int32_t)hx * 256 - (int32_t)s_rim[pl].hx * 256;
+        int32_t dy = (int32_t)hy * 256 - (int32_t)s_rim[pl].hy * 256;
+        if ((iabs32(dx) <= 24 * 256) && (iabs32(dy) <= 24 * 256))
+        {
+          cx = s_rim[pl].cx + dx;
+          cy = s_rim[pl].cy + dy;
+          R = s_rim[pl].R;
+          cov = (int)s_rim[pl].cov;
+          used = 1;
+        }
+      }
+      if (!used)
+      {
+        rep->n_scale_bad++;
+        dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), (int16_t)hx, (int16_t)hy, bl[b].area, dtm,
+                 (int8_t)di->place, DIAL_FAIL_ARC, 0U, 0U);
+        continue;
+      }
     }
     /* 6 pointer first: pang is needed by tick filters (rules 2-3) */
     if (pointer_tip(bl[b].id, &tx, &ty) != 0) {
@@ -3497,6 +3540,15 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
     geo[nd].place = di->place;
     geo[nd].face_w = s_face_w; geo[nd].face_d = s_face_d;
     geo[nd].arc_cov = (uint8_t)cov;
+    if ((di->place >= 0) && (di->place < 4))
+    {
+      rim_cache_t *rc = &s_rim[di->place];
+      rc->valid = 1U;
+      rc->cov = (uint8_t)cov;
+      rc->hx = (int16_t)hx;
+      rc->hy = (int16_t)hy;
+      rc->cx = cx; rc->cy = cy; rc->R = R;
+    }
     dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), (int16_t)hx, (int16_t)hy, bl[b].area, dtm,
              (int8_t)di->place, DIAL_FAIL_OK, s_tip_why, (uint8_t)geo[nd].T.n_vis);
     nd++;
