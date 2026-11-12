@@ -1940,11 +1940,18 @@ static int blade_midline_tip(uint16_t id, int32_t ax, int32_t ay, int32_t ar,
     nmid++;
   }
   if (nmid < 4) { s_tip_why = 3U; return -1; }
-  tail0 = nmid / 3;
+  /* Outer half, weighted by inverse width: thin slices near the tip
+   * give a better centreline than the fat shoulder. */
+  tail0 = nmid / 2;
   for (i = tail0; i < nmid; i++)
   {
-    sc += cos_mdeg(mid_a[i]) / 256;   /* Q8 accum, enough for ~100 rings */
-    ss += sin_mdeg(mid_a[i]) / 256;
+    int32_t wt = mid_w[i];
+    if (wt < 1) { wt = 1; }
+    wt = 64 / wt;
+    if (wt < 1) { wt = 1; }
+    if (wt > 16) { wt = 16; }
+    sc += (cos_mdeg(mid_a[i]) / 256) * wt;
+    ss += (sin_mdeg(mid_a[i]) / 256) * wt;
   }
   if ((sc == 0) && (ss == 0)) { s_tip_why = 4U; return -1; }
   ang = atan2_mdeg((int64_t)ss, (int64_t)sc);
@@ -1953,7 +1960,6 @@ static int blade_midline_tip(uint16_t id, int32_t ax, int32_t ay, int32_t ar,
   /* Try both directions: a wrong mid-arc can point at the hub's short side. */
   {
     int32_t rA = -1, xA = 0, yA = 0, rB = -1, xB = 0, yB = 0;
-    int32_t best_a = ang, d, rD, xD, yD;
     (void)walk_red_ray(id, ax, ay, ang, r0, r1, &rA, &xA, &yA);
     (void)walk_red_ray(id, ax, ay, ang + 180000, r0, r1, &rB, &xB, &yB);
     if ((rB > rA) && (rB >= 0))
@@ -1966,18 +1972,39 @@ static int blade_midline_tip(uint16_t id, int32_t ax, int32_t ay, int32_t ar,
       last_r = rA; last_x = xA; last_y = yA;
     }
     if ((last_r < 0) || (last_r < ar * 2)) { s_tip_why = 5U; return -1; }
-    /* Snap to the ray with the longest red run, +/- 8 deg. */
-    best_a = ang;
-    for (d = -8; d <= 8; d++)
+    /* Tip = farthest red pixel in a narrow cone around the blade.
+     * The old "longest radial run +/- 8 deg" followed the fat side
+     * of an asymmetric pointer and missed the tip by several degrees. */
     {
-      if (d == 0) { continue; }
-      if (walk_red_ray(id, ax, ay, ang + d * 1000, r0, r1, &rD, &xD, &yD) != 0) { continue; }
-      if (rD > last_r)
+      int32_t best_d2 = -1, bx = last_x, by = last_y;
+      int32_t rmin2 = (ar * 2) * (ar * 2);
+      int32_t rmax = r1 + 20;
+      int32_t rmax2 = rmax * rmax;
+      int x, y, xmin, xmax, ymin, ymax;
+      xmin = ax - rmax; if (xmin < s_x0) { xmin = s_x0; }
+      ymin = ay - rmax; if (ymin < s_y0) { ymin = s_y0; }
+      xmax = ax + rmax + 1; if (xmax > s_x1) { xmax = s_x1; }
+      ymax = ay + rmax + 1; if (ymax > s_y1) { ymax = s_y1; }
+      for (y = ymin; y < ymax; y++)
       {
-        last_r = rD; last_x = xD; last_y = yD; best_a = ang + d * 1000;
+        for (x = xmin; x < xmax; x++)
+        {
+          int32_t dx = x - ax, dy = y - ay;
+          int32_t d2, da;
+          if (s_lab[(uint32_t)y * s_w + (uint32_t)x] != id) { continue; }
+          d2 = dx * dx + dy * dy;
+          if ((d2 < rmin2) || (d2 > rmax2)) { continue; }
+          da = iabs32(angdiff_mdeg(atan2_mdeg((int64_t)dy, (int64_t)dx), ang));
+          if (da > 8000) { continue; }
+          if (d2 > best_d2) { best_d2 = d2; bx = x; by = y; }
+        }
+      }
+      if (best_d2 >= 0)
+      {
+        last_x = bx; last_y = by;
+        last_r = (int32_t)isqrt64((uint64_t)best_d2);
       }
     }
-    (void)best_a;
   }
   *tx = last_x * 256;
   *ty = last_y * 256;
