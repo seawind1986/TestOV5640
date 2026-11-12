@@ -1692,6 +1692,29 @@ static void longest_arc360(const uint8_t *hit, int *start, int *width)
  * Black rim / tick ink is not walked: only this pointer's red label.
  * A hooked shadow at the rim is ignored because the angle comes from
  * the mid-arc of many rings, not from a single farthest pixel. */
+
+/* Walk this label along angle ang (mdeg) from r0..r1 (px from ax,ay). */
+static int walk_red_ray(uint16_t id, int32_t ax, int32_t ay, int32_t ang,
+                        int32_t r0, int32_t r1, int32_t *last_r, int32_t *last_x, int32_t *last_y)
+{
+  int32_t rr, lr = -1, lx = 0, ly = 0;
+  for (rr = r0; rr <= r1; rr++)
+  {
+    int32_t x = ax + (int32_t)(((int64_t)rr * cos_mdeg(ang)) / 65536);
+    int32_t y = ay + (int32_t)(((int64_t)rr * sin_mdeg(ang)) / 65536);
+    if ((x < s_x0) || (y < s_y0) || (x >= s_x1) || (y >= s_y1)) { break; }
+    if (s_lab[(uint32_t)y * s_w + (uint32_t)x] == id)
+    {
+      lr = rr; lx = x; ly = y;
+    }
+    else if ((lr >= 0) && (rr - lr > 4)) { break; }
+  }
+  *last_r = lr;
+  *last_x = lx;
+  *last_y = ly;
+  return (lr >= 0) ? 0 : -1;
+}
+
 static int blade_midline_tip(uint16_t id, int32_t ax, int32_t ay, int32_t ar,
                              int32_t *tx, int32_t *ty)
 {
@@ -1741,18 +1764,35 @@ static int blade_midline_tip(uint16_t id, int32_t ax, int32_t ay, int32_t ar,
   ang = atan2_mdeg((int64_t)ss, (int64_t)sc);
   r0 = ar + 2;
   r1 = ar * 4 + 60;
-  for (rr = r0; rr <= r1; rr++)
+  /* Try both directions: a wrong mid-arc can point at the hub's short side. */
   {
-    int32_t x = ax + (int32_t)(((int64_t)rr * cos_mdeg(ang)) / 65536);
-    int32_t y = ay + (int32_t)(((int64_t)rr * sin_mdeg(ang)) / 65536);
-    if ((x < s_x0) || (y < s_y0) || (x >= s_x1) || (y >= s_y1)) { break; }
-    if (s_lab[(uint32_t)y * s_w + (uint32_t)x] == id)
+    int32_t rA = -1, xA = 0, yA = 0, rB = -1, xB = 0, yB = 0;
+    int32_t best_a = ang, d, rD, xD, yD;
+    (void)walk_red_ray(id, ax, ay, ang, r0, r1, &rA, &xA, &yA);
+    (void)walk_red_ray(id, ax, ay, ang + 180000, r0, r1, &rB, &xB, &yB);
+    if ((rB > rA) && (rB >= 0))
     {
-      last_r = rr; last_x = x; last_y = y;
+      ang = ang + 180000;
+      last_r = rB; last_x = xB; last_y = yB;
     }
-    else if ((last_r >= 0) && (rr - last_r > 4)) { break; }
+    else
+    {
+      last_r = rA; last_x = xA; last_y = yA;
+    }
+    if ((last_r < 0) || (last_r < ar * 2)) { return -1; }
+    /* Snap to the ray with the longest red run, +/- 8 deg. */
+    best_a = ang;
+    for (d = -8; d <= 8; d++)
+    {
+      if (d == 0) { continue; }
+      if (walk_red_ray(id, ax, ay, ang + d * 1000, r0, r1, &rD, &xD, &yD) != 0) { continue; }
+      if (rD > last_r)
+      {
+        last_r = rD; last_x = xD; last_y = yD; best_a = ang + d * 1000;
+      }
+    }
+    (void)best_a;
   }
-  if (last_r < 0) { return -1; }
   *tx = last_x * 256;
   *ty = last_y * 256;
   return 0;
@@ -2128,9 +2168,24 @@ static void paint_live_dials(uint16_t *fb, uint16_t w, uint16_t h, const dial_re
                   LIVE_CIRC, tw, (int)w, (int)h, seam, mode);
       }
     }
-    live_line(fb, x0, y0, x1, y1, LIVE_PTR, 3, (int)w, (int)h, seam, mode);
+    /* Centre through the tip, ending on the rim so alignment is easy to check. */
     live_plot_w(fb, x0, y0, LIVE_PTR, 7, (int)w, (int)h, seam, mode);
     live_plot_w(fb, x1, y1, LIVE_PTR, 5, (int)w, (int)h, seam, mode);
+    {
+      int64_t tdx = (int64_t)d->tip_x_q8 - d->cx_q8;
+      int64_t tdy = (int64_t)d->tip_y_q8 - d->cy_q8;
+      int32_t tlen = (int32_t)isqrt64((uint64_t)(tdx * tdx + tdy * tdy));
+      int32_t rx1, ry1, qx, qy;
+      if (tlen >= (20 * 256))
+      {
+        rx1 = (int32_t)(d->cx_q8 + (tdx * (int64_t)d->r_q8) / tlen);
+        ry1 = (int32_t)(d->cy_q8 + (tdy * (int64_t)d->r_q8) / tlen);
+        inv_rectify_q8(rx1, ry1, &qx, &qy);
+        x1 = (int)((qx + 128) >> 8);
+        y1 = (int)((qy + 128) >> 8);
+        live_line(fb, x0, y0, x1, y1, LIVE_PTR, 3, (int)w, (int)h, seam, mode);
+      }
+    }
   }
 }
 
