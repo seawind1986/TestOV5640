@@ -17,8 +17,9 @@
  *   9 digit place from a calibration table (never by left/right)
  *  10 boundary rules  -> carry / borrow / SUSPECT
  *  11 combined reading 0.xxxxxx
- *  12 overlay: timestamp + reading (red, black outline), per-dial digit at
- *     6 o'clock, green completed ticks on dark pixels only.
+ *  12 overlay: timestamp + reading (red on a solid white panel). On the live
+ *     frame: green recognised rim and a blue line from centre to tip.
+ *     Analysis copy also keeps per-dial digit at 6 o'clock and green ticks.
  *     SUSPECT: raw (restored+rectified) frame with timestamp only, saved via hook.
  */
 #ifndef DIAL_READ_H
@@ -132,7 +133,7 @@ void DialOrder_Reset(void);
 int  DialOrder_Feed(const dial_report_t *rep, uint32_t t_ms);
 int  DialOrder_Finish(dial_cal_t *cal_out, uint8_t *n_out);
 
-/* Paint timestamp / reading onto a live frame (does not re-run the reader). */
+/* Paint timestamp, reading, recognised rims and pointer lines onto a live frame. */
 void DialRead_PaintHud(uint16_t *fb, uint16_t w, uint16_t h, const dial_report_t *rep);
 
 /* hooks: weak defaults in dial_read.c, override in the board port */

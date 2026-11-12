@@ -1976,6 +1976,137 @@ static void text_ink_box(const char *s, int x, int y, int *x0, int *y0, int *x1,
   *y1 = bot;
 }
 
+
+/* Map a point from the rectified / unwrapped analysis frame back onto the
+ * live captured framebuffer (inverse rectify, then re-apply the seam). */
+static void inv_rectify_q8(int32_t x_q8, int32_t y_q8, int32_t *sx_q8, int32_t *sy_q8)
+{
+#if DIAL_RECTIFY_ON
+  int64_t X = ((int64_t)HI11 * x_q8 + (int64_t)HI12 * y_q8 + 128) >> 8;
+  int64_t Y = ((int64_t)HI21 * x_q8 + (int64_t)HI22 * y_q8 + 128) >> 8;
+  int64_t D = ((int64_t)HI31 * x_q8 + (int64_t)HI32 * y_q8 + 128) >> 8;
+  int64_t e30, e2, inv;
+  X += HI13;
+  Y += HI23;
+  D += ((int64_t)1 << 32);
+  e30 = (((int64_t)1 << 32) - D) >> 2;
+  e2 = (e30 * e30) >> 30;
+  inv = ((int64_t)1 << 30) + e30 + e2 + ((e2 * e30) >> 30);
+  *sx_q8 = (int32_t)((X * inv) >> 42);
+  *sy_q8 = (int32_t)((Y * inv) >> 42);
+#else
+  *sx_q8 = x_q8;
+  *sy_q8 = y_q8;
+#endif
+}
+
+static void live_plot(uint16_t *fb, int x, int y, uint16_t col,
+                     int w, int h, int seam, uint8_t mode)
+{
+  int32_t ww = (int32_t)w, hh = (int32_t)h, xx, yy;
+  if ((ww <= 0) || (hh <= 0)) { return; }
+  if (seam > 0)
+  {
+    if (mode == 1U)
+    {
+      int32_t n = ww * hh;
+      int32_t i = y * ww + x + seam;
+      i %= n;
+      if (i < 0) { i += n; }
+      xx = i % ww;
+      yy = i / ww;
+    }
+    else
+    {
+      xx = x + seam;
+      xx %= ww;
+      if (xx < 0) { xx += ww; }
+      yy = y;
+    }
+  }
+  else
+  {
+    xx = x;
+    yy = y;
+  }
+  if ((xx >= 0) && (yy >= 0) && (xx < ww) && (yy < hh))
+  {
+    fb[(uint32_t)yy * (uint32_t)ww + (uint32_t)xx] = col;
+  }
+}
+
+static void live_plot_w(uint16_t *fb, int x, int y, uint16_t col, int wid,
+                       int w, int h, int seam, uint8_t mode)
+{
+  int t, u, hw;
+  if (wid < 1) { wid = 1; }
+  hw = wid / 2;
+  for (t = -hw; t <= hw; t++)
+  {
+    for (u = -hw; u <= hw; u++)
+    {
+      if ((t * t + u * u) <= (hw * hw + 1))
+      {
+        live_plot(fb, x + t, y + u, col, w, h, seam, mode);
+      }
+    }
+  }
+}
+
+static void live_line(uint16_t *fb, int x0, int y0, int x1, int y1, uint16_t col, int wid,
+                     int w, int h, int seam, uint8_t mode)
+{
+  int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1), sx = (x0 < x1) ? 1 : -1;
+  int dy = (y1 > y0) ? (y0 - y1) : (y1 - y0), sy = (y0 < y1) ? 1 : -1;
+  int err = dx + dy, e2;
+  for (;;)
+  {
+    live_plot_w(fb, x0, y0, col, wid, w, h, seam, mode);
+    if ((x0 == x1) && (y0 == y1)) { break; }
+    e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+
+#define LIVE_CIRC  0x07E0U  /* green recognised rim */
+#define LIVE_PTR   0x029FU  /* blue centre-to-tip, same as analysis overlay */
+
+static void paint_live_dials(uint16_t *fb, uint16_t w, uint16_t h, const dial_report_t *rep)
+{
+  int i, a;
+  int seam = (int)rep->seam_col;
+  uint8_t mode = rep->seam_mode;
+  if ((fb == 0) || (rep == 0) || (rep->n_dials == 0U)) { return; }
+  for (i = 0; i < (int)rep->n_dials; i++)
+  {
+    const dial_info_t *d = &rep->dial[i];
+    int32_t sx, sy, tx, ty, px, py, rx, ry;
+    int x0, y0, x1, y1;
+    int32_t c, s;
+    if (d->r_q8 < (20 * 256)) { continue; }
+    inv_rectify_q8(d->cx_q8, d->cy_q8, &sx, &sy);
+    inv_rectify_q8(d->tip_x_q8, d->tip_y_q8, &tx, &ty);
+    x0 = (int)((sx + 128) >> 8);
+    y0 = (int)((sy + 128) >> 8);
+    x1 = (int)((tx + 128) >> 8);
+    y1 = (int)((ty + 128) >> 8);
+    for (a = 0; a < 360; a++)
+    {
+      c = cos_deg(a);
+      s = sin_deg(a);
+      px = ray_q8(d->cx_q8, d->r_q8, c);
+      py = ray_q8(d->cy_q8, d->r_q8, s);
+      inv_rectify_q8(px, py, &rx, &ry);
+      live_plot_w(fb, (int)((rx + 128) >> 8), (int)((ry + 128) >> 8),
+                  LIVE_CIRC, 3, (int)w, (int)h, seam, mode);
+    }
+    live_line(fb, x0, y0, x1, y1, LIVE_PTR, 3, (int)w, (int)h, seam, mode);
+    live_plot_w(fb, x0, y0, LIVE_PTR, 7, (int)w, (int)h, seam, mode);
+    live_plot_w(fb, x1, y1, LIVE_PTR, 5, (int)w, (int)h, seam, mode);
+  }
+}
+
 void DialRead_PaintHud(uint16_t *fb, uint16_t w, uint16_t h, const dial_report_t *rep)
 {
   uint16_t ow = s_w, oh = s_h;
@@ -1996,6 +2127,8 @@ void DialRead_PaintHud(uint16_t *fb, uint16_t w, uint16_t h, const dial_report_t
     s_h = oh;
     return;
   }
+  /* dial circles + centre-to-tip lines first, so the text bar stays on top */
+  paint_live_dials(fb, w, h, rep);
   has2 = ((rep->status == DIAL_OK) && (rep->line2[0] != 0)) ? 1 : 0;
   text_ink_box(rep->line1, hx, hy1, &tx0, &ty0, &tx1, &ty1);
   if (has2 != 0)
