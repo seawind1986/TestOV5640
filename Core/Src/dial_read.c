@@ -1715,13 +1715,16 @@ static int walk_red_ray(uint16_t id, int32_t ax, int32_t ay, int32_t ang,
   return (lr >= 0) ? 0 : -1;
 }
 
+static uint8_t s_tip_why;           /* pointer_tip / blade detail for g_dial_dbg */
+volatile dial_dbg_t g_dial_dbg;
+
 static int blade_midline_tip(uint16_t id, int32_t ax, int32_t ay, int32_t ar,
                              int32_t *tx, int32_t *ty)
 {
   int32_t rr, r0, r1, nmid = 0;
   int32_t mid_a[160], mid_w[160];
   int32_t i, tail0, sc = 0, ss = 0, ang, last_r = -1, last_x = 0, last_y = 0;
-  if (ar < 6) { return -1; }
+  if (ar < 6) { s_tip_why = 2U; return -1; }
   r0 = ar + 6;
   r1 = (ar * 18) / 5 + 40;   /* 3.6 * ar + 40 */
   for (rr = r0; (rr <= r1) && (nmid < 160); rr++)
@@ -1753,14 +1756,14 @@ static int blade_midline_tip(uint16_t id, int32_t ax, int32_t ay, int32_t ar,
     mid_w[nmid] = width;
     nmid++;
   }
-  if (nmid < 4) { return -1; }
+  if (nmid < 4) { s_tip_why = 3U; return -1; }
   tail0 = nmid / 3;
   for (i = tail0; i < nmid; i++)
   {
     sc += cos_mdeg(mid_a[i]) / 256;   /* Q8 accum, enough for ~100 rings */
     ss += sin_mdeg(mid_a[i]) / 256;
   }
-  if ((sc == 0) && (ss == 0)) { return -1; }
+  if ((sc == 0) && (ss == 0)) { s_tip_why = 4U; return -1; }
   ang = atan2_mdeg((int64_t)ss, (int64_t)sc);
   r0 = ar + 2;
   r1 = ar * 4 + 60;
@@ -1779,7 +1782,7 @@ static int blade_midline_tip(uint16_t id, int32_t ax, int32_t ay, int32_t ar,
     {
       last_r = rA; last_x = xA; last_y = yA;
     }
-    if ((last_r < 0) || (last_r < ar * 2)) { return -1; }
+    if ((last_r < 0) || (last_r < ar * 2)) { s_tip_why = 5U; return -1; }
     /* Snap to the ray with the longest red run, +/- 8 deg. */
     best_a = ang;
     for (d = -8; d <= 8; d++)
@@ -1804,12 +1807,13 @@ static int pointer_tip(uint16_t id, int32_t *tx, int32_t *ty)
   uint16_t dtm;
   int64_t n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, cnt = 0;
   int64_t lim;
+  s_tip_why = 0U;
   for (y = s_y0; y < s_y1; y++)
   {
     dial_yield();
     for (x = s_x0; x < s_x1; x++) { if (s_lab[(uint32_t)y * s_w + (uint32_t)x] == id) { cnt++; } }
   }
-  if (cnt < 40) { return -1; }
+  if (cnt < 40) { s_tip_why = 1U; return -1; }
   dtm = chamfer(s_x0, s_y0, w, h, mask_lab, id, &ax, &ay);
   lim = (int64_t)(dtm + 9U) * (dtm + 9U);      /* (ar+3)^2 * 9 */
   for (y = s_y0; y < s_y1; y++)
@@ -1876,7 +1880,9 @@ static int pointer_tip(uint16_t id, int32_t *tx, int32_t *ty)
         if (dx * dx + dy * dy > bd) { bd = dx * dx + dy * dy; *tx = x * 256; *ty = y * 256; }
       }
     }
-    return (bd >= 0) ? 0 : -1;
+    if (bd >= 0) { return 0; }
+    if (s_tip_why == 0U) { s_tip_why = 6U; }
+    return -1;
   }
 }
 
@@ -2993,6 +2999,159 @@ static void make_tables(void)
   for (i = 0; i < 64; i++) { s_g6to8[i] = (uint8_t)((i * 255) / 63); }
 }
 
+static void dbg_begin(void)
+{
+  uint32_t i;
+  g_dial_dbg.magic = DIAL_DBG_MAGIC;
+  g_dial_dbg.seq++;
+  g_dial_dbg.suspect_flags = 0U;
+  g_dial_dbg.seam_col = 0;
+  g_dial_dbg.track_fb = 0U;
+  g_dial_dbg.seam_mode = 0U;
+  g_dial_dbg.seam_reused = 0U;
+  g_dial_dbg.n_blobs = 0U;
+  g_dial_dbg.n_cand = 0U;
+  g_dial_dbg.n_dials = 0U;
+  g_dial_dbg.n_scale_bad = 0U;
+  g_dial_dbg.status = 0U;
+  g_dial_dbg.place_mask = 0U;
+  g_dial_dbg.miss_place = 0U;
+  g_dial_dbg.cnt_area = 0U;
+  g_dial_dbg.cnt_win = 0U;
+  g_dial_dbg.cnt_hub_dt = 0U;
+  g_dial_dbg.cnt_hub_clip = 0U;
+  g_dial_dbg.cnt_arc = 0U;
+  g_dial_dbg.cnt_tip = 0U;
+  g_dial_dbg.cnt_vis = 0U;
+  for (i = 0U; i < DIAL_DBG_NCAND; i++)
+  {
+    dial_dbg_cand_t *c = &g_dial_dbg.cand[i];
+    c->cx = 0; c->cy = 0; c->hx = -1; c->hy = -1;
+    c->area = 0U; c->dtm = 0U; c->place = -1;
+    c->reason = 0U; c->tip_sub = 0U; c->n_vis = 0U;
+  }
+}
+
+static void dbg_note(int16_t cx, int16_t cy, int16_t hx, int16_t hy,
+                     uint32_t area, uint16_t dtm, int8_t place,
+                     uint8_t reason, uint8_t tip_sub, uint8_t n_vis)
+{
+  uint8_t i = g_dial_dbg.n_cand;
+  if (i < (uint8_t)DIAL_DBG_NCAND)
+  {
+    dial_dbg_cand_t *c = &g_dial_dbg.cand[i];
+    c->cx = cx; c->cy = cy; c->hx = hx; c->hy = hy;
+    c->area = (area > 65535U) ? 65535U : (uint16_t)area;
+    c->dtm = dtm; c->place = place;
+    c->reason = reason; c->tip_sub = tip_sub; c->n_vis = n_vis;
+    g_dial_dbg.n_cand = (uint8_t)(i + 1U);
+  }
+  if (reason == DIAL_FAIL_AREA) { g_dial_dbg.cnt_area++; }
+  else if (reason == DIAL_FAIL_WIN) { g_dial_dbg.cnt_win++; }
+  else if (reason == DIAL_FAIL_HUB_DT) { g_dial_dbg.cnt_hub_dt++; }
+  else if (reason == DIAL_FAIL_HUB_CLIP) { g_dial_dbg.cnt_hub_clip++; }
+  else if (reason == DIAL_FAIL_ARC) { g_dial_dbg.cnt_arc++; }
+  else if (reason == DIAL_FAIL_TIP) { g_dial_dbg.cnt_tip++; }
+  else if (reason == DIAL_FAIL_VIS) { g_dial_dbg.cnt_vis++; }
+}
+
+static int8_t dbg_place_of(int b, int32_t hx, int32_t hy, int32_t cx0, int32_t cy0)
+{
+  int8_t pl = ((b >= 0) && (b < (int)DIAL_MAX_BLOBS)) ? s_blob_place[b] : (int8_t)-1;
+  if ((pl < 0) && (hx >= 0) && (hy >= 0))
+  {
+    int g = match_cal((int32_t)hx * 256, (int32_t)hy * 256);
+    if (g >= 0) { pl = (int8_t)g; }
+  }
+  if (pl < 0)
+  {
+    int g = match_cal(cx0, cy0);
+    if (g >= 0) { pl = (int8_t)g; }
+  }
+  return pl;
+}
+
+static void dbg_finish(const dial_report_t *rep, int nb, int nd)
+{
+  uint8_t have = 0U, miss, p, j, ci;
+  int k;
+  g_dial_dbg.n_blobs = (nb < 0) ? 0U : ((nb > 255) ? 255U : (uint8_t)nb);
+  g_dial_dbg.n_dials = (nd < 0) ? 0U : ((nd > 255) ? 255U : (uint8_t)nd);
+  if (rep != 0)
+  {
+    g_dial_dbg.n_scale_bad = rep->n_scale_bad;
+    g_dial_dbg.track_fb = rep->track_fb;
+    g_dial_dbg.status = (rep->status < 0) ? 0xFFU : (uint8_t)rep->status;
+    g_dial_dbg.suspect_flags = rep->suspect_flags;
+    g_dial_dbg.seam_col = rep->seam_col;
+    g_dial_dbg.seam_mode = rep->seam_mode;
+  }
+  /* accepted cand places may have been refined after the locate loop */
+  ci = 0U;
+  for (j = 0U; (j < g_dial_dbg.n_cand) && (ci < (uint8_t)nd); j++)
+  {
+    if (g_dial_dbg.cand[j].reason == DIAL_FAIL_OK)
+    {
+      g_dial_dbg.cand[j].place = rep->dial[ci].place;
+      ci++;
+    }
+  }
+  for (k = 0; k < nd; k++)
+  {
+    int pl = rep->dial[k].place;
+    if ((pl >= 0) && (pl < 8)) { have = (uint8_t)(have | (uint8_t)(1U << pl)); }
+  }
+  miss = (uint8_t)(((1U << DIAL_COUNT_CFG) - 1U) & (uint8_t)~have);
+  g_dial_dbg.place_mask = have;
+  g_dial_dbg.miss_place = miss;
+  if (miss != 0U)
+  {
+    g_dial_dbg.fail_seq = g_dial_dbg.seq;
+    g_dial_dbg.last_n_dials = g_dial_dbg.n_dials;
+    g_dial_dbg.last_miss_place = miss;
+    g_dial_dbg.last_n_cand = g_dial_dbg.n_cand;
+    g_dial_dbg.last_seam_reused = g_dial_dbg.seam_reused;
+    g_dial_dbg.last_seam_col = g_dial_dbg.seam_col;
+    for (p = 0U; p < 4U; p++)
+    {
+      int16_t cx = 0, cy = 0, hx = -1, hy = -1;
+      uint8_t reason = DIAL_FAIL_NO_BLOB, tip = 0U;
+      if ((have & (uint8_t)(1U << p)) != 0U)
+      {
+        reason = DIAL_FAIL_OK;
+        for (j = 0U; j < g_dial_dbg.n_cand; j++)
+        {
+          if ((g_dial_dbg.cand[j].place == (int8_t)p) && (g_dial_dbg.cand[j].reason == DIAL_FAIL_OK))
+          {
+            cx = g_dial_dbg.cand[j].cx; cy = g_dial_dbg.cand[j].cy;
+            hx = g_dial_dbg.cand[j].hx; hy = g_dial_dbg.cand[j].hy;
+            tip = g_dial_dbg.cand[j].tip_sub;
+            break;
+          }
+        }
+      }
+      else
+      {
+        for (j = 0U; j < g_dial_dbg.n_cand; j++)
+        {
+          if (g_dial_dbg.cand[j].place == (int8_t)p)
+          {
+            reason = g_dial_dbg.cand[j].reason;
+            tip = g_dial_dbg.cand[j].tip_sub;
+            cx = g_dial_dbg.cand[j].cx; cy = g_dial_dbg.cand[j].cy;
+            hx = g_dial_dbg.cand[j].hx; hy = g_dial_dbg.cand[j].hy;
+            break;
+          }
+        }
+      }
+      g_dial_dbg.last_reason[p] = reason;
+      g_dial_dbg.last_tip_sub[p] = tip;
+      g_dial_dbg.last_cx[p] = cx; g_dial_dbg.last_cy[p] = cy;
+      g_dial_dbg.last_hx[p] = hx; g_dial_dbg.last_hy[p] = hy;
+    }
+  }
+}
+
 int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
                  uint8_t *work, uint32_t work_bytes, dial_report_t *rep)
 {
@@ -3011,6 +3170,7 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
   if (!raw || !out || !work || !rep || (w < 16U) || (h < 16U)) { return DIAL_ERR_ARG; }
   if (work_bytes < DialRead_WorkBytes(w, h)) { return DIAL_ERR_WORK; }
   memset(rep, 0, sizeof(*rep));
+  dbg_begin();
   make_tables();
   p = (uint8_t *)(((uintptr_t)p + 7U) & ~(uintptr_t)7U);
   rest = (uint16_t *)p; p += npx * 2U;
@@ -3040,11 +3200,14 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
   if ((s_track.valid) && (DIAL_SEAM_COL_CFG < 0))
   {
     seam = s_track.seam_col; mode = s_track.seam_mode;
+    g_dial_dbg.seam_reused = 1U;
   }
   else if (DIAL_SEAM_COL_CFG < 0) { seam = seam_detect(raw, w, h, &mode, colsum); }
   else { seam = DIAL_SEAM_COL_CFG; mode = (DIAL_SEAM_MODE_CFG == 1) ? 1U : 0U; if (DIAL_SEAM_MODE_CFG == 2) { (void)seam_detect(raw, w, h, &mode, colsum); } }
   rep->seam_col = (int16_t)seam;
   rep->seam_mode = mode;
+  g_dial_dbg.seam_col = (int16_t)seam;
+  g_dial_dbg.seam_mode = mode;
   if (seam <= 0)
   {
     uint32_t y, x;
@@ -3198,17 +3361,33 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
     int cov, k, k0 = 0;
     int32_t bdu = 0x7fffffff;
     dial_info_t *di;
-    if (bl[b].area < CAND_MIN_AREA) { continue; }
+    if (bl[b].area < CAND_MIN_AREA) {
+      dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), -1, -1, bl[b].area, 0U,
+               dbg_place_of(b, -1, -1, cx0, cy0), DIAL_FAIL_AREA, 0U, 0U);
+      continue;
+    }
     /* hub: max chamfer distance of red inside +-120 px */
     wx0 = (cx0 >> 8) - HUB_WIN; if (wx0 < 0) { wx0 = 0; }
     wy0 = (cy0 >> 8) - HUB_WIN; if (wy0 < 0) { wy0 = 0; }
     wx1 = (cx0 + HUB_WIN * 256) >> 8; if (wx1 > (int32_t)w) { wx1 = w; }
     wy1 = (cy0 + HUB_WIN * 256) >> 8; if (wy1 > (int32_t)h) { wy1 = h; }
-    if ((wx1 - wx0) * (wy1 - wy0) > (2 * RAD_PAD) * (2 * RAD_PAD)) { continue; }
+    if ((wx1 - wx0) * (wy1 - wy0) > (2 * RAD_PAD) * (2 * RAD_PAD)) {
+      dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), -1, -1, bl[b].area, 0U,
+               dbg_place_of(b, -1, -1, cx0, cy0), DIAL_FAIL_WIN, 0U, 0U);
+      continue;
+    }
     dtm = chamfer(wx0, wy0, wx1 - wx0, wy1 - wy0, mask_red, 0U, &hx, &hy);
-    if (dtm < HUB_MIN_DT) { continue; }                  /* red mark, not a pointer */
+    if (dtm < HUB_MIN_DT) {
+      dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), (int16_t)hx, (int16_t)hy, bl[b].area, dtm,
+               dbg_place_of(b, hx, hy, cx0, cy0), DIAL_FAIL_HUB_DT, 0U, 0U);
+      continue;
+    }                  /* red mark, not a pointer */
     if ((3 * hx - dtm < 3) || (3 * hy - dtm < 3) ||
-        (3 * hx + dtm > 3 * ((int32_t)w - 2)) || (3 * hy + dtm > 3 * ((int32_t)h - 2))) { continue; }  /* hub clipped */
+        (3 * hx + dtm > 3 * ((int32_t)w - 2)) || (3 * hy + dtm > 3 * ((int32_t)h - 2))) {
+      dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), (int16_t)hx, (int16_t)hy, bl[b].area, dtm,
+               dbg_place_of(b, hx, hy, cx0, cy0), DIAL_FAIL_HUB_CLIP, 0U, 0U);
+      continue;
+    }  /* hub clipped */
     /* dial crop */
     s_x0 = (cx0 >> 8) - RAD_PAD; if (s_x0 < 0) { s_x0 = 0; }
     s_y0 = (cy0 >> 8) - RAD_PAD; if (s_y0 < 0) { s_y0 = 0; }
@@ -3229,6 +3408,8 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
     if ((arc_circle(cx0, cy0, &cx, &cy, &R, &cov) != 0) || (R < R_MIN_Q8) || (R > R_MAX_Q8))
     {
       rep->n_scale_bad++;
+      dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), (int16_t)hx, (int16_t)hy, bl[b].area, dtm,
+               dbg_place_of(b, hx, hy, cx0, cy0), DIAL_FAIL_ARC, 0U, 0U);
       continue;
     }
     /* place from the rigidly shifted calibration (never left/right) */
@@ -3240,7 +3421,12 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
       di->place = (int8_t)place_guess;
     }
     /* 6 pointer first: pang is needed by tick filters (rules 2-3) */
-    if (pointer_tip(bl[b].id, &tx, &ty) != 0) { rep->n_scale_bad++; continue; }
+    if (pointer_tip(bl[b].id, &tx, &ty) != 0) {
+      rep->n_scale_bad++;
+      dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), (int16_t)hx, (int16_t)hy, bl[b].area, dtm,
+               (int8_t)di->place, DIAL_FAIL_TIP, s_tip_why, 0U);
+      continue;
+    }
     di->pang_mdeg = atan2_mdeg((int64_t)ty - cy, (int64_t)tx - cx);
     /* 5 ticks. Peak angles stay on the 1 px gap profile so a close
      * tadpole merge cannot slide a local max (235° -> 234°, 8.89 -> 8.90).
@@ -3288,6 +3474,8 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
         (cx < 0) || (cy < 0) || (cx >= (int32_t)w * 256) || (cy >= (int32_t)h * 256))
     {
       rep->n_scale_bad++;
+      dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), (int16_t)hx, (int16_t)hy, bl[b].area, dtm,
+               (int8_t)di->place, DIAL_FAIL_VIS, s_tip_why, (uint8_t)geo[nd].T.n_vis);
       continue;
     }
     geo[nd].cx = cx; geo[nd].cy = cy; geo[nd].R = R;
@@ -3299,6 +3487,8 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
     geo[nd].place = di->place;
     geo[nd].face_w = s_face_w; geo[nd].face_d = s_face_d;
     geo[nd].arc_cov = (uint8_t)cov;
+    dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), (int16_t)hx, (int16_t)hy, bl[b].area, dtm,
+             (int8_t)di->place, DIAL_FAIL_OK, s_tip_why, (uint8_t)geo[nd].T.n_vis);
     nd++;
   }
   /* refine places from the fitted rim centres (same rigid shift) */
@@ -3419,6 +3609,7 @@ after_locate:
     rep->status = DIAL_SUSPECT;
     draw_text(out, 12, 8, rep->line1);
     (void)dial_save_suspect_frame(out, w, h, rep->ts_name);
+    dbg_finish(rep, nb, nd);
     return DIAL_SUSPECT;
   }
   {
@@ -3458,6 +3649,7 @@ after_locate:
     }
   }
   rep->status = DIAL_OK;
+  dbg_finish(rep, nb, nd);
   return DIAL_OK;
 }
 

@@ -137,6 +137,79 @@ const dial_cal_t *DialRead_GetOrderCal(uint8_t *n);
 /* Drop the cached 4-dial geometry so the next Run is a full keyframe. */
 void DialRead_ResetTrack(void);
 
+/* J-Link diagnostics: read g_dial_dbg (magic 0x44424731 = 'DBG1').
+ * Reason codes: 0 ok, 1 area<800, 2 chamfer window too big, 3 hub dt<45
+ * (red mark), 4 hub clipped at frame edge, 5 arc/R fail, 6 pointer tip
+ * fail, 7 too few ticks / centre off-frame, 8 no blob for this place.
+ * tip_sub (only with reason 6, or 0 if tip used farthest fallback):
+ * 1 few red pixels, 2 hub r too small, 3 too few mid-arc rings,
+ * 4 axis zero, 5 red run shorter than 2*hub, 6 farthest-pixel fail.
+ * last_* keeps the most recent frame that missed a dial (bit0=x0.1). */
+#define DIAL_DBG_MAGIC   0x44424731U
+#define DIAL_DBG_NCAND   16U
+#define DIAL_FAIL_OK         0U
+#define DIAL_FAIL_AREA       1U
+#define DIAL_FAIL_WIN        2U
+#define DIAL_FAIL_HUB_DT     3U
+#define DIAL_FAIL_HUB_CLIP   4U
+#define DIAL_FAIL_ARC        5U
+#define DIAL_FAIL_TIP        6U
+#define DIAL_FAIL_VIS        7U
+#define DIAL_FAIL_NO_BLOB    8U
+
+typedef struct
+{
+  int16_t  cx, cy;       /* blob centroid, px                          */
+  int16_t  hx, hy;       /* hub, or -1 if not computed                 */
+  uint16_t area;
+  uint16_t dtm;          /* chamfer * 3, 0 if not computed             */
+  int8_t   place;        /* 0=x0.1 .. 3=x0.0001, -1 unknown            */
+  uint8_t  reason;       /* DIAL_FAIL_* ; 0 = accepted                 */
+  uint8_t  tip_sub;      /* pointer_tip detail, see above              */
+  uint8_t  n_vis;
+} dial_dbg_cand_t;       /* 16 bytes                                   */
+
+typedef struct
+{
+  uint32_t magic;            /* 0  0x44424731                          */
+  uint32_t seq;              /* 4  increments each DialRead_Run        */
+  uint32_t fail_seq;         /* 8  seq of last incomplete frame        */
+  uint32_t suspect_flags;    /* 12 this frame                          */
+  int16_t  seam_col;         /* 16                                     */
+  int16_t  last_seam_col;    /* 18                                     */
+  uint16_t track_fb;         /* 20 HUD status code                     */
+  uint8_t  seam_mode;        /* 22                                     */
+  uint8_t  seam_reused;      /* 23 1 = reused last good seam           */
+  uint8_t  n_blobs;          /* 24                                     */
+  uint8_t  n_cand;           /* 25 entries in cand[] this frame        */
+  uint8_t  n_dials;          /* 26 accepted                            */
+  uint8_t  n_scale_bad;      /* 27                                     */
+  uint8_t  status;           /* 28 DIAL_OK / DIAL_SUSPECT              */
+  uint8_t  place_mask;       /* 29 bit i set if place i accepted       */
+  uint8_t  miss_place;       /* 30 bits of missing places              */
+  uint8_t  cnt_area;         /* 31 this-frame skip counts              */
+  uint8_t  cnt_win;          /* 32                                     */
+  uint8_t  cnt_hub_dt;       /* 33                                     */
+  uint8_t  cnt_hub_clip;     /* 34                                     */
+  uint8_t  cnt_arc;          /* 35                                     */
+  uint8_t  cnt_tip;          /* 36                                     */
+  uint8_t  cnt_vis;          /* 37                                     */
+  uint8_t  last_n_dials;     /* 38 snapshot when miss_place != 0       */
+  uint8_t  last_miss_place;  /* 39                                     */
+  uint8_t  last_n_cand;      /* 40                                     */
+  uint8_t  last_seam_reused; /* 41                                     */
+  uint8_t  _pad0, _pad1;     /* 42 keep 16-bit alignment               */
+  uint8_t  last_reason[4];   /* 44 reason for place 0..3 last miss     */
+  uint8_t  last_tip_sub[4];  /* 48                                     */
+  int16_t  last_cx[4];       /* 52                                     */
+  int16_t  last_cy[4];       /* 60                                     */
+  int16_t  last_hx[4];       /* 68                                     */
+  int16_t  last_hy[4];       /* 76                                     */
+  dial_dbg_cand_t cand[DIAL_DBG_NCAND]; /* 84, 16*16 = 256; total 340  */
+} dial_dbg_t;
+
+extern volatile dial_dbg_t g_dial_dbg;
+
 /* speed-based auto ordering (water flowing): lower digit turns ~10x faster.
  * Feed one report per frame (status may be SUSPECT for lack of calibration),
  * then Finish() writes the table.  Returns 0 ok, <0 error. */
