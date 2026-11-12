@@ -2599,6 +2599,9 @@ static void assign_places_rigid(const int16_t *xs, const int16_t *ys, int8_t *pl
 #define TRACK_RESID_MAX   4     /* max hub residual vs consensus, px       */
 #define TRACK_MIN_AGREE   3     /* hubs that must agree on (dx, dy)        */
 #define TRACK_HUB_PAD     8     /* extra chamfer margin around last hub    */
+#ifndef DIAL_TRACK_FAST
+#define DIAL_TRACK_FAST   0     /* 0: locate dials and ticks every frame   */
+#endif
 
 typedef struct
 {
@@ -3031,7 +3034,7 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
    * nonzero wrap column) so hubs stay in the same unwrapped
    * coordinate system. Detect only when there is no cache, or when
    * a fixed column is configured. */
-  if ((s_track.valid) && (DIAL_SEAM_COL_CFG < 0))
+  if (DIAL_TRACK_FAST && (s_track.valid) && (DIAL_SEAM_COL_CFG < 0))
   {
     seam = s_track.seam_col; mode = s_track.seam_mode;
   }
@@ -3078,7 +3081,7 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
    * level + rectify so s_L/s_red are complete before find_blobs. */
   rep->track_mode = 0U;
   rep->track_fb = 1U; /* 1 = no cache, full keyframe */
-  if (s_track.valid)
+  if (DIAL_TRACK_FAST && s_track.valid)
   {
     int ti;
     uint32_t yy;
