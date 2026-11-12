@@ -2141,7 +2141,7 @@ static void paint_live_dials(uint16_t *fb, uint16_t w, uint16_t h, const dial_re
       live_plot_w(fb, (int)((rx + 128) >> 8), (int)((ry + 128) >> 8),
                   LIVE_CIRC, 3, (int)w, (int)h, seam, mode);
     }
-    /* ticks: from inside the face, extended well past the rim for alignment */
+    /* ticks: recognised length, from inside the face to the rim (not past it) */
     {
       const dial_ovl_t *ov = &rep->ovl[i];
       int k, nt = (int)ov->n_tick;
@@ -2152,7 +2152,7 @@ static void paint_live_dials(uint16_t *fb, uint16_t w, uint16_t h, const dial_re
         if (ov->keep[k] == 0U) { continue; }
         is_maj = ((ov->allow_half == 0U) || ((k % 2) == (int)ov->major_base)) ? 1 : 0;
         rin = (int32_t)(((int64_t)d->r_q8 * (is_maj ? 84 : 90)) / 100);
-        rout = (int32_t)(((int64_t)d->r_q8 * (is_maj ? 124 : 114)) / 100);
+        rout = d->r_q8;
         c = cos_mdeg(ov->tick_mdeg[k]);
         s = sin_mdeg(ov->tick_mdeg[k]);
         ix = ray_q8(d->cx_q8, rin, c);
