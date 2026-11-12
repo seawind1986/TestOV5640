@@ -3034,7 +3034,10 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
    * nonzero wrap column) so hubs stay in the same unwrapped
    * coordinate system. Detect only when there is no cache, or when
    * a fixed column is configured. */
-  if (DIAL_TRACK_FAST && (s_track.valid) && (DIAL_SEAM_COL_CFG < 0))
+  /* Reuse last good seam even when locating every frame: x0.1 sits
+   * near the wrap, and a jittering seam splits that dial so it
+   * disappears from the overlay. */
+  if ((s_track.valid) && (DIAL_SEAM_COL_CFG < 0))
   {
     seam = s_track.seam_col; mode = s_track.seam_mode;
   }
@@ -3314,9 +3317,12 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
   }
 after_locate:
   rep->n_dials = (uint8_t)nd;
-  /* Cache a complete 4-dial constellation. Boundary rules may still
-   * mark AMBIG afterwards; the printed geometry stays usable. */
-  track_save(rep, geo, nd);
+  /* Cache a complete 4-dial constellation (and its seam). A partial
+   * result must not overwrite a good seam: x0.1 is next to the wrap. */
+  if (nd == (int)DIAL_COUNT_CFG)
+  {
+    track_save(rep, geo, nd);
+  }
   report_copy_ticks(rep, geo, nd);
   if (rep->n_scale_bad) { rep->suspect_flags |= DIAL_SUS_SCALE; }
   if (nd != (int)DIAL_COUNT_CFG) { rep->suspect_flags |= DIAL_SUS_COUNT; }
