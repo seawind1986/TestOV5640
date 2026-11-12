@@ -733,6 +733,131 @@ static int arc_trace(int32_t cx, int32_t cy, int32_t R, int a_start, int step, p
   return n;
 }
 
+
+/* Fit a circle to a possibly incomplete rim. The centre is kept near
+ * the hub so a short or one-sided arc cannot collapse or drift. */
+static int fit_partial_arc(const pt_t *p, int n, int32_t hx, int32_t hy,
+                           int32_t *pcx, int32_t *pcy, int32_t *pR)
+{
+  uint16_t hist[128];
+  int i, acc, mid, rpx, n_in;
+  int32_t r_med, cx, cy, R;
+  if (n < 20) { return -1; }
+  for (i = 0; i < 128; i++) { hist[i] = 0U; }
+  for (i = 0; i < n; i++)
+  {
+    int64_t dx = (int64_t)p[i].x - hx, dy = (int64_t)p[i].y - hy;
+    rpx = (int)(isqrt64((uint64_t)(dx * dx + dy * dy)) >> 8);
+    if (rpx < 0) { rpx = 0; }
+    if (rpx > 127) { rpx = 127; }
+    hist[rpx]++;
+  }
+  mid = n / 2; acc = 0; r_med = 0;
+  for (i = 0; i < 128; i++)
+  {
+    acc += (int)hist[i];
+    if (acc >= mid) { r_med = (int32_t)i * 256; break; }
+  }
+  if ((r_med < R_MIN_Q8) || (r_med > R_MAX_Q8)) { return -1; }
+
+  n_in = 0;
+  for (i = 0; i < n; i++)
+  {
+    int64_t dx = (int64_t)p[i].x - hx, dy = (int64_t)p[i].y - hy;
+    int32_t ri = (int32_t)isqrt64((uint64_t)(dx * dx + dy * dy));
+    if (iabs32(ri - r_med) <= 5 * 256)
+    {
+      if (n_in < 360) { s_seed[n_in] = p[i]; n_in++; }
+    }
+  }
+  if (n_in < 20) { return -1; }
+
+  /* Recompute the median radius on inliers. */
+  for (i = 0; i < 128; i++) { hist[i] = 0U; }
+  for (i = 0; i < n_in; i++)
+  {
+    int64_t dx = (int64_t)s_seed[i].x - hx, dy = (int64_t)s_seed[i].y - hy;
+    rpx = (int)(isqrt64((uint64_t)(dx * dx + dy * dy)) >> 8);
+    if (rpx < 0) { rpx = 0; }
+    if (rpx > 127) { rpx = 127; }
+    hist[rpx]++;
+  }
+  mid = n_in / 2; acc = 0;
+  for (i = 0; i < 128; i++)
+  {
+    acc += (int)hist[i];
+    if (acc >= mid) { r_med = (int32_t)i * 256; break; }
+  }
+
+  /* Kasa is accurate on a long arc, but biased on a short one: only
+   * keep it when the centre stays near the hub. */
+  if (kasa_fit(s_seed, n_in, &cx, &cy, &R) == 0)
+  {
+    int64_t dcx = (int64_t)cx - hx, dcy = (int64_t)cy - hy;
+    int64_t lim = (int64_t)15 * 256 * 15 * 256;
+    int rms_ok = (circle_ss(s_seed, n_in, cx, cy, R) * 100
+                  <= (int64_t)250 * n_in * 65536);
+    if (rms_ok && (R >= R_MIN_Q8) && (R <= R_MAX_Q8) && (dcx * dcx + dcy * dcy <= lim))
+    {
+      *pcx = cx; *pcy = cy; *pR = R;
+      return 0;
+    }
+  }
+
+  /* One damped least-squares step of the centre, then clamp. */
+  cx = hx; cy = hy; R = r_med;
+  {
+    int64_t a11 = 0, a12 = 0, a22 = 0, b1 = 0, b2 = 0, det, num_x, num_y;
+    int32_t dx, dy;
+    for (i = 0; i < n_in; i++)
+    {
+      int64_t ux, uy, res, rx, ry, rr;
+      rx = (int64_t)s_seed[i].x - hx;
+      ry = (int64_t)s_seed[i].y - hy;
+      rr = (int64_t)isqrt64((uint64_t)(rx * rx + ry * ry));
+      if (rr < 256) { continue; }
+      ux = (rx * 256) / rr;
+      uy = (ry * 256) / rr;
+      res = rr - r_med;
+      a11 += ux * ux; a12 += ux * uy; a22 += uy * uy;
+      b1 += ux * res; b2 += uy * res;
+    }
+    det = a11 * a22 - a12 * a12;
+    if (det > (1 << 16))
+    {
+      num_x = a22 * b1 - a12 * b2;
+      num_y = a11 * b2 - a12 * b1;
+      dx = (int32_t)(num_x / det);
+      dy = (int32_t)(num_y / det);
+      if (iabs32(dx) > 8 * 256) { dx = (dx > 0) ? (8 * 256) : (-8 * 256); }
+      if (iabs32(dy) > 8 * 256) { dy = (dy > 0) ? (8 * 256) : (-8 * 256); }
+      cx = hx + dx;
+      cy = hy + dy;
+    }
+  }
+  /* Refresh R around the refined centre. */
+  for (i = 0; i < 128; i++) { hist[i] = 0U; }
+  acc = 0;
+  for (i = 0; i < n_in; i++)
+  {
+    int64_t dx = (int64_t)s_seed[i].x - cx, dy = (int64_t)s_seed[i].y - cy;
+    rpx = (int)(isqrt64((uint64_t)(dx * dx + dy * dy)) >> 8);
+    if (rpx < 0) { rpx = 0; }
+    if (rpx > 127) { rpx = 127; }
+    hist[rpx]++;
+    acc++;
+  }
+  mid = acc / 2; acc = 0; r_med = R;
+  for (i = 0; i < 128; i++)
+  {
+    acc += (int)hist[i];
+    if (acc >= mid) { r_med = (int32_t)i * 256; break; }
+  }
+  if ((r_med < R_MIN_Q8) || (r_med > R_MAX_Q8)) { return -1; }
+  *pcx = cx; *pcy = cy; *pR = r_med;
+  return 0;
+}
+
 static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_t *pR, int *pcov)
 {
   int a, i, run_s = 0, run_n = 0, best_s = 0, best_n = 0, nseed, rnd, npts;
@@ -787,27 +912,73 @@ static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_
   }
   if (run_n > best_n) { best_n = run_n; best_s = run_s; }
   if (best_n > 360) { best_n = 360; }
+  /* Gather every valid rim sample. A clipped dial is only a partial
+   * arc, so a single continuous run is not required. */
   {
-    int x = hx >> 8, y = hy >> 8, near_edge, seed_min;
-    near_edge = ((x < 130) || (y < 130) ||
-                 (x > (int32_t)s_w - 130) || (y > (int32_t)s_h - 130));
-    seed_min = near_edge ? 24 : ARC_SEED_MIN;
-    if (best_n < seed_min) { return -1; }
-  }
-  nseed = best_n;
-  for (i = 0; i < nseed; i++)
-  {
-    int aa = (best_s + i) % 360;
-    s_seed[i].x = ray_q8(hx, s_rr[aa] * 256, cos_deg(aa));
-    s_seed[i].y = ray_q8(hy, s_rr[aa] * 256, sin_deg(aa));
-  }
-  if (kasa_fit(s_seed, nseed, &cx, &cy, &R) != 0) { return -1; }
-  {
-    int x = hx >> 8, y = hy >> 8, near_edge, rms100;
-    near_edge = ((x < 130) || (y < 130) ||
-                 (x > (int32_t)s_w - 130) || (y > (int32_t)s_h - 130));
-    rms100 = near_edge ? 250 : (int)ARC_SEED_RMS2_X100; /* 1.58 px vs 1.2 */
-    if (circle_ss(s_seed, nseed, cx, cy, R) * 100 > (int64_t)rms100 * nseed * 65536) { return -1; }
+    int nall = 0, ok = 0, aa;
+    for (a = 0; a < 360; a++)
+    {
+      if (s_rr[a] < 0) { continue; }
+      s_pts[nall].x = ray_q8(hx, s_rr[a] * 256, cos_deg(a));
+      s_pts[nall].y = ray_q8(hy, s_rr[a] * 256, sin_deg(a));
+      nall++;
+    }
+    /* Longest-run Kasa first: accurate when the whole rim is visible,
+     * but only if the centre stays near the hub. */
+    if (best_n >= ARC_SEED_MIN)
+    {
+      nseed = best_n;
+      for (i = 0; i < nseed; i++)
+      {
+        aa = (best_s + i) % 360;
+        s_seed[i].x = ray_q8(hx, s_rr[aa] * 256, cos_deg(aa));
+        s_seed[i].y = ray_q8(hy, s_rr[aa] * 256, sin_deg(aa));
+      }
+      if (kasa_fit(s_seed, nseed, &cx, &cy, &R) == 0)
+      {
+        int64_t dcx = (int64_t)cx - hx, dcy = (int64_t)cy - hy;
+        int64_t lim = (int64_t)15 * 256 * 15 * 256;
+        if ((R >= R_MIN_Q8) && (R <= R_MAX_Q8)
+            && (dcx * dcx + dcy * dcy <= lim)
+            && (circle_ss(s_seed, nseed, cx, cy, R) * 100
+                <= (int64_t)ARC_SEED_RMS2_X100 * nseed * 65536))
+        {
+          ok = 1;
+        }
+      }
+    }
+    if (!ok)
+    {
+      if (fit_partial_arc(s_pts, nall, hx, hy, &cx, &cy, &R) != 0) { return -1; }
+      /* Keep the longest run as the seed for tracing when it is long
+       * enough; otherwise use every inlier in angle order. */
+      if (best_n >= 16)
+      {
+        nseed = best_n;
+        for (i = 0; i < nseed; i++)
+        {
+          aa = (best_s + i) % 360;
+          s_seed[i].x = ray_q8(hx, s_rr[aa] * 256, cos_deg(aa));
+          s_seed[i].y = ray_q8(hy, s_rr[aa] * 256, sin_deg(aa));
+        }
+      }
+      else
+      {
+        nseed = 0;
+        for (a = 0; a < 360; a++)
+        {
+          int32_t x, y, ri;
+          if (s_rr[a] < 0) { continue; }
+          x = ray_q8(hx, s_rr[a] * 256, cos_deg(a));
+          y = ray_q8(hy, s_rr[a] * 256, sin_deg(a));
+          ri = (int32_t)isqrt64((uint64_t)(((int64_t)x - cx) * ((int64_t)x - cx)
+                                         + ((int64_t)y - cy) * ((int64_t)y - cy)));
+          if (iabs32(ri - R) > 5 * 256) { continue; }
+          s_seed[nseed].x = x; s_seed[nseed].y = y; nseed++;
+        }
+        if (nseed < 20) { return -1; }
+      }
+    }
   }
   {
     int32_t seed_cx = cx, seed_cy = cy, seed_R = R;
