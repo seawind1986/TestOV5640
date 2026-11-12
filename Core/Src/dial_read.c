@@ -2001,8 +2001,42 @@ static int blade_midline_tip(uint16_t id, int32_t ax, int32_t ay, int32_t ar,
       }
       if (best_d2 >= 0)
       {
+        int32_t r_best, r_cut, cut2, ntip = 0;
+        int64_t sx = 0, sy = 0;
         last_x = bx; last_y = by;
         last_r = (int32_t)isqrt64((uint64_t)best_d2);
+        /* Centroid of the tip cluster, not the single farthest pixel:
+         * a lone edge pixel popping in or out was making the line twitch. */
+        r_best = last_r;
+        r_cut = r_best - 3;
+        if (r_cut < (ar * 2)) { r_cut = ar * 2; }
+        cut2 = r_cut * r_cut;
+        for (y = ymin; y < ymax; y++)
+        {
+          for (x = xmin; x < xmax; x++)
+          {
+            int32_t dx = x - ax, dy = y - ay, d2, da;
+            if (s_lab[(uint32_t)y * s_w + (uint32_t)x] != id) { continue; }
+            d2 = dx * dx + dy * dy;
+            if ((d2 < cut2) || (d2 > rmax2)) { continue; }
+            da = iabs32(angdiff_mdeg(atan2_mdeg((int64_t)dy, (int64_t)dx), ang));
+            if (da > 8000) { continue; }
+            sx += x; sy += y; ntip++;
+          }
+        }
+        if (ntip > 0)
+        {
+          last_x = (int32_t)(sx / ntip);
+          last_y = (int32_t)(sy / ntip);
+          *tx = (int32_t)((sx * 256) / ntip);
+          *ty = (int32_t)((sy * 256) / ntip);
+        }
+        else
+        {
+          *tx = last_x * 256;
+          *ty = last_y * 256;
+        }
+        return 0;
       }
     }
   }
@@ -3669,6 +3703,19 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
         dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), (int16_t)hx, (int16_t)hy, bl[b].area, dtm,
                  (int8_t)di->place, DIAL_FAIL_ARC, 0U, 0U);
         continue;
+      }
+    }
+    /* Blend a 1-3 px rim-centre twitch so the pointer line stays put. */
+    if ((di->place >= 0) && (di->place < 4) && (s_rim[di->place].valid != 0U))
+    {
+      int32_t dcx = cx - s_rim[di->place].cx;
+      int32_t dcy = cy - s_rim[di->place].cy;
+      int64_t d2 = ((int64_t)dcx * dcx + (int64_t)dcy * dcy) >> 16; /* px^2 */
+      if (d2 <= 9)
+      {
+        cx = (s_rim[di->place].cx + cx) / 2;
+        cy = (s_rim[di->place].cy + cy) / 2;
+        R  = (s_rim[di->place].R  + R ) / 2;
       }
     }
     /* 6 pointer first: pang is needed by tick filters (rules 2-3) */
