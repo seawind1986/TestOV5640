@@ -144,8 +144,10 @@ void DialRead_ResetTrack(void);
  * tip_sub (only with reason 6, or 0 if tip used farthest fallback):
  * 1 few red pixels, 2 hub r too small, 3 too few mid-arc rings,
  * 4 axis zero, 5 red run shorter than 2*hub, 6 farthest-pixel fail.
- * last_* keeps the most recent frame that missed a dial (bit0=x0.1). */
-#define DIAL_DBG_MAGIC   0x44424731U
+ * last_* keeps the most recent frame that missed a dial (bit0=x0.1).
+ * n_frame / n_ok / n_miss / n_miss_pl / n_reason / n_pl_reason
+ * accumulate until reset; they are not cleared each frame. */
+#define DIAL_DBG_MAGIC   0x44424732U
 #define DIAL_DBG_NCAND   16U
 #define DIAL_FAIL_OK         0U
 #define DIAL_FAIL_AREA       1U
@@ -171,7 +173,7 @@ typedef struct
 
 typedef struct
 {
-  uint32_t magic;            /* 0  0x44424731                          */
+  uint32_t magic;            /* 0  0x44424732                          */
   uint32_t seq;              /* 4  increments each DialRead_Run        */
   uint32_t fail_seq;         /* 8  seq of last incomplete frame        */
   uint32_t suspect_flags;    /* 12 this frame                          */
@@ -205,8 +207,17 @@ typedef struct
   int16_t  last_cy[4];       /* 60                                     */
   int16_t  last_hx[4];       /* 68                                     */
   int16_t  last_hy[4];       /* 76                                     */
-  dial_dbg_cand_t cand[DIAL_DBG_NCAND]; /* 84, 16*16 = 256; total 340  */
-} dial_dbg_t;
+  dial_dbg_cand_t cand[DIAL_DBG_NCAND]; /* 84, 16*16 = 256; subtotal 340 */
+  /* cumulative counters: never cleared by dbg_begin (BSS zero at reset) */
+  uint32_t n_frame;              /* 340 completed DialRead_Run calls     */
+  uint32_t n_ok;                 /* 344 all 4 places present             */
+  uint32_t n_miss;               /* 348 at least one place missing       */
+  uint32_t n_miss_pl[4];         /* 352 frames each place was missing    */
+  uint32_t n_reason[9];          /* 368 missing-place reasons (sum)      */
+  uint32_t n_pl_reason[4][9];    /* 404 reason counts per place          */
+  uint32_t n_cand_reason[9];     /* 548 every skipped candidate          */
+  uint32_t n_tip_sub[8];         /* 584 tip_sub when a place failed tip  */
+} dial_dbg_t;                    /* total 616 bytes                      */
 
 extern volatile dial_dbg_t g_dial_dbg;
 

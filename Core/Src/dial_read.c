@@ -3053,6 +3053,7 @@ static void dbg_note(int16_t cx, int16_t cy, int16_t hx, int16_t hy,
   else if (reason == DIAL_FAIL_ARC) { g_dial_dbg.cnt_arc++; }
   else if (reason == DIAL_FAIL_TIP) { g_dial_dbg.cnt_tip++; }
   else if (reason == DIAL_FAIL_VIS) { g_dial_dbg.cnt_vis++; }
+  if (reason < 9U) { g_dial_dbg.n_cand_reason[reason]++; }
 }
 
 static int8_t dbg_place_of(int b, int32_t hx, int32_t hy, int32_t cx0, int32_t cy0)
@@ -3148,8 +3149,17 @@ static void dbg_finish(const dial_report_t *rep, int nb, int nd)
       g_dial_dbg.last_tip_sub[p] = tip;
       g_dial_dbg.last_cx[p] = cx; g_dial_dbg.last_cy[p] = cy;
       g_dial_dbg.last_hx[p] = hx; g_dial_dbg.last_hy[p] = hy;
+      if ((have & (uint8_t)(1U << p)) == 0U)
+      {
+        g_dial_dbg.n_miss_pl[p]++;
+        if (reason < 9U) { g_dial_dbg.n_reason[reason]++; g_dial_dbg.n_pl_reason[p][reason]++; }
+        if ((reason == DIAL_FAIL_TIP) && (tip < 8U)) { g_dial_dbg.n_tip_sub[tip]++; }
+      }
     }
   }
+  g_dial_dbg.n_frame++;
+  if (miss == 0U) { g_dial_dbg.n_ok++; }
+  else { g_dial_dbg.n_miss++; }
 }
 
 int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
