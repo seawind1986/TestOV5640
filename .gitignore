@@ -1,0 +1,22 @@
+# Keil 编译产物
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.bin
+*.map
+*.htm
+*.lnp
+*.dep
+*.lst
+*.iex
+*.build_log.htm
+*_sct.Bak
+JLinkLog.txt
+MDK-ARM/DebugConfig/
+MDK-ARM/*.uvguix.*
+
+# C# 接收程序
+Host/**/bin/
+Host/**/obj/

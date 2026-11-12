@@ -1,0 +1,57 @@
+
+/**
+#t* @brief GPIO Initialization Function
+#t* @param None
+#t* @retval None
+#t*/
+static void MX_GPIO_Init(void)
+{
+#tGPIO_InitTypeDef GPIO_InitStruct = {0};
+#t/* USER CODE BEGIN MX_GPIO_Init_1 */
+#n
+#t/* USER CODE END MX_GPIO_Init_1 */
+#n#t/* GPIO Ports Clock Enable */
+#t__HAL_RCC_GPIOI_CLK_ENABLE();
+#t__HAL_RCC_GPIOF_CLK_ENABLE();
+#t__HAL_RCC_GPIOH_CLK_ENABLE();
+#t__HAL_RCC_GPIOC_CLK_ENABLE();
+#t__HAL_RCC_GPIOA_CLK_ENABLE();
+#t__HAL_RCC_GPIOG_CLK_ENABLE();
+#t__HAL_RCC_GPIOE_CLK_ENABLE();
+#t__HAL_RCC_GPIOB_CLK_ENABLE();
+#t__HAL_RCC_GPIOD_CLK_ENABLE();
+#n#t/*Configure GPIO pin Output Level */
+#tHAL_GPIO_WritePin(OV5640_RESET_GPIO_Port, OV5640_RESET_Pin, GPIO_PIN_SET);
+#n#t/*Configure GPIO pin Output Level */
+#tHAL_GPIO_WritePin(GPIOB, OV5640_SDA_Pin|OV5640_SCL_Pin|LCD_BL_Pin, GPIO_PIN_SET);
+#n#t/*Configure GPIO pin : OV5640_XCLK_Pin */
+#tGPIO_InitStruct.Pin = OV5640_XCLK_Pin;
+#tGPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+#tGPIO_InitStruct.Pull = GPIO_NOPULL;
+#tGPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+#tGPIO_InitStruct.Alternate = GPIO_AF0_MCO;
+#tHAL_GPIO_Init(OV5640_XCLK_GPIO_Port, &GPIO_InitStruct);
+#n#t/*Configure GPIO pin : OV5640_RESET_Pin */
+#tGPIO_InitStruct.Pin = OV5640_RESET_Pin;
+#tGPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+#tGPIO_InitStruct.Pull = GPIO_NOPULL;
+#tGPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+#tHAL_GPIO_Init(OV5640_RESET_GPIO_Port, &GPIO_InitStruct);
+#n#t/*Configure GPIO pins : OV5640_SDA_Pin OV5640_SCL_Pin */
+#tGPIO_InitStruct.Pin = OV5640_SDA_Pin|OV5640_SCL_Pin;
+#tGPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+#tGPIO_InitStruct.Pull = GPIO_NOPULL;
+#tGPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+#tHAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+#n#t/*Configure GPIO pin : LCD_BL_Pin */
+#tGPIO_InitStruct.Pin = LCD_BL_Pin;
+#tGPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+#tGPIO_InitStruct.Pull = GPIO_PULLUP;
+#tGPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+#tHAL_GPIO_Init(LCD_BL_GPIO_Port, &GPIO_InitStruct);
+#n
+#t/* USER CODE BEGIN MX_GPIO_Init_2 */
+#n
+#t/* USER CODE END MX_GPIO_Init_2 */
+}
+#n

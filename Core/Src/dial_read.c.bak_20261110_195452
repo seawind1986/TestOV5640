@@ -1,0 +1,1585 @@
+/*
+ * dial_read.c  --  water-meter pointer-dial reader, STM32H743 port of the
+ * PC verification (dial_read.py + rectify.py + dial_mask_0001.py).
+ *
+ * Integer only. Angles in milli-degrees (mdeg), coordinates in 1/256 px (q8).
+ * All large buffers live in the caller's work area (SDRAM).
+ */
+#include "dial_read.h"
+#include "dial_font.h"
+#include <string.h>
+#include <limits.h>
+#ifdef DIAL_HOST_DEBUG
+#include <stdio.h>
+#endif
+
+#if defined(__GNUC__) || defined(__clang__) || defined(__ARMCC_VERSION)
+#define DIAL_WEAK __attribute__((weak))
+#else
+#define DIAL_WEAK
+#endif
+
+extern const int32_t dial_cos_q16[361];
+extern const int32_t dial_atan_mdeg[257];
+
+/* ---------------- parameters (same numbers as dial_read.py) ---------------- */
+#define RED_RMIN        95
+#define RED_DG          16
+#define RED_DB          16
+#define RED_GMAX        200
+#define RED_BMAX        190
+#define BLOB_MIN_AREA   400U
+#define CAND_MIN_AREA   800U
+#define HUB_WIN         120     /* hub test window half size               */
+#define HUB_MIN_DT      45      /* hub radius 15 px * 3 (3-4 chamfer)      */
+#define RAD_PAD         170     /* dial crop half size                     */
+#define ARC_T_STRONG    120
+#define ARC_WHITE       185
+#define ARC_RMIN        15
+#define ARC_RMAX        125
+#define ARC_SEED_MIN    40
+#define ARC_SEED_RMS2_X100 144  /* rms <= 1.2 px                            */
+#define ARC_NEAR        35
+#define ARC_CONTRAST    45
+#define ARC_WHITE_GAP   25
+#define ARC_MISS        2
+#define DARK_L          (ARC_WHITE - 30)   /* 155: dark / near-dark         */
+#define N_TICK          20
+#define STEP_MDEG       18000
+#define SNAP_MAX_MDEG   7000
+#define ISOLATE_MDEG    2500
+#define MIN_VIS_TICKS   5
+#define MAX_ARC_PTS     1100
+#define R_MIN_Q8        (30 * 256)
+#define R_MAX_Q8        (160 * 256)
+#define MAX_LABELS      65535U
+#define DT_INF          60000U
+
+#define TXT_R 230
+#define TXT_G 30
+#define TXT_B 30
+
+/* inverse rectification (rectified -> captured), from rectify.py fit on the
+ * 17:29:39 frame.  h11..h23 in Q20, h31/h32 in Q32, h33 = 1. */
+#define HI11  1071152
+#define HI12  5069
+#define HI13  (-4317748)
+#define HI21  5544
+#define HI22  1071955
+#define HI23  (-5061496)
+#define HI31  75697
+#define HI32  86945
+
+/* lighting normalisation for the analysis copy (display copy stays raw):
+ * 0 = off (exactly the PC verification), 1 = gain so the 90th luma percentile
+ * maps to the reference frame's white, 2 = two-point (10th and 90th percentile). */
+#ifndef DIAL_AUTO_LEVEL
+#define DIAL_AUTO_LEVEL     2
+#endif
+#define LEVEL_REF_LO        119     /* 10th percentile luma of the 17:29:39 frame */
+#define LEVEL_REF_HI        227     /* 90th percentile                            */
+static uint8_t s_lvl[256];
+static int32_t s_gain_q8 = 256, s_off = 0;
+
+/* default digit-place calibration (rectified frame, px) */
+static dial_cal_t s_cal[DIAL_MAX_FOUND] = {
+  {748, 132, 0}, {688, 345, 1}, {501, 456, 2}, {286, 416, 3}
+};
+static uint8_t s_ncal = 4U;
+
+/* ---------------- frame / work state ---------------- */
+static uint16_t s_w, s_h;
+static const uint8_t *s_L;      /* luma (r+2g+b)>>2           */
+static const uint8_t *s_red;    /* red mask                   */
+static uint16_t *s_lab;         /* blob labels (root id)      */
+static uint16_t *s_dt;          /* chamfer distance scratch   */
+static int32_t s_x0, s_y0, s_x1, s_y1;   /* current dial crop  */
+
+/* RGB565 -> 8 bit exactly as the LCD dump tool: floor(v*255/31), floor(v*255/63) */
+static uint8_t s_r5to8[32];
+static uint8_t s_g6to8[64];
+
+/* ---------------- small math ---------------- */
+static int32_t iabs32(int32_t v) { return (v < 0) ? -v : v; }
+static int64_t iabs64(int64_t v) { return (v < 0) ? -v : v; }
+
+static uint32_t isqrt64(uint64_t v)
+{
+  uint64_t res = 0U;
+  uint64_t bit = (uint64_t)1U << 62;
+  while (bit > v) { bit >>= 2; }
+  while (bit != 0U)
+  {
+    if (v >= res + bit) { v -= res + bit; res = (res >> 1) + bit; }
+    else { res >>= 1; }
+    bit >>= 2;
+  }
+  return (uint32_t)res;
+}
+
+static int32_t wrap_mdeg(int32_t a)
+{
+  a %= 360000;
+  if (a < 0) { a += 360000; }
+  return a;
+}
+
+/* (a-b+180)%360-180 */
+static int32_t angdiff_mdeg(int32_t a, int32_t b)
+{
+  return wrap_mdeg(a - b + 180000) - 180000;
+}
+
+static int32_t cos_deg(int32_t d) { d %= 360; if (d < 0) { d += 360; } return dial_cos_q16[d]; }
+static int32_t sin_deg(int32_t d) { return cos_deg(d + 270); }
+
+/* cos of an arbitrary angle: per-degree table + linear interpolation (Q16) */
+static int32_t cos_mdeg(int32_t a)
+{
+  int32_t i, f;
+  a = wrap_mdeg(a);
+  i = a / 1000;
+  f = a - i * 1000;
+  return dial_cos_q16[i] + (int32_t)(((int64_t)(dial_cos_q16[i + 1] - dial_cos_q16[i]) * f) / 1000);
+}
+static int32_t sin_mdeg(int32_t a) { return cos_mdeg(a + 270000); }
+
+/* atan2 -> [0, 360000) mdeg, image convention (y down) like numpy */
+static int32_t atan2_mdeg(int64_t y, int64_t x)
+{
+  uint64_t ax = (uint64_t)iabs64(x), ay = (uint64_t)iabs64(y);
+  uint64_t mx;
+  uint32_t t, idx, fr;
+  int32_t a;
+  if ((ax == 0U) && (ay == 0U)) { return 0; }
+  mx = (ax > ay) ? ax : ay;
+  while (mx >= 32768U) { ax >>= 1; ay >>= 1; mx >>= 1; }
+  if (ax >= ay)
+  {
+    t = (uint32_t)((ay << 16) / ax);
+  }
+  else
+  {
+    t = (uint32_t)((ax << 16) / ay);
+  }
+  idx = t >> 8;
+  fr = t & 255U;
+  if (idx >= 256U) { a = dial_atan_mdeg[256]; }
+  else { a = dial_atan_mdeg[idx] + (((dial_atan_mdeg[idx + 1] - dial_atan_mdeg[idx]) * (int32_t)fr) >> 8); }
+  if (ax < ay) { a = 90000 - a; }
+  if (x < 0) { a = 180000 - a; }
+  if (y < 0) { a = 360000 - a; }
+  if (a >= 360000) { a -= 360000; }
+  return a;
+}
+
+/* num * 2^e / den, keeping inside int64 */
+static int64_t muldiv_p2(int64_t num, int64_t den, int e)
+{
+  if (den == 0) { return 0; }
+  while ((e > 0) && (iabs64(num) < ((int64_t)1 << 61))) { num *= 2; e--; }
+  while (e > 0) { den /= 2; e--; if (den == 0) { return 0; } }
+  while ((e < 0) && (iabs64(den) < ((int64_t)1 << 61))) { den *= 2; e++; }
+  while (e < 0) { num /= 2; e++; }
+  return num / den;
+}
+
+static int bits_needed(int64_t v)
+{
+  int n = 0;
+  uint64_t u = (uint64_t)iabs64(v);
+  while (u != 0U) { u >>= 1; n++; }
+  return n;
+}
+
+/* ---------------- samplers ---------------- */
+static int round_q8(int32_t v) { return (v + 128) >> 8; }
+
+/* luma at a q8 position inside the current crop, -1 = outside (None) */
+static int L_at(int32_t x_q8, int32_t y_q8)
+{
+  int32_t xi = round_q8(x_q8), yi = round_q8(y_q8);
+  if ((xi < s_x0) || (yi < s_y0) || (xi >= s_x1) || (yi >= s_y1)) { return -1; }
+  return s_L[(uint32_t)yi * s_w + (uint32_t)xi];
+}
+
+static int red_at(int32_t x_q8, int32_t y_q8)
+{
+  int32_t xi = round_q8(x_q8), yi = round_q8(y_q8);
+  if ((xi < s_x0) || (yi < s_y0) || (xi >= s_x1) || (yi >= s_y1)) { return 0; }
+  return s_red[(uint32_t)yi * s_w + (uint32_t)xi];
+}
+
+/* point on a ray: c + r*dir, r in q8, dir in Q16 */
+static int32_t ray_q8(int32_t c_q8, int32_t r_q8, int32_t d_q16)
+{
+  return c_q8 + (int32_t)(((int64_t)r_q8 * d_q16 + 32768) >> 16);
+}
+
+/* ---------------- Kasa algebraic circle fit ---------------- */
+typedef struct { int32_t x, y; } pt_t;
+
+static int kasa_fit(const pt_t *p, int n, int32_t *cx, int32_t *cy, int32_t *r)
+{
+  int64_t sx = 0, sy = 0, suu = 0, svv = 0, suv = 0, suuu = 0, svvv = 0, suvv = 0, suuv = 0;
+  int64_t b1, b2, num_u, num_v, det, r2;
+  int32_t mx, my, uc, vc;
+  int i, sa, sb, m;
+  if (n < 3) { return -1; }
+  for (i = 0; i < n; i++) { sx += p[i].x; sy += p[i].y; }
+  mx = (int32_t)(sx / n);
+  my = (int32_t)(sy / n);
+  for (i = 0; i < n; i++)
+  {
+    int64_t u = p[i].x - mx, v = p[i].y - my;
+    int64_t uu = u * u, vv = v * v;
+    suu += uu; svv += vv; suv += u * v;
+    suuu += uu * u; svvv += vv * v; suvv += u * vv; suuv += uu * v;
+  }
+  b1 = suuu + suvv;
+  b2 = svvv + suuv;
+  m = bits_needed(suu); if (bits_needed(svv) > m) { m = bits_needed(svv); } if (bits_needed(suv) > m) { m = bits_needed(suv); }
+  sa = (m > 28) ? (m - 28) : 0;
+  m = bits_needed(b1); if (bits_needed(b2) > m) { m = bits_needed(b2); }
+  sb = (m > 31) ? (m - 31) : 0;
+  {
+    int64_t a11 = suu >> sa, a22 = svv >> sa, a12 = suv >> sa;
+    int64_t c1 = b1 >> sb, c2 = b2 >> sb;
+    det = 2 * (a11 * a22 - a12 * a12);
+    if (det <= 0) { return -1; }
+    num_u = a22 * c1 - a12 * c2;
+    num_v = a11 * c2 - a12 * c1;
+    uc = (int32_t)muldiv_p2(num_u, det, sb - sa);
+    vc = (int32_t)muldiv_p2(num_v, det, sb - sa);
+  }
+  r2 = (int64_t)uc * uc + (int64_t)vc * vc + (suu + svv) / n;
+  if (r2 <= 16 * 65536) { return -1; }
+  *cx = mx + uc;
+  *cy = my + vc;
+  *r = (int32_t)isqrt64((uint64_t)r2);
+  return 0;
+}
+
+/* sum of squared radial residuals (q16) */
+static int64_t circle_ss(const pt_t *p, int n, int32_t cx, int32_t cy, int32_t r)
+{
+  int64_t ss = 0;
+  int i;
+  for (i = 0; i < n; i++)
+  {
+    int64_t dx = p[i].x - cx, dy = p[i].y - cy;
+    int32_t d = (int32_t)isqrt64((uint64_t)(dx * dx + dy * dy)) - r;
+    ss += (int64_t)d * d;
+  }
+  return ss;
+}
+
+/* ---------------- chamfer 3-4 distance on a window ---------------- */
+/* mask(x,y) != 0 -> foreground. returns argmax (first in raster order) */
+typedef int (*mask_fn)(int32_t x, int32_t y, uint32_t arg);
+
+static uint16_t chamfer(int32_t x0, int32_t y0, int32_t w, int32_t h, mask_fn fn, uint32_t arg,
+                        int32_t *ax, int32_t *ay)
+{
+  int32_t x, y;
+  uint16_t best = 0U;
+  *ax = 0; *ay = 0;
+  for (y = 0; y < h; y++)
+  {
+    for (x = 0; x < w; x++)
+    {
+      uint32_t v;
+      uint16_t *d = &s_dt[y * w + x];
+      if (!fn(x0 + x, y0 + y, arg)) { *d = 0U; continue; }
+      v = DT_INF;
+      if (x) { uint32_t t = d[-1] + 3U; if (t < v) { v = t; } }
+      if (y) { uint32_t t = d[-w] + 3U; if (t < v) { v = t; } }
+      if (x && y) { uint32_t t = d[-w - 1] + 4U; if (t < v) { v = t; } }
+      if ((x < w - 1) && y) { uint32_t t = d[-w + 1] + 4U; if (t < v) { v = t; } }
+      *d = (uint16_t)v;
+    }
+  }
+  for (y = h - 1; y >= 0; y--)
+  {
+    for (x = w - 1; x >= 0; x--)
+    {
+      uint32_t v;
+      uint16_t *d = &s_dt[y * w + x];
+      if (*d == 0U) { continue; }
+      v = *d;
+      if (x < w - 1) { uint32_t t = d[1] + 3U; if (t < v) { v = t; } }
+      if (y < h - 1) { uint32_t t = d[w] + 3U; if (t < v) { v = t; } }
+      if ((x < w - 1) && (y < h - 1)) { uint32_t t = d[w + 1] + 4U; if (t < v) { v = t; } }
+      if (x && (y < h - 1)) { uint32_t t = d[w - 1] + 4U; if (t < v) { v = t; } }
+      *d = (uint16_t)v;
+    }
+  }
+  for (y = 0; y < h; y++)
+  {
+    for (x = 0; x < w; x++)
+    {
+      if (s_dt[y * w + x] > best) { best = s_dt[y * w + x]; *ax = x0 + x; *ay = y0 + y; }
+    }
+  }
+  return best;
+}
+
+static int mask_red(int32_t x, int32_t y, uint32_t arg)
+{
+  (void)arg;
+  return s_red[(uint32_t)y * s_w + (uint32_t)x];
+}
+static int mask_lab(int32_t x, int32_t y, uint32_t arg)
+{
+  return s_lab[(uint32_t)y * s_w + (uint32_t)x] == (uint16_t)arg;
+}
+
+/* ---------------- step 1: seam restore ---------------- */
+static void px8(uint16_t c, int *r, int *g, int *b)
+{
+  *r = s_r5to8[c >> 11];
+  *g = s_g6to8[(c >> 5) & 63U];
+  *b = s_r5to8[c & 31U];
+}
+static uint32_t pxdiff(uint16_t a, uint16_t b)
+{
+  int r1, g1, b1, r2, g2, b2;
+  px8(a, &r1, &g1, &b1);
+  px8(b, &r2, &g2, &b2);
+  return (uint32_t)(iabs32(r1 - r2) + iabs32(g1 - g2) + iabs32(b1 - b2));
+}
+
+/* column with the largest mean adjacent-column difference; verified by the
+ * wrap continuity W-1 -> 0.  Returns seam column (0 = none) and mode. */
+static int seam_detect(const uint16_t *raw, uint16_t w, uint16_t h, uint8_t *mode, uint32_t *colsum)
+{
+  uint32_t x, y, best = 0U, bestx = 0U;
+  uint64_t tot = 0U, wrap_row = 0U, wrap_lin = 0U;
+  for (x = 0U; x < w; x++) { colsum[x] = 0U; }
+  for (y = 0U; y < h; y++)
+  {
+    const uint16_t *row = raw + y * w;
+    for (x = 1U; x < w; x++) { colsum[x] += pxdiff(row[x], row[x - 1U]); }
+    wrap_row += pxdiff(row[w - 1U], row[0]);
+    if (y + 1U < h) { wrap_lin += pxdiff(row[w - 1U], row[w]); }
+  }
+  for (x = 1U; x < w; x++)
+  {
+    tot += colsum[x];
+    if (colsum[x] > best) { best = colsum[x]; bestx = x; }
+  }
+  if (DIAL_SEAM_MODE_CFG == 2) { *mode = (wrap_lin * h < wrap_row * (h - 1U)) ? 1U : 0U; }
+  else { *mode = (uint8_t)DIAL_SEAM_MODE_CFG; }
+  /* real seam: >= 4x the mean column difference and >= 3x the wrap difference */
+  if (((uint64_t)best * (w - 1U) < 4U * tot) || ((uint64_t)best < 3U * wrap_row)) { return 0; }
+  return (int)bestx;
+}
+
+/* ---------------- step 2: rectification (+ seam remap) ---------------- */
+static uint16_t pack565(int r, int g, int b)
+{
+  /* inverse of the 565->888 table above */
+  int r5 = (r * 31 + 127) / 255, g6 = (g * 63 + 127) / 255, b5 = (b * 31 + 127) / 255;
+  return (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+}
+
+static int is_red_px(int r, int g, int b)
+{
+  return (r >= RED_RMIN) && (r > g + RED_DG) && (r > b + RED_DB) && (g < RED_GMAX) && (b < RED_BMAX);
+}
+
+static void rectify(const uint16_t *src, uint16_t *out, uint8_t *L, uint8_t *red, uint16_t w, uint16_t h)
+{
+  int32_t x, y;
+  for (y = 0; y < h; y++)
+  {
+#if DIAL_RECTIFY_ON
+    int64_t X = (int64_t)HI12 * y + HI13;
+    int64_t Y = (int64_t)HI22 * y + HI23;
+    int64_t D = (int64_t)HI32 * y + ((int64_t)1 << 32);
+#endif
+    for (x = 0; x < w; x++)
+    {
+      uint32_t o = (uint32_t)y * w + (uint32_t)x;
+      int r, g, b;
+#if DIAL_RECTIFY_ON
+      /* 1/D by series (D = 1 - e, |e| < 0.05): 1 + e + e^2 + e^3 (Q30) */
+      int64_t e30 = (((int64_t)1 << 32) - D) >> 2;
+      int64_t e2 = (e30 * e30) >> 30;
+      int64_t inv = ((int64_t)1 << 30) + e30 + e2 + ((e2 * e30) >> 30);
+      int32_t sx = (int32_t)((X * inv) >> 42);   /* q8 */
+      int32_t sy = (int32_t)((Y * inv) >> 42);
+      int32_t xi = sx >> 8, yi = sy >> 8, fx = sx & 255, fy = sy & 255;
+      X += HI11; Y += HI21; D += HI31;
+      if ((xi < 0) || (yi < 0) || (xi >= (int32_t)w - 1) || (yi >= (int32_t)h - 1))
+      {
+        r = g = b = 0;
+      }
+      else
+      {
+        const uint16_t *p = src + (uint32_t)yi * w + (uint32_t)xi;
+        int r00, g00, b00, r01, g01, b01, r10, g10, b10, r11, g11, b11;
+        px8(p[0], &r00, &g00, &b00); px8(p[1], &r01, &g01, &b01);
+        px8(p[w], &r10, &g10, &b10); px8(p[w + 1], &r11, &g11, &b11);
+        r = (((r00 * (256 - fx) + r01 * fx) * (256 - fy)) + ((r10 * (256 - fx) + r11 * fx) * fy)) >> 16;
+        g = (((g00 * (256 - fx) + g01 * fx) * (256 - fy)) + ((g10 * (256 - fx) + g11 * fx) * fy)) >> 16;
+        b = (((b00 * (256 - fx) + b01 * fx) * (256 - fy)) + ((b10 * (256 - fx) + b11 * fx) * fy)) >> 16;
+      }
+#else
+      px8(src[o], &r, &g, &b);
+#endif
+      out[o] = pack565(r, g, b);
+      r = s_lvl[r]; g = s_lvl[g]; b = s_lvl[b];
+      L[o] = (uint8_t)((r + 2 * g + b) >> 2);
+      red[o] = (uint8_t)is_red_px(r, g, b);
+    }
+  }
+}
+
+/* luma percentiles of the frame -> level LUT. Near-unity corrections are
+ * ignored so a well-lit frame is processed exactly like the PC verification. */
+static void level_setup(const uint16_t *src, uint32_t npx, uint32_t *hist)
+{
+  uint32_t i, acc = 0U, p10 = 0U, p90 = 0U;
+  int32_t g = 256, off = 0;
+  for (i = 0U; i < 256U; i++) { hist[i] = 0U; }
+  if (DIAL_AUTO_LEVEL != 0)
+  {
+    for (i = 0U; i < npx; i += 4U)
+    {
+      int r, gg, b;
+      px8(src[i], &r, &gg, &b);
+      hist[(r + 2 * gg + b) >> 2]++;
+    }
+    for (i = 0U; i < 256U; i++)
+    {
+      acc += hist[i];
+      if ((p10 == 0U) && (acc * 10U >= npx / 4U)) { p10 = i; }
+      if ((p90 == 0U) && (acc * 10U >= 9U * (npx / 4U))) { p90 = i; }
+    }
+    if (DIAL_AUTO_LEVEL == 1)
+    {
+      if (p90 > 0U) { g = (int32_t)((LEVEL_REF_HI * 256U + p90 / 2U) / p90); }
+    }
+    else if (p90 > p10 + 20U)
+    {
+      g = (int32_t)(((LEVEL_REF_HI - LEVEL_REF_LO) * 256 + (int32_t)(p90 - p10) / 2) / (int32_t)(p90 - p10));
+      off = LEVEL_REF_LO * 256 - g * (int32_t)p10;     /* q8 */
+    }
+    if (g < 128) { g = 128; }
+    if (g > 512) { g = 512; }
+    if ((iabs32(g - 256) <= 8) && (iabs32(off) <= 4 * 256)) { g = 256; off = 0; }
+  }
+  s_gain_q8 = g; s_off = off;
+  for (i = 0U; i < 256U; i++)
+  {
+    int32_t v = ((int32_t)i * g + off + 128) >> 8;
+    s_lvl[i] = (uint8_t)((v < 0) ? 0 : ((v > 255) ? 255 : v));
+  }
+}
+
+/* ---------------- step 3: red blobs (4-connected union-find) ---------------- */
+typedef struct { uint32_t area; int64_t sx, sy; uint16_t id; uint32_t first; } blob_t;
+
+static uint16_t uf_find(uint16_t *par, uint16_t a)
+{
+  while (par[a] != a) { par[a] = par[par[a]]; a = par[a]; }
+  return a;
+}
+
+static int find_blobs(uint16_t *par, uint32_t *area, blob_t *bl, int maxb)
+{
+  uint32_t x, y, n = 0U;
+  int nb = 0, i, j;
+  for (y = 0U; y < s_h; y++)
+  {
+    for (x = 0U; x < s_w; x++)
+    {
+      uint32_t o = y * s_w + x;
+      uint16_t up, lf;
+      if (!s_red[o]) { s_lab[o] = 0U; continue; }
+      up = y ? s_lab[o - s_w] : 0U;
+      lf = x ? s_lab[o - 1U] : 0U;
+      if (up && lf)
+      {
+        uint16_t a = uf_find(par, up), b = uf_find(par, lf);
+        s_lab[o] = up;
+        if (a != b) { par[b] = a; }
+      }
+      else if (up) { s_lab[o] = up; }
+      else if (lf) { s_lab[o] = lf; }
+      else if (n + 1U < MAX_LABELS) { n++; par[n] = (uint16_t)n; s_lab[o] = (uint16_t)n; }
+      else { s_lab[o] = 0U; }
+    }
+  }
+  for (i = 0; i <= (int)n; i++) { area[i] = 0U; }
+  /* resolve to roots; collect stats per root in first-appearance order */
+  for (y = 0U; y < s_h; y++)
+  {
+    for (x = 0U; x < s_w; x++)
+    {
+      uint32_t o = y * s_w + x;
+      uint16_t r;
+      if (!s_lab[o]) { continue; }
+      r = uf_find(par, s_lab[o]);
+      s_lab[o] = r;
+      area[r]++;
+    }
+  }
+  for (y = 0U; (y < s_h) && (nb < maxb); y++)
+  {
+    for (x = 0U; x < s_w; x++)
+    {
+      uint32_t o = y * s_w + x;
+      uint16_t r = s_lab[o];
+      if (!r || (area[r] < BLOB_MIN_AREA)) { continue; }
+      for (i = 0; i < nb; i++) { if (bl[i].id == r) { break; } }
+      if (i == nb)
+      {
+        if (nb >= maxb) { continue; }
+        bl[nb].id = r; bl[nb].area = 0U; bl[nb].sx = 0; bl[nb].sy = 0; bl[nb].first = o; nb++;
+      }
+    }
+  }
+  for (y = 0U; y < s_h; y++)
+  {
+    for (x = 0U; x < s_w; x++)
+    {
+      uint16_t r = s_lab[y * s_w + x];
+      if (!r || (area[r] < BLOB_MIN_AREA)) { continue; }
+      for (i = 0; i < nb; i++)
+      {
+        if (bl[i].id == r) { bl[i].area++; bl[i].sx += (int64_t)x; bl[i].sy += (int64_t)y; break; }
+      }
+    }
+  }
+  /* stable sort by area, descending */
+  for (i = 1; i < nb; i++)
+  {
+    blob_t t = bl[i];
+    j = i - 1;
+    while ((j >= 0) && (bl[j].area < t.area)) { bl[j + 1] = bl[j]; j--; }
+    bl[j + 1] = t;
+  }
+  return nb;
+}
+
+/* ---------------- step 4: arc-seed circle ---------------- */
+static pt_t s_pts[MAX_ARC_PTS];
+static pt_t s_seed[360];
+static int16_t s_rr[360];
+
+/* adaptive trace along the circle from a_start (deg), step +1/-1 */
+static int arc_trace(int32_t cx, int32_t cy, int32_t R, int a_start, int step, pt_t *outp, int maxp)
+{
+  int vals[5] = { ARC_T_STRONG, ARC_T_STRONG, ARC_T_STRONG, ARC_T_STRONG, ARC_T_STRONG };
+  int vi = 0, vsum = 5 * ARC_T_STRONG;
+  int32_t r_prev_q8 = R;
+  int miss = 0, n = 0, a = a_start, it;
+  for (it = 0; it < 360; it++)
+  {
+    int32_t c, s, base, r, rmin = 0;
+    int vmin = 1000, vout = -1, d, ok = 1;
+    a = ((a + step) % 360 + 360) % 360;
+    c = cos_deg(a); s = sin_deg(a);
+    base = round_q8(r_prev_q8);
+    for (r = base - 3; r <= base + 3; r++)
+    {
+      int v = L_at(ray_q8(cx, r * 256, c), ray_q8(cy, r * 256, s));
+      if (v < 0) { ok = 0; break; }
+      if (v < vmin) { vmin = v; rmin = r; }
+    }
+    if (!ok) { break; }
+    for (d = 3; d < 8; d++)
+    {
+      int t = L_at(ray_q8(cx, (rmin + d) * 256, c), ray_q8(cy, (rmin + d) * 256, s));
+      if (t > vout) { vout = t; }
+    }
+    if (vout < 0) { vout = vmin; }
+    if (red_at(ray_q8(cx, rmin * 256, c), ray_q8(cy, rmin * 256, s))) { break; }
+    if ((vout - vmin < ARC_WHITE_GAP) && (vmin > ARC_WHITE - 20)) { break; }
+    if ((5 * vmin <= vsum + 5 * ARC_NEAR) && (vout - vmin >= ARC_CONTRAST))
+    {
+      if (n < maxp)
+      {
+        outp[n].x = ray_q8(cx, rmin * 256, c);
+        outp[n].y = ray_q8(cy, rmin * 256, s);
+        n++;
+      }
+      vsum += vmin - vals[vi]; vals[vi] = vmin; vi = (vi + 1) % 5;
+      r_prev_q8 = rmin * 256;
+      miss = 0;
+    }
+    else
+    {
+      miss++;
+      if (miss > ARC_MISS) { break; }
+    }
+  }
+  return n;
+}
+
+static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_t *pR, int *pcov)
+{
+  int a, i, run_s = 0, run_n = 0, best_s = 0, best_n = 0, nseed, rnd, npts;
+  int32_t cx, cy, R;
+  for (a = 0; a < 360; a++)
+  {
+    int32_t c = cos_deg(a), s = sin_deg(a), r;
+    int best = -1;
+    s_rr[a] = -1;
+    for (r = ARC_RMIN; r < ARC_RMAX; r++)
+    {
+      int v = L_at(ray_q8(hx, r * 256, c), ray_q8(hy, r * 256, s));
+      if (v < 0) { break; }
+      if (v <= ARC_T_STRONG)
+      {
+        int d, mx = -1;
+        for (d = 2; d < 9; d++)
+        {
+          int t = L_at(ray_q8(hx, (r + d) * 256, c), ray_q8(hy, (r + d) * 256, s));
+          if (t > mx) { mx = t; }
+        }
+        if (mx >= ARC_WHITE) { best = r; }
+      }
+    }
+    if (best >= 0)
+    {
+      int vb = 1000, rb = best;
+      for (r = best - 2; r < best + 2; r++)
+      {
+        int v = L_at(ray_q8(hx, r * 256, c), ray_q8(hy, r * 256, s));
+        if ((v >= 0) && (v < vb)) { vb = v; rb = r; }
+      }
+      s_rr[a] = (int16_t)rb;
+    }
+  }
+  /* longest circular run with |dr| <= 2 */
+  for (i = 0; i < 720; i++)
+  {
+    int r = s_rr[i % 360];
+    int prev = (run_n > 0) ? s_rr[(run_s + run_n - 1) % 360] : 0;
+    if ((r >= 0) && ((run_n == 0) || (iabs32(r - prev) <= 2)))
+    {
+      if (run_n == 0) { run_s = i; }
+      run_n++;
+    }
+    else
+    {
+      if (run_n > best_n) { best_n = run_n; best_s = run_s; }
+      if (r >= 0) { run_s = i; run_n = 1; } else { run_n = 0; }
+    }
+    if (run_n >= 360) { break; }
+  }
+  if (run_n > best_n) { best_n = run_n; best_s = run_s; }
+  if (best_n > 360) { best_n = 360; }
+  if (best_n < ARC_SEED_MIN) { return -1; }
+  nseed = best_n;
+  for (i = 0; i < nseed; i++)
+  {
+    int aa = (best_s + i) % 360;
+    s_seed[i].x = ray_q8(hx, s_rr[aa] * 256, cos_deg(aa));
+    s_seed[i].y = ray_q8(hy, s_rr[aa] * 256, sin_deg(aa));
+  }
+  if (kasa_fit(s_seed, nseed, &cx, &cy, &R) != 0) { return -1; }
+  if (circle_ss(s_seed, nseed, cx, cy, R) * 100 > (int64_t)ARC_SEED_RMS2_X100 * nseed * 65536) { return -1; }
+  {
+    int a_end = (atan2_mdeg(s_seed[nseed - 1].y - cy, s_seed[nseed - 1].x - cx) + 500) / 1000;
+    int a_beg = (atan2_mdeg(s_seed[0].y - cy, s_seed[0].x - cx) + 500) / 1000;
+    memcpy(s_pts, s_seed, (size_t)nseed * sizeof(pt_t));
+    npts = nseed;
+    for (rnd = 0; rnd < 3; rnd++)
+    {
+      int nf, nbw, nn;
+      int32_t ncx, ncy, nR;
+      nn = nseed;
+      memcpy(s_pts, s_seed, (size_t)nseed * sizeof(pt_t));
+      nf = arc_trace(cx, cy, R, a_end, +1, &s_pts[nn], MAX_ARC_PTS - nn);
+      nn += nf;
+      nbw = arc_trace(cx, cy, R, a_beg, -1, &s_pts[nn], MAX_ARC_PTS - nn);
+      nn += nbw;
+      if (kasa_fit(s_pts, nn, &ncx, &ncy, &nR) != 0) { break; }
+      cx = ncx; cy = ncy; R = nR; npts = nn;
+    }
+  }
+  {
+    uint8_t occ[36];
+    int cov = 0;
+    memset(occ, 0, sizeof(occ));
+    for (i = 0; i < npts; i++) { occ[atan2_mdeg(s_pts[i].y - cy, s_pts[i].x - cx) / 10000] = 1U; }
+    for (i = 0; i < 36; i++) { cov += occ[i]; }
+    *pcov = cov;
+  }
+  *pcx = cx; *pcy = cy; *pR = R;
+  return 0;
+}
+
+/* ---------------- step 5: ticks ---------------- */
+static void tick_len_profile(int32_t cx, int32_t cy, int32_t R, int16_t *hist)
+{
+  int a;
+  int rmax_in = (int)(((int64_t)R * 24 + 12800) / 25600);   /* round(R*0.24) */
+  for (a = 0; a < 360; a++)
+  {
+    int32_t c = cos_deg(a), s = sin_deg(a);
+    int d, vr = 1000, dr = 0, ok = 1, k, n = 0, gap = 0, thr;
+    int32_t r0;
+    hist[a] = 0;
+    for (d = -2; d <= 2; d++)
+    {
+      int v = L_at(ray_q8(cx, R + d * 256, c), ray_q8(cy, R + d * 256, s));
+      if (v < 0) { ok = 0; break; }
+      if (v < vr) { vr = v; dr = d; }
+    }
+    if (!ok) { continue; }
+    thr = vr + ARC_NEAR;
+    r0 = R + dr * 256;
+    for (k = 3; k < rmax_in; k++)
+    {
+      int32_t px = ray_q8(cx, r0 - k * 256, c), py = ray_q8(cy, r0 - k * 256, s);
+      int v = L_at(px, py);
+      if (v < 0) { break; }
+      if (red_at(px, py)) { n = -1; break; }
+      if ((v <= thr) && (v <= DARK_L)) { n = k - 2; gap = 0; }
+      else { gap++; if (gap > 1) { break; } }
+    }
+    hist[a] = (int16_t)((n > 0) ? n : 0);
+  }
+}
+
+typedef struct { int32_t a; int32_t h; } peak_t;   /* a in mdeg */
+
+static void sort_by_h_stable(peak_t *p, int n)
+{
+  int i, j;
+  for (i = 1; i < n; i++)
+  {
+    peak_t t = p[i];
+    j = i - 1;
+    while ((j >= 0) && (p[j].h < t.h)) { p[j + 1] = p[j]; j--; }
+    p[j + 1] = t;
+  }
+}
+static void sort_by_a(peak_t *p, int n)
+{
+  int i, j;
+  for (i = 1; i < n; i++)
+  {
+    peak_t t = p[i];
+    j = i - 1;
+    while ((j >= 0) && (p[j].a > t.a)) { p[j + 1] = p[j]; j--; }
+    p[j + 1] = t;
+  }
+}
+
+static int H360(const int16_t *h, int i) { return h[((i % 360) + 360) % 360]; }
+
+static int find_peaks(const int16_t *hist, peak_t *out, int maxn, int min_sep)
+{
+  peak_t c[360];
+  int nc = 0, i, j, n = 0;
+  const int sep = min_sep, minh = 3;
+  for (i = 0; i < 360; i++)
+  {
+    int v = hist[i], d, ok = 1;
+    if ((v < minh) || (v < H360(hist, i - 1)) || (v < H360(hist, i + 1))) { continue; }
+    for (d = -2; d <= 2; d++) { if (H360(hist, i + d) > v) { ok = 0; } }
+    if (ok) { c[nc].a = i; c[nc].h = v; nc++; }
+  }
+  sort_by_h_stable(c, nc);
+  for (i = 0; (i < nc) && (n < maxn); i++)
+  {
+    int ok = 1;
+    for (j = 0; j < n; j++)
+    {
+      int d = iabs32(c[i].a - out[j].a);
+      if (360 - d < d) { d = 360 - d; }
+      if (d < sep) { ok = 0; break; }
+    }
+    if (ok) { out[n++] = c[i]; }
+  }
+  sort_by_a(out, n);
+  for (i = 0; i < n; i++) { out[i].a *= 1000; }
+  return n;
+}
+
+/* Drop short peaks (< 0.75 of the upper-half median length).  Used on
+ * 10-tick dials so a mid-sector shadow / paper-tip mark is not a tick. */
+static int drop_short_peaks(peak_t *pk, int n)
+{
+  int h[64], i, j, ntop, mid;
+  int32_t lmaj, thr;
+  if (n <= 0) { return n; }
+  if (n > 64) { n = 64; }
+  for (i = 0; i < n; i++) { h[i] = pk[i].h; }
+  for (i = 1; i < n; i++)
+  {
+    int t = h[i];
+    j = i - 1;
+    while ((j >= 0) && (h[j] > t)) { h[j + 1] = h[j]; j--; }
+    h[j + 1] = t;
+  }
+  ntop = n / 2; if (ntop < 1) { ntop = 1; }
+  mid = n - ntop + (ntop - 1) / 2;
+  lmaj = h[mid];
+  if ((ntop % 2) == 0) { lmaj = (h[mid] + h[mid + 1]) / 2; }
+  thr = (lmaj * 3 + 2) / 4;            /* 0.75 * lmaj, rounded */
+  j = 0;
+  for (i = 0; i < n; i++) { if (pk[i].h >= thr) { pk[j++] = pk[i]; } }
+  return j;
+}
+
+/* fit a 36 deg grid to the strongest peaks; returns offset of the slot grid */
+static void phase_offset(const peak_t *pk, int n, int *off, int *major_base, int allow_half)
+{
+  peak_t top[40];
+  int nt, o, i, best_o = 0;
+  int64_t best_s = -1;
+  if (n <= 0) { *off = 0; *major_base = 0; return; }
+  nt = (n > 40) ? 40 : n;
+  memcpy(top, pk, (size_t)nt * sizeof(peak_t));
+  sort_by_h_stable(top, nt);
+  if (nt > 10) { nt = 10; }
+  for (o = 0; o < 36; o++)
+  {
+    int64_t acc = 0;
+    for (i = 0; i < nt; i++)
+    {
+      int a = top[i].a / 1000;
+      int d = iabs32(angdiff_mdeg(a * 1000, o * 1000)) / 1000;
+      /* nearest 36-grid line: |ang_diff| folded into 0..18 */
+      d = ((a - o) % 36 + 36) % 36;
+      if (d > 18) { d = 36 - d; }
+      if (d < 18) { acc += (int64_t)(18 - d) * top[i].h; }
+    }
+    if (acc > best_s) { best_s = acc; best_o = o; }
+  }
+  if (!allow_half) { *off = best_o % 36; *major_base = 0; }
+  else if (best_o < 18) { *off = best_o; *major_base = 0; }
+  else { *off = best_o - 18; *major_base = 1; }
+}
+
+static int32_t refine_peak(const int16_t *hist, int32_t a0_mdeg)
+{
+  int a0 = a0_mdeg / 1000, d, k = 0, peak = -1, cnt = 0;
+  int64_t sw = 0, sh = 0;
+  int hh[9];
+  for (d = -4; d <= 4; d++)
+  {
+    hh[d + 4] = H360(hist, a0 + d);
+    if (hh[d + 4] > peak) { peak = hh[d + 4]; k = d + 4; }
+  }
+  if (peak <= 0) { return a0 * 1000; }
+  for (d = 0; d < 9; d++)
+  {
+    if (10 * hh[d] >= 7 * peak) { cnt++; sw += (int64_t)(a0 + d - 4) * 1000 * hh[d]; sh += hh[d]; }
+  }
+  if (cnt <= 1) { return wrap_mdeg((a0 + k - 4) * 1000); }
+  return wrap_mdeg((int32_t)((sw + sh / 2) / sh));
+}
+
+typedef struct
+{
+  int32_t tick[N_TICK];
+  uint8_t vis[N_TICK];
+  uint8_t keep[N_TICK];
+  int major_base;
+  int n_vis;
+  int n_tick;        /* 20 if half ticks allowed, else 10                  */
+  int allow_half;    /* 1 only on calibration place 3 (x0.0001)            */
+} ticks_t;
+
+/* allow_half: only x0.0001 has half ticks (20 slots / 18 deg).
+ * Other dials: 10 majors on a 36 deg grid; mid-sector peaks (~18 deg away)
+ * fail SNAP_MAX (7 deg) and are discarded as noise. */
+static void build_ticks(const int16_t *hist, const peak_t *pk, int n, int off, int major_base, int allow_half, ticks_t *T)
+{
+  peak_t pr[64], kept[64];
+  int jj[64];
+  int32_t dd[64];
+  int32_t grid[N_TICK];
+  int32_t asg[N_TICK];
+  uint8_t used[N_TICK];
+  int i, k, j, nk = 0;
+  int n_tick = allow_half ? 20 : 10;
+  int32_t step = allow_half ? STEP_MDEG : 36000;
+  int half;
+  memset(T, 0, sizeof(*T));
+  T->n_tick = n_tick;
+  T->allow_half = allow_half;
+  T->major_base = allow_half ? major_base : 0;
+  if (n > 64) { n = 64; }
+  for (k = 0; k < n_tick; k++) { grid[k] = wrap_mdeg(off * 1000 + k * step); asg[k] = -1; used[k] = 0U; }
+  for (i = 0; i < n; i++) { pr[i].a = refine_peak(hist, pk[i].a); pr[i].h = pk[i].h; }
+  /* isolate_drop against this dial's grid */
+  for (i = 0; i < n; i++)
+  {
+    int32_t bd = 0x7fffffff;
+    jj[i] = 0;
+    for (k = 0; k < n_tick; k++)
+    {
+      int32_t d = angdiff_mdeg(pr[i].a, grid[k]);
+      if (iabs32(d) < bd) { bd = iabs32(d); jj[i] = k; dd[i] = d; }
+    }
+  }
+  half = n_tick / 2;
+  for (i = 0; i < n; i++)
+  {
+    int share = 0;
+    if (iabs32(dd[i]) <= ISOLATE_MDEG) { kept[nk++] = pr[i]; continue; }
+    for (j = 0; j < n; j++)
+    {
+      int sd;
+      if (j == i) { continue; }
+      sd = (((jj[j] - jj[i] + half) % n_tick) + n_tick) % n_tick - half;
+      if ((iabs32(sd) <= 1) && (iabs32(dd[j] - dd[i]) < 1500) && (iabs32(dd[j]) > (ISOLATE_MDEG * 6) / 10)) { share = 1; break; }
+    }
+    if (share) { kept[nk++] = pr[i]; }
+  }
+  sort_by_h_stable(kept, nk);
+  for (i = 0; i < nk; i++)
+  {
+    int32_t bd = 0x7fffffff;
+    int bk = 0;
+    for (k = 0; k < n_tick; k++)
+    {
+      int32_t d = used[k] ? 0x7fffffff : iabs32(angdiff_mdeg(kept[i].a, grid[k]));
+      if (d < bd) { bd = d; bk = k; }
+    }
+    if (bd <= SNAP_MAX_MDEG) { asg[bk] = kept[i].a; used[bk] = 1U; }
+  }
+  T->n_vis = 0;
+  for (k = 0; k < n_tick; k++)
+  {
+    int pk_ = -1, nx = -1, d;
+    if (asg[k] >= 0) { T->tick[k] = asg[k]; T->vis[k] = 1U; T->n_vis++; continue; }
+    T->vis[k] = 0U;
+    for (d = 1; d < n_tick; d++) { if (asg[(k - d + n_tick) % n_tick] >= 0) { pk_ = (k - d + n_tick) % n_tick; break; } }
+    for (d = 1; d < n_tick; d++) { if (asg[(k + d) % n_tick] >= 0) { nx = (k + d) % n_tick; break; } }
+    if ((pk_ >= 0) && (nx >= 0) && (pk_ != nx))
+    {
+      int span = (nx - pk_ + n_tick) % n_tick, t = (k - pk_ + n_tick) % n_tick;
+      int32_t fwd = wrap_mdeg(asg[nx] - asg[pk_]);
+      T->tick[k] = wrap_mdeg(asg[pk_] + (int32_t)(((int64_t)fwd * t + span / 2) / span));
+    }
+    else
+    {
+      T->tick[k] = grid[k];
+    }
+  }
+}
+
+/* count dark pixels along a tick line (for snapping completed ticks) */
+static void dark_count(int32_t cx, int32_t cy, int32_t R, int32_t a_mdeg, int len_pct, int *pn, int *ptot)
+{
+  int32_t c = cos_mdeg(a_mdeg), s = sin_mdeg(a_mdeg);
+  int32_t r, r0 = (int32_t)(((int64_t)R * (100 - len_pct)) / 25600), r1 = (R >> 8) - 2;
+  int n = 0, tot = 0;
+  for (r = r0; r < r1; r++)
+  {
+    int32_t px = ray_q8(cx, r * 256, c), py = ray_q8(cy, r * 256, s);
+    int v = L_at(px, py);
+    if (v < 0) { continue; }
+    tot++;
+    if ((v <= DARK_L) || red_at(px, py)) { n++; }
+  }
+  *pn = n; *ptot = tot;
+}
+
+static void snap_completed(int32_t cx, int32_t cy, int32_t R, ticks_t *T)
+{
+  int k, i, n_tick = T->n_tick ? T->n_tick : N_TICK;
+  for (k = 0; k < n_tick; k++)
+  {
+    int bn = -1, bi = 0, found = 0;
+    int32_t ba = 0;
+    int is_maj = (!T->allow_half || ((k % 2) == T->major_base));
+    int len = is_maj ? 16 : 10;
+    T->keep[k] = 1U;
+    if (T->vis[k]) { continue; }
+    for (i = -8; i <= 8; i++)
+    {
+      int n, tot;
+      int32_t a = T->tick[k] + 500 * i;
+      dark_count(cx, cy, R, a, len, &n, &tot);
+      if (tot && (10 * n >= 6 * tot))
+      {
+        if (!found || (n > bn) || ((n == bn) && (-iabs32(i) > -iabs32(bi))))
+        {
+          found = 1; bn = n; bi = i; ba = a;
+        }
+      }
+    }
+    if (!found) { T->keep[k] = 0U; }
+    else { T->tick[k] = wrap_mdeg(ba); }
+  }
+}
+
+/* ---------------- step 6: pointer axis ---------------- */
+static int pointer_tip(uint16_t id, int32_t *tx, int32_t *ty)
+{
+  int32_t w = s_x1 - s_x0, h = s_y1 - s_y0, ax, ay, x, y;
+  uint16_t dtm;
+  int64_t n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, cnt = 0;
+  int64_t lim;
+  for (y = s_y0; y < s_y1; y++)
+  {
+    for (x = s_x0; x < s_x1; x++) { if (s_lab[(uint32_t)y * s_w + (uint32_t)x] == id) { cnt++; } }
+  }
+  if (cnt < 40) { return -1; }
+  dtm = chamfer(s_x0, s_y0, w, h, mask_lab, id, &ax, &ay);
+  lim = (int64_t)(dtm + 9U) * (dtm + 9U);      /* (ar+3)^2 * 9 */
+  for (y = s_y0; y < s_y1; y++)
+  {
+    for (x = s_x0; x < s_x1; x++)
+    {
+      int64_t dx = x - ax, dy = y - ay;
+      if (s_lab[(uint32_t)y * s_w + (uint32_t)x] != id) { continue; }
+      if (9 * (dx * dx + dy * dy) <= lim) { continue; }
+      n++; sx += x; sy += y; sxx += (int64_t)x * x; syy += (int64_t)y * y; sxy += (int64_t)x * y;
+    }
+  }
+  if (n >= 30)
+  {
+    int64_t a = n * sxx - sx * sx, b = n * syy - sy * sy, c = n * sxy - sx * sy;
+    int64_t p, q, s, v1x, v1y, v2x, v2y, vx, vy, mx, my, tmax = INT64_MIN, nv2;
+    int m = bits_needed(a), sh;
+    if (bits_needed(b) > m) { m = bits_needed(b); }
+    if (bits_needed(c) > m) { m = bits_needed(c); }
+    sh = (m > 28) ? (m - 28) : 0;
+    a >>= sh; b >>= sh; c >>= sh;
+    p = a - b; q = 2 * c;
+    s = (int64_t)isqrt64((uint64_t)(p * p + q * q));
+    v1x = p + s; v1y = q; v2x = q; v2y = s - p;
+    if (iabs64(v1x) + iabs64(v1y) >= iabs64(v2x) + iabs64(v2y)) { vx = v1x; vy = v1y; } else { vx = v2x; vy = v2y; }
+    if ((vx == 0) && (vy == 0)) { vx = 1; }
+    while ((iabs64(vx) > 16384) || (iabs64(vy) > 16384)) { vx /= 2; vy /= 2; }
+    mx = (sx * 256) / n; my = (sy * 256) / n;
+    if (((mx - (int64_t)ax * 256) * vx + (my - (int64_t)ay * 256) * vy) < 0) { vx = -vx; vy = -vy; }
+    for (y = s_y0; y < s_y1; y++)
+    {
+      for (x = s_x0; x < s_x1; x++)
+      {
+        int64_t dx = x - ax, dy = y - ay, pr;
+        if (s_lab[(uint32_t)y * s_w + (uint32_t)x] != id) { continue; }
+        if (9 * (dx * dx + dy * dy) <= lim) { continue; }
+        pr = ((int64_t)x * 256 - mx) * vx + ((int64_t)y * 256 - my) * vy;
+        if (pr > tmax) { tmax = pr; }
+      }
+    }
+    nv2 = vx * vx + vy * vy;
+    *tx = (int32_t)(mx + (vx * tmax) / nv2);
+    *ty = (int32_t)(my + (vy * tmax) / nv2);
+    return 0;
+  }
+  /* fallback: farthest substantial pointer pixel from the hub */
+  {
+    int64_t bd = -1;
+    for (y = s_y0; y < s_y1; y++)
+    {
+      for (x = s_x0; x < s_x1; x++)
+      {
+        int64_t dx = x - ax, dy = y - ay;
+        if (s_dt[(y - s_y0) * w + (x - s_x0)] < 5U) { continue; }
+        if (dx * dx + dy * dy > bd) { bd = dx * dx + dy * dy; *tx = x * 256; *ty = y * 256; }
+      }
+    }
+    return (bd >= 0) ? 0 : -1;
+  }
+}
+
+/* ---------------- step 7: reading between printed main ticks ---------------- */
+static int32_t read_value(int32_t pang, const int32_t *maj)
+{
+  int k, bk = 0;
+  int32_t bd = 0x7fffffff;
+  for (k = 0; k < 10; k++)
+  {
+    int32_t a0 = maj[k], a1 = maj[(k + 1) % 10];
+    int32_t span = wrap_mdeg(a1 - a0), t = wrap_mdeg(pang - a0);
+    if (span <= 0) { continue; }
+    if (t <= span) { return k * 10000 + (int32_t)(((int64_t)t * 10000 + span / 2) / span); }
+  }
+  for (k = 0; k < 10; k++)
+  {
+    int32_t d = iabs32(angdiff_mdeg(pang, maj[k]));
+    if (d < bd) { bd = d; bk = k; }
+  }
+  return bk * 10000;
+}
+
+/* ---------------- text ---------------- */
+static const dial_glyph_t *glyph_of(uint8_t ch)
+{
+  uint32_t i;
+  for (i = 0U; i < DIAL_FONT_NGLYPH; i++) { if (dial_font_glyphs[i].code == ch) { return &dial_font_glyphs[i]; } }
+  return 0;
+}
+
+static void blend(uint16_t *px, int r, int g, int b, int a)
+{
+  int r0, g0, b0;
+  px8(*px, &r0, &g0, &b0);
+  r0 = (r * a + r0 * (15 - a) + 7) / 15;
+  g0 = (g * a + g0 * (15 - a) + 7) / 15;
+  b0 = (b * a + b0 * (15 - a) + 7) / 15;
+  *px = pack565(r0, g0, b0);
+}
+
+static void draw_str(uint16_t *fb, int x, int y, const char *s, int r, int g, int b)
+{
+  int32_t pen = x * 64;
+  for (; *s; s++)
+  {
+    const dial_glyph_t *gl = glyph_of((uint8_t)*s);
+    int gx, gy, i, j;
+    if (!gl) { continue; }
+    gx = (int)((pen + 32) >> 6) + gl->xoff;
+    gy = y + gl->yoff;
+    for (j = 0; j < gl->h; j++)
+    {
+      for (i = 0; i < gl->w; i++)
+      {
+        int idx = j * gl->w + i, a = (gl->bits[idx >> 1] >> ((idx & 1) * 4)) & 15;
+        int px = gx + i, py = gy + j;
+        if (!a || (px < 0) || (py < 0) || (px >= s_w) || (py >= s_h)) { continue; }
+        blend(&fb[(uint32_t)py * s_w + (uint32_t)px], r, g, b, a);
+      }
+    }
+    pen += gl->adv64;
+  }
+}
+
+/* red text with black outline (8 neighbours, 2 px) */
+static void draw_text(uint16_t *fb, int x, int y, const char *s)
+{
+  static const int8_t o[8][2] = { {-2, 0}, {2, 0}, {0, -2}, {0, 2}, {-1, -1}, {1, -1}, {-1, 1}, {1, 1} };
+  int i;
+  for (i = 0; i < 8; i++) { draw_str(fb, x + o[i][0], y + o[i][1], s, 0, 0, 0); }
+  draw_str(fb, x, y, s, TXT_R, TXT_G, TXT_B);
+}
+
+static char *put_n(char *p, uint32_t v, int digits)
+{
+  int i;
+  for (i = digits - 1; i >= 0; i--) { p[i] = (char)('0' + (v % 10U)); v /= 10U; }
+  return p + digits;
+}
+
+/* ---------------- green completed ticks (dark pixels only) ---------------- */
+typedef struct
+{
+  int32_t cx, cy, R;
+  int32_t x0, y0, x1, y1;
+  ticks_t T;
+} dial_geo_t;
+
+static void paint_ticks(uint16_t *fb, const dial_geo_t *g)
+{
+  int32_t x, y;
+  int64_t rin = ((int64_t)g->R * 988) / 1000, rout = ((int64_t)g->R * 1012) / 1000;
+  int64_t tin = ((int64_t)g->R * 84) / 100, tout = ((int64_t)g->R * 10036) / 10000;
+  int64_t rin2 = rin * rin, rout2 = rout * rout, tin2 = tin * tin, tout2 = tout * tout;
+  int64_t min2[N_TICK];
+  int k, n_tick = g->T.n_tick ? g->T.n_tick : N_TICK;
+  for (k = 0; k < n_tick; k++)
+  {
+    int is_maj = (!g->T.allow_half || ((k % 2) == g->T.major_base));
+    int64_t r0 = ((int64_t)g->R * (is_maj ? 84 : 90)) / 100;
+    min2[k] = r0 * r0;
+  }
+  for (y = g->y0; y < g->y1; y++)
+  {
+    for (x = g->x0; x < g->x1; x++)
+    {
+      uint32_t o = (uint32_t)y * s_w + (uint32_t)x;
+      int64_t dx = (int64_t)x * 256 - g->cx, dy = (int64_t)y * 256 - g->cy, d2 = dx * dx + dy * dy;
+      int on = 0;
+      if (!((s_L[o] <= DARK_L) || s_red[o])) { continue; }
+      if ((d2 >= rin2) && (d2 <= rout2)) { on = 1; }
+      else if ((d2 >= tin2) && (d2 <= tout2))
+      {
+        int32_t aa = atan2_mdeg(dy, dx);
+        for (k = 0; k < n_tick; k++)
+        {
+          int is_maj = (!g->T.allow_half || ((k % 2) == g->T.major_base));
+          int32_t hw = is_maj ? 800 : 600;
+          if (!g->T.keep[k] || (d2 < min2[k])) { continue; }
+          if (iabs32(angdiff_mdeg(aa, g->T.tick[k])) <= hw) { on = 1; break; }
+        }
+      }
+      if (on) { fb[o] = 0x07E0U; }
+    }
+  }
+}
+
+/* ---------------- hooks ---------------- */
+DIAL_WEAK void dial_get_time(dial_time_t *t)
+{
+  t->year = 2026U; t->mon = 1U; t->day = 1U; t->hour = 0U; t->min = 0U; t->sec = 0U;
+}
+
+DIAL_WEAK int dial_save_suspect_frame(const uint16_t *frame, uint16_t w, uint16_t h, const char *name)
+{
+  (void)frame; (void)w; (void)h; (void)name;
+  return -1;   /* no storage yet: implement on SD card / QSPI flash */
+}
+
+/* ---------------- calibration ---------------- */
+void DialRead_SetOrderCal(const dial_cal_t *cal, uint8_t n)
+{
+  if (n > DIAL_MAX_FOUND) { n = DIAL_MAX_FOUND; }
+  memcpy(s_cal, cal, (size_t)n * sizeof(dial_cal_t));
+  s_ncal = n;
+}
+
+const dial_cal_t *DialRead_GetOrderCal(uint8_t *n)
+{
+  *n = s_ncal;
+  return s_cal;
+}
+
+static int match_cal(int32_t cx_q8, int32_t cy_q8)
+{
+  int i, best = -1;
+  int64_t bd = INT64_MAX;
+  for (i = 0; i < s_ncal; i++)
+  {
+    int64_t dx = cx_q8 - (int32_t)s_cal[i].x * 256, dy = cy_q8 - (int32_t)s_cal[i].y * 256;
+    int64_t d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = s_cal[i].place; }
+  }
+  return (bd < (int64_t)40 * 40 * 65536) ? best : -1;
+}
+
+/* ---------------- main entry ---------------- */
+uint32_t DialRead_WorkBytes(uint16_t w, uint16_t h)
+{
+  uint32_t n = (uint32_t)w * h;
+  return n * 2U            /* restored frame       */
+       + n                 /* luma                 */
+       + n                 /* red                  */
+       + n * 2U            /* labels               */
+       + (2U * RAD_PAD) * (2U * RAD_PAD) * 2U   /* chamfer */
+       + MAX_LABELS * 2U   /* union-find parents   */
+       + MAX_LABELS * 4U   /* areas                */
+       + (uint32_t)w * 4U  /* seam column sums     */
+       + 64U;
+}
+
+static void make_tables(void)
+{
+  int i;
+  for (i = 0; i < 32; i++) { s_r5to8[i] = (uint8_t)((i * 255) / 31); }
+  for (i = 0; i < 64; i++) { s_g6to8[i] = (uint8_t)((i * 255) / 63); }
+}
+
+int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
+                 uint8_t *work, uint32_t work_bytes, dial_report_t *rep)
+{
+  static blob_t bl[DIAL_MAX_BLOBS];
+  static dial_geo_t geo[DIAL_MAX_FOUND];
+  static int16_t hist[360];
+  static peak_t pk[64];
+  uint32_t npx = (uint32_t)w * h, i;
+  uint8_t *p = work;
+  uint16_t *rest, *par;
+  uint32_t *area, *colsum;
+  uint8_t *L, *red;
+  int nb, b, nd = 0, seam;
+  uint8_t mode = 0U;
+  dial_time_t ts;
+  if (!raw || !out || !work || !rep || (w < 16U) || (h < 16U)) { return DIAL_ERR_ARG; }
+  if (work_bytes < DialRead_WorkBytes(w, h)) { return DIAL_ERR_WORK; }
+  memset(rep, 0, sizeof(*rep));
+  make_tables();
+  p = (uint8_t *)(((uintptr_t)p + 7U) & ~(uintptr_t)7U);
+  rest = (uint16_t *)p; p += npx * 2U;
+  s_lab = (uint16_t *)p; p += npx * 2U;
+  s_dt = (uint16_t *)p; p += (2U * RAD_PAD) * (2U * RAD_PAD) * 2U;
+  par = (uint16_t *)p; p += MAX_LABELS * 2U;
+  area = (uint32_t *)p; p += MAX_LABELS * 4U;
+  colsum = (uint32_t *)p; p += (uint32_t)w * 4U;
+  L = p; p += npx;
+  red = p; p += npx;
+  s_w = w; s_h = h; s_L = L; s_red = red;
+
+  /* 1 seam restore */
+  if (DIAL_SEAM_COL_CFG < 0) { seam = seam_detect(raw, w, h, &mode, colsum); }
+  else { seam = DIAL_SEAM_COL_CFG; mode = (DIAL_SEAM_MODE_CFG == 1) ? 1U : 0U; if (DIAL_SEAM_MODE_CFG == 2) { (void)seam_detect(raw, w, h, &mode, colsum); } }
+  rep->seam_col = (int16_t)seam;
+  rep->seam_mode = mode;
+  if (seam <= 0) { memcpy(rest, raw, npx * 2U); }
+  else if (mode == 1U)
+  {
+    for (i = 0U; i < npx; i++) { uint32_t j = i + (uint32_t)seam; if (j >= npx) { j -= npx; } rest[i] = raw[j]; }
+  }
+  else
+  {
+    uint32_t y, x;
+    for (y = 0U; y < h; y++)
+    {
+      const uint16_t *src = raw + y * w;
+      uint16_t *dst = rest + y * w;
+      for (x = 0U; x < w; x++) { uint32_t j = x + (uint32_t)seam; if (j >= w) { j -= w; } dst[x] = src[j]; }
+    }
+  }
+  /* 2 rectification -> out (565), luma, red (analysis copy level-normalised) */
+  level_setup(rest, npx, area);
+  rep->level_gain_q8 = (int16_t)s_gain_q8;
+  rep->level_off = (int16_t)(s_off / 256);
+  rectify(rest, out, L, red, w, h);
+#ifdef DIAL_HOST_DEBUG
+  { FILE *fp_ = fopen("dbg_L.raw", "wb"); if (fp_) { fwrite(L, 1, npx, fp_); fwrite(red, 1, npx, fp_); fclose(fp_); } }
+#endif
+
+  /* 3 red blobs */
+  nb = find_blobs(par, area, bl, DIAL_MAX_BLOBS);
+  for (b = 0; (b < nb) && (nd < (int)DIAL_MAX_FOUND); b++)
+  {
+    int32_t cx0 = (int32_t)((bl[b].sx * 256) / bl[b].area), cy0 = (int32_t)((bl[b].sy * 256) / bl[b].area);
+    int32_t hx, hy, cx, cy, R, tx, ty, wx0, wy0, wx1, wy1, maj[10];
+    uint16_t dtm;
+    int cov, k, k0 = 0;
+    int32_t bdu = 0x7fffffff;
+    dial_info_t *di;
+    if (bl[b].area < CAND_MIN_AREA) { continue; }
+    /* hub: max chamfer distance of red inside +-120 px */
+    wx0 = (cx0 >> 8) - HUB_WIN; if (wx0 < 0) { wx0 = 0; }
+    wy0 = (cy0 >> 8) - HUB_WIN; if (wy0 < 0) { wy0 = 0; }
+    wx1 = (cx0 + HUB_WIN * 256) >> 8; if (wx1 > (int32_t)w) { wx1 = w; }
+    wy1 = (cy0 + HUB_WIN * 256) >> 8; if (wy1 > (int32_t)h) { wy1 = h; }
+    if ((wx1 - wx0) * (wy1 - wy0) > (2 * RAD_PAD) * (2 * RAD_PAD)) { continue; }
+    dtm = chamfer(wx0, wy0, wx1 - wx0, wy1 - wy0, mask_red, 0U, &hx, &hy);
+    if (dtm < HUB_MIN_DT) { continue; }                  /* red mark, not a pointer */
+    if ((3 * hx - dtm < 3) || (3 * hy - dtm < 3) ||
+        (3 * hx + dtm > 3 * ((int32_t)w - 2)) || (3 * hy + dtm > 3 * ((int32_t)h - 2))) { continue; }  /* hub clipped */
+    /* dial crop */
+    s_x0 = (cx0 >> 8) - RAD_PAD; if (s_x0 < 0) { s_x0 = 0; }
+    s_y0 = (cy0 >> 8) - RAD_PAD; if (s_y0 < 0) { s_y0 = 0; }
+    s_x1 = (cx0 >> 8) + RAD_PAD; if (s_x1 > (int32_t)w) { s_x1 = w; }
+    s_y1 = (cy0 >> 8) + RAD_PAD; if (s_y1 > (int32_t)h) { s_y1 = h; }
+    di = &rep->dial[nd];
+    di->hub_x = (int16_t)hx; di->hub_y = (int16_t)hy; di->hub_r = (uint8_t)(dtm / 3U);
+    /* 4 rim circle from an arc segment */
+    if ((arc_circle(cx0, cy0, &cx, &cy, &R, &cov) != 0) || (R < R_MIN_Q8) || (R > R_MAX_Q8))
+    {
+      rep->n_scale_bad++;
+      continue;
+    }
+    /* place from calibration (never left/right): half ticks only on place 3 */
+    {
+      int place_guess = match_cal((int32_t)hx * 256, (int32_t)hy * 256);
+      if (place_guess < 0) { place_guess = match_cal(cx0, cy0); }
+      di->place = (int8_t)place_guess;
+    }
+    /* 5 ticks */
+    tick_len_profile(cx, cy, R, hist);
+    {
+      int allow_half = (di->place == 3);   /* only x0.0001; unknown -> no half ticks */
+      int np = find_peaks(hist, pk, 64, allow_half ? 7 : 14), off, mb;
+      if (!allow_half) { np = drop_short_peaks(pk, np); }
+      phase_offset(pk, np, &off, &mb, allow_half);
+      build_ticks(hist, pk, np, off, mb, allow_half, &geo[nd].T);
+#ifdef DIAL_HOST_DEBUG
+      { int q_; printf("  dial@(%d,%d) place=%d allow_half=%d n_tick=%d c=(%.2f,%.2f,%.2f)\n  peaks %d:", cx0 >> 8, cy0 >> 8, di->place, allow_half, geo[nd].T.n_tick, cx/256.0, cy/256.0, R/256.0, np); for (q_ = 0; q_ < np; q_++) printf(" %d:%d", pk[q_].a / 1000, pk[q_].h);
+        printf("  off=%d mb=%d vis=%d ticks:", off, mb, geo[nd].T.n_vis); for (q_ = 0; q_ < geo[nd].T.n_tick; q_++) printf(" %s%.1f", geo[nd].T.vis[q_] ? "" : "~", geo[nd].T.tick[q_] / 1000.0); printf("\n"); }
+#endif
+    }
+    /* 6 pointer */
+    if (pointer_tip(bl[b].id, &tx, &ty) != 0) { rep->n_scale_bad++; continue; }
+    /* 7 value: interpolate between printed majors (10 of them either way) */
+    for (k = 0; k < 10; k++)
+    {
+      int32_t ang = geo[nd].T.allow_half
+                  ? geo[nd].T.tick[geo[nd].T.major_base + 2 * k]
+                  : geo[nd].T.tick[k];
+      int32_t d = iabs32(angdiff_mdeg(ang, 270000));
+      if (d < bdu) { bdu = d; k0 = k; }
+    }
+    for (k = 0; k < 10; k++)
+    {
+      int ik = (k0 + k) % 10;
+      maj[k] = geo[nd].T.allow_half
+             ? geo[nd].T.tick[geo[nd].T.major_base + 2 * ik]
+             : geo[nd].T.tick[ik];
+    }
+    di->pang_mdeg = atan2_mdeg((int64_t)ty - cy, (int64_t)tx - cx);
+    di->value_e4 = read_value(di->pang_mdeg, maj);
+    if (di->value_e4 >= 100000) { di->value_e4 -= 100000; }
+    snap_completed(cx, cy, R, &geo[nd].T);
+    di->cx_q8 = cx; di->cy_q8 = cy; di->r_q8 = R; di->tip_x_q8 = tx; di->tip_y_q8 = ty;
+    di->n_vis = (uint8_t)geo[nd].T.n_vis; di->arc_cov = (uint8_t)cov;
+    /* 8 validity: n_vis in [MIN_VIS_TICKS, n_tick] */
+    if ((geo[nd].T.n_vis < MIN_VIS_TICKS) || (geo[nd].T.n_vis > geo[nd].T.n_tick) ||
+        (cx < 0) || (cy < 0) || (cx >= (int32_t)w * 256) || (cy >= (int32_t)h * 256))
+    {
+      rep->n_scale_bad++;
+      continue;
+    }
+    geo[nd].cx = cx; geo[nd].cy = cy; geo[nd].R = R;
+    geo[nd].x0 = s_x0; geo[nd].y0 = s_y0; geo[nd].x1 = s_x1; geo[nd].y1 = s_y1;
+    /* place already set from calibration (refined below if the rim centre is better) */
+    {
+      int pl = match_cal(cx, cy);
+      if (pl >= 0) { di->place = (int8_t)pl; }
+    }
+    nd++;
+  }
+  rep->n_dials = (uint8_t)nd;
+  if (rep->n_scale_bad) { rep->suspect_flags |= DIAL_SUS_SCALE; }
+  if (nd != (int)DIAL_COUNT_CFG) { rep->suspect_flags |= DIAL_SUS_COUNT; }
+  {
+    int32_t val[DIAL_MAX_FOUND];
+    int have[DIAL_MAX_FOUND], dg[DIAL_MAX_FOUND], j, np = (int)DIAL_COUNT_CFG;
+    for (j = 0; j < (int)DIAL_MAX_FOUND; j++) { have[j] = 0; val[j] = 0; dg[j] = 0; }
+    for (j = 0; j < nd; j++)
+    {
+      int pl = rep->dial[j].place;
+      if ((pl < 0) || (pl >= np) || have[pl]) { rep->suspect_flags |= DIAL_SUS_CAL; continue; }
+      have[pl] = 1; val[pl] = rep->dial[j].value_e4;
+    }
+    for (j = 0; j < np; j++) { if (!have[j]) { rep->suspect_flags |= DIAL_SUS_CAL; } }
+    if (rep->suspect_flags == 0U)
+    {
+      /* 10 boundary rules (lowest dial x0.0001 excluded) */
+      for (j = 0; j < np; j++) { dg[j] = (val[j] / 10000) % 10; }
+      for (j = 0; j < np - 1; j++)
+      {
+        int32_t f = val[j] % 10000, nv = val[j + 1];
+        int near_tick = (f < 2500) || (f >= 7500);
+        if (near_tick && (nv >= 30000) && (nv <= 70000)) { rep->ambig_places |= (uint8_t)(1U << j); continue; }
+        if ((f >= 7500) && (nv < 25000)) { dg[j] = (dg[j] + 1) % 10; }
+        else if ((f <= 2500) && (nv >= 70000)) { dg[j] = (dg[j] + 9) % 10; }
+      }
+      if (rep->ambig_places) { rep->suspect_flags |= DIAL_SUS_AMBIG; }
+      /* 11 combined: higher dials integer digit, lowest dial to 0.01 tick */
+      {
+        uint32_t lo = (uint32_t)((val[np - 1] + 50) / 100) % 1000U, r = 0U;
+        for (j = 0; j < np - 1; j++) { r = r * 10U + (uint32_t)dg[j]; }
+        rep->reading_e6 = r * 1000U + lo;
+      }
+      for (j = 0; j < nd; j++) { rep->dial[j].digit = (uint8_t)dg[rep->dial[j].place]; }
+    }
+  }
+  /* timestamp */
+  dial_get_time(&ts);
+  rep->ts = ts;
+  {
+    char *q = rep->line1;
+    q = put_n(q, ts.year, 4); *q++ = '-'; q = put_n(q, ts.mon, 2); *q++ = '-'; q = put_n(q, ts.day, 2);
+    *q++ = ' '; q = put_n(q, ts.hour, 2); *q++ = ':'; q = put_n(q, ts.min, 2); *q++ = ':'; q = put_n(q, ts.sec, 2);
+    *q = 0;
+    q = rep->ts_name;
+    q = put_n(q, ts.year, 4); q = put_n(q, ts.mon, 2); q = put_n(q, ts.day, 2); *q++ = '_';
+    q = put_n(q, ts.hour, 2); q = put_n(q, ts.min, 2); q = put_n(q, ts.sec, 2); *q = 0;
+  }
+  if (rep->suspect_flags != 0U)
+  {
+    /* SUSPECT: raw (restored + rectified) frame, timestamp only, nothing else */
+    rep->status = DIAL_SUSPECT;
+    draw_text(out, 12, 8, rep->line1);
+    (void)dial_save_suspect_frame(out, w, h, rep->ts_name);
+    return DIAL_SUSPECT;
+  }
+  {
+    char *q = rep->line2;
+    uint32_t v = rep->reading_e6;
+    *q++ = '0'; *q++ = '.';
+    q = put_n(q, v, (int)DIAL_COUNT_CFG - 1 + 3);
+    *q++ = ' '; *q++ = 'm'; *q++ = (char)DIAL_CH_SUP3; *q = 0;
+  }
+  /* 12 overlay */
+  {
+    int j;
+    for (j = 0; j < nd; j++) { paint_ticks(out, &geo[j]); }
+    draw_text(out, 12, 8, rep->line1);
+    draw_text(out, 12, 44, rep->line2);
+    for (j = 0; j < nd; j++)
+    {
+      char s[2];
+      int32_t ty = (geo[j].cy + geo[j].R + 2 * 256) >> 8;
+      if (ty > (int32_t)h - 36) { ty = (int32_t)h - 36; }
+      s[0] = (char)('0' + rep->dial[j].digit); s[1] = 0;
+      draw_text(out, (int)((geo[j].cx - 8 * 256) >> 8), (int)ty, s);
+    }
+  }
+  rep->status = DIAL_OK;
+  return DIAL_OK;
+}
+
+/* ---------------- speed-based auto ordering ---------------- */
+#define ORD_MAXF  DIAL_MAX_FOUND
+static struct
+{
+  int n;
+  int16_t x[ORD_MAXF], y[ORD_MAXF];
+  int32_t last[ORD_MAXF];
+  int64_t acc[ORD_MAXF];      /* |unwrapped angle| travelled, mdeg */
+  uint32_t t0, t1;
+  uint32_t frames;
+} s_ord;
+
+void DialOrder_Reset(void)
+{
+  memset(&s_ord, 0, sizeof(s_ord));
+}
+
+/* The fastest (lowest) dial must turn < 180 deg between two fed frames. */
+int DialOrder_Feed(const dial_report_t *rep, uint32_t t_ms)
+{
+  int j, k;
+  if (rep->n_dials == 0U) { return -1; }
+  for (j = 0; j < rep->n_dials; j++)
+  {
+    const dial_info_t *d = &rep->dial[j];
+    int32_t x = d->cx_q8 >> 8, y = d->cy_q8 >> 8;
+    int m = -1;
+    for (k = 0; k < s_ord.n; k++)
+    {
+      if ((iabs32(x - s_ord.x[k]) < 40) && (iabs32(y - s_ord.y[k]) < 40)) { m = k; break; }
+    }
+    if (m < 0)
+    {
+      if (s_ord.n >= (int)ORD_MAXF) { continue; }
+      m = s_ord.n++;
+      s_ord.x[m] = (int16_t)x; s_ord.y[m] = (int16_t)y; s_ord.last[m] = d->pang_mdeg; s_ord.acc[m] = 0;
+      continue;
+    }
+    s_ord.acc[m] += iabs32(angdiff_mdeg(d->pang_mdeg, s_ord.last[m]));
+    s_ord.last[m] = d->pang_mdeg;
+  }
+  if (s_ord.frames == 0U) { s_ord.t0 = t_ms; }
+  s_ord.t1 = t_ms;
+  s_ord.frames++;
+  return (int)s_ord.frames;
+}
+
+/* slowest dial = place 0.  Neighbour speed ratio must be 4..25 (nominal 10). */
+int DialOrder_Finish(dial_cal_t *cal_out, uint8_t *n_out)
+{
+  int idx[ORD_MAXF], i, j, n = s_ord.n;
+  if ((s_ord.frames < 5U) || (n != (int)DIAL_COUNT_CFG)) { return -1; }
+  for (i = 0; i < n; i++) { idx[i] = i; }
+  for (i = 1; i < n; i++)
+  {
+    int t = idx[i];
+    j = i - 1;
+    while ((j >= 0) && (s_ord.acc[idx[j]] > s_ord.acc[t])) { idx[j + 1] = idx[j]; j--; }
+    idx[j + 1] = t;
+  }
+  if (s_ord.acc[idx[n - 1]] < 90000) { return -2; }    /* lowest dial moved < 90 deg: not enough flow */
+  for (i = 1; i < n; i++)
+  {
+    int64_t lo = s_ord.acc[idx[i - 1]], hi = s_ord.acc[idx[i]];
+    if (lo <= 0) { continue; }                          /* top dial may not have moved yet */
+    if ((hi < 4 * lo) || (hi > 25 * lo)) { return -3; }
+  }
+  for (i = 0; i < n; i++)
+  {
+    cal_out[i].x = s_ord.x[idx[i]]; cal_out[i].y = s_ord.y[idx[i]]; cal_out[i].place = (int8_t)i;
+  }
+  *n_out = (uint8_t)n;
+  DialRead_SetOrderCal(cal_out, (uint8_t)n);
+  return 0;
+}

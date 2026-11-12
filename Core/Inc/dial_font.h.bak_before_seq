@@ -1,0 +1,11 @@
+#ifndef DIAL_FONT_H
+#define DIAL_FONT_H
+#include <stdint.h>
+
+typedef struct { uint8_t code; int8_t xoff; int8_t yoff; uint8_t w; uint8_t h; uint16_t adv64; const uint8_t *bits; } dial_glyph_t;
+#define DIAL_FONT_NGLYPH 18U
+#define DIAL_FONT_LINE_H 28
+#define DIAL_CH_SUP3 0xB3U   /* superscript 3 */
+extern const dial_glyph_t dial_font_glyphs[DIAL_FONT_NGLYPH];
+#endif
+
