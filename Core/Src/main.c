@@ -25,6 +25,7 @@
 #include "ov5640.h"
 #include "meter_locate.h"
 #include "dial_read.h"
+#include "speed_track.h"
 #include "net_app.h"
 /* USER CODE END Includes */
 
@@ -50,6 +51,10 @@
 #define METER_LOCATE_ON       1U
 /* 1: run the new dial-read pipeline (seam + rectify + 4-dial reading) on each LCD frame. */
 #define DIAL_READ_ON           1U
+/* 功能模式：0 四指针读体积（源文件不改，只作为可切换模式保留），1 升针/梅花轮转速跟踪。 */
+#define METER_MODE_VOLUME      0U
+#define METER_MODE_SPEED       1U
+#define METER_MODE             METER_MODE_SPEED
 /* Snapshot + work sit after the JPEG photo buffer, not on CAM_BUF0. */
 #define DIAL_SNAP_ADDR         (((PHOTO_ADDR + PHOTO_MAX) + 7UL) & ~7UL)
 #define DIAL_WORK_ADDR         (DIAL_SNAP_ADDR + LCD_FB_BYTES)
@@ -121,6 +126,7 @@ static void Shutter_Init(void);
 static void Shutter_Service(uint8_t allow_present);
 static int CamLcdFrozen(void);
 static void DialRead_Service(void);
+static void SpeedTrack_Service(void);
 static void CAM_Init(void);
 static void CAM_Start(void);
 static int CAM_Kick(void);
@@ -235,7 +241,14 @@ int main(void)
     CAM_Service();
     OV5640_FocusSweep();
     LCD_DemoFrame();
-    DialRead_Service();
+    if (METER_MODE == METER_MODE_VOLUME)
+    {
+      DialRead_Service();
+    }
+    else
+    {
+      SpeedTrack_Service();
+    }
     if (NET_APP_ON != 0U)
     {
       NET_Poll();
@@ -686,6 +699,11 @@ static uint16_t lcd_star_count;
 static volatile uint8_t lcd_stars_on = LCD_STARS_ON;
 static volatile uint32_t lcd_draw;
 static volatile uint8_t cam_draw_full;
+static volatile uint32_t cam_stamp_us;
+static volatile uint16_t cam_ox;
+static volatile uint16_t cam_oy;
+static speed_state_t g_speed;
+static uint8_t speed_phase;
 static uint8_t dial_hud_ready;
 static uint8_t dial_yield_lock;
 static dial_report_t dial_hud_rep;
@@ -1124,10 +1142,26 @@ static void LCD_PresentLive(void)
   {
     return;
   }
-  if (dial_hud_ready != 0U)
+  if (METER_MODE == METER_MODE_VOLUME)
   {
-    DialRead_PaintHud((uint16_t *)lcd_draw, (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
-                      &dial_hud_rep);
+    if (dial_hud_ready != 0U)
+    {
+      DialRead_PaintHud((uint16_t *)lcd_draw, (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
+                        &dial_hud_rep);
+    }
+  }
+  else
+  {
+    dial_time_t now;
+    dial_get_time(&now);
+    if (speed_phase != 0U)
+    {
+      const uint16_t *rgb = (const uint16_t *)lcd_draw;
+      SpeedTrack_Tick(rgb + (((uint32_t)cam_oy * LCD_WIDTH) + (uint32_t)cam_ox),
+                      (uint16_t)LCD_WIDTH, cam_w, cam_h, cam_stamp_us, &g_speed);
+    }
+    SpeedTrack_Paint((uint16_t *)lcd_draw, (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
+                     (int16_t)cam_ox, (int16_t)cam_oy, &g_speed, &now);
   }
   if (LCD_Present() == 0)
   {
@@ -1673,8 +1707,6 @@ static int LCD_BlitCamera(void)
 }
 
 static uint8_t cam_dma_inited;
-static volatile uint16_t cam_ox;
-static volatile uint16_t cam_oy;
 static uint16_t cam_vw;
 static uint16_t cam_vh;
 static uint8_t cam_cap_bank;
@@ -2164,6 +2196,7 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *dcmi)
     }
     else if ((cam_draw_full == 0U) && (cam_curline >= cam_h) && (cam_h != 0U))
     {
+      cam_stamp_us = TIM2->CNT;
       cam_draw_full = 1U;
     }
     CAM_ResyncRgbDma();
@@ -2465,7 +2498,8 @@ int dial_save_suspect_frame(const uint16_t *frame, uint16_t w, uint16_t h, const
   return -1;
 }
 
-/* TIM2 free-runs at 1 kHz (1 ms per count) for reading-interval stamps. */
+/* TIM2 free-runs at 1 MHz (1 µs per count). Volume HUD interval still uses RTC.
+ * Speed tracking uses this stamp only; do not use RTC for flow or tooth rate. */
 TIM_HandleTypeDef htim2;
 
 void HAL_TIM_Base_MspInit(TIM_HandleTypeDef *htim)
@@ -2487,7 +2521,7 @@ static void MX_TIM2_Init(void)
     tclk = pclk * 2U;
   }
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = (tclk / 1000U) - 1U;
+  htim2.Init.Prescaler = (tclk / 1000000U) - 1U;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim2.Init.Period = 0xFFFFFFFFU;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -2499,9 +2533,14 @@ static void MX_TIM2_Init(void)
   (void)HAL_TIM_Base_Start(&htim2);
 }
 
-static uint32_t tim2_ms(void)
+static uint32_t tim2_us(void)
 {
   return __HAL_TIM_GET_COUNTER(&htim2);
+}
+
+static uint32_t tim2_ms(void)
+{
+  return __HAL_TIM_GET_COUNTER(&htim2) / 1000U;
 }
 
 /* Milliseconds since midnight, from the same RTC fields as the HUD date. */
@@ -2656,6 +2695,114 @@ static void DialRead_FinishReport(dial_report_t *work_rep, dial_time_t *prev_ts,
   dial_hud_rep = *work_rep;
   *prev_ts = work_rep->ts;
   dial_hud_ready = 1U;
+}
+
+
+static void LCD_FillBothBlack(void)
+{
+  uint32_t cur = lcd_draw;
+  lcd_draw = LCD_FB_ADDR;
+  LCD_FillBackground();
+  lcd_draw = LCD_FB_BACK;
+  LCD_FillBackground();
+  lcd_draw = cur;
+}
+
+static void SpeedTrack_ApplyCrop(void)
+{
+  uint16_t win_x, win_y, win_w, win_h;
+  uint16_t vx, vy, vw, vh, cw, ch;
+  uint16_t sx, sy, sw, sh;
+  int32_t x0 = (int32_t)g_speed.crop.x;
+  int32_t y0 = (int32_t)g_speed.crop.y;
+
+  OV5640_GetWindow(&win_x, &win_y, &win_w, &win_h);
+  OV5640_GetView(&vx, &vy, &vw, &vh);
+  OV5640_GetCapture(&cw, &ch);
+  if (cw == 0U)
+  {
+    cw = 1U;
+  }
+  if (ch == 0U)
+  {
+    ch = 1U;
+  }
+  sx = (uint16_t)((int32_t)win_x + (((x0 - (int32_t)vx) * (int32_t)win_w) / (int32_t)cw));
+  sy = (uint16_t)((int32_t)win_y + (((y0 - (int32_t)vy) * (int32_t)win_h) / (int32_t)ch));
+  sw = (uint16_t)(((uint32_t)g_speed.crop.w * (uint32_t)win_w) / (uint32_t)cw);
+  sh = (uint16_t)(((uint32_t)g_speed.crop.h * (uint32_t)win_h) / (uint32_t)ch);
+  sw = (uint16_t)(sw & (uint16_t)~1U);
+  sh = (uint16_t)(sh & (uint16_t)~1U);
+  if (sw < 160U)
+  {
+    sw = 160U;
+  }
+  if (sh < 120U)
+  {
+    sh = 120U;
+  }
+  if (sw > LCD_WIDTH)
+  {
+    sw = (uint16_t)LCD_WIDTH;
+  }
+  if (sh > LCD_HEIGHT)
+  {
+    sh = (uint16_t)LCD_HEIGHT;
+  }
+  LCD_FillBothBlack();
+  OV5640_SetNativeWindow(sx, sy, sw, sh);
+  CAM_Apply();
+  LCD_FillBothBlack();
+  SpeedTrack_Shift(&g_speed, (int16_t)(-(int16_t)g_speed.crop.x),
+                   (int16_t)(-(int16_t)g_speed.crop.y));
+  speed_phase = 1U;
+}
+
+/* 转速模式：先借用四指针结果定位升针，再另找梅花轮，然后裁窗。裁窗后不再跑表盘算法。 */
+static void SpeedTrack_Service(void)
+{
+  static dial_report_t loc_rep;
+  uint32_t wb;
+
+  if (METER_MODE != METER_MODE_SPEED)
+  {
+    return;
+  }
+  if ((cam_ok == 0U) || (cam_out_jpeg != 0U))
+  {
+    return;
+  }
+  if (speed_phase != 0U)
+  {
+    return;
+  }
+  wb = DialRead_WorkBytes((uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT);
+  if ((DIAL_WORK_ADDR + wb) > (SDRAM_BASE + 0x2000000UL))
+  {
+    return;
+  }
+  DialRead_CopyShown((uint16_t *)DIAL_SNAP_ADDR);
+  (void)DialRead_Run((const uint16_t *)DIAL_SNAP_ADDR,
+                     (uint16_t *)DIAL_SNAP_ADDR,
+                     (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
+                     (uint8_t *)DIAL_WORK_ADDR, wb, &loc_rep);
+  if (SpeedTrack_TakeNeedle(&loc_rep, &g_speed) != 0)
+  {
+    return;
+  }
+  /* 梅花轮在实时画面上找，不要用被整流过的分析副本。 */
+  if (SpeedTrack_FindStar((const uint16_t *)lcd_frame_addr, (uint16_t)LCD_WIDTH,
+                          (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
+                          (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed) != 0)
+  {
+    return;
+  }
+  SpeedTrack_FinishLocate(&g_speed, (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT);
+  if (g_speed.loc_ok == 0U)
+  {
+    return;
+  }
+  SpeedTrack_ApplyCrop();
 }
 
 static void DialRead_Service(void)

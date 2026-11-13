@@ -1,0 +1,1217 @@
+#include "speed_track.h"
+#include "dial_font.h"
+#include <string.h>
+
+#define RED_RMIN   95
+#define RED_DG     16
+#define RED_DB     16
+#define RED_GMAX   200
+#define RED_BMAX   190
+#define DARK_Y     115
+#define MAX_BLOB   16
+#define LIVE_CIRC  0x07E0U
+#define LIVE_PTR   0x029FU
+#define LIVE_STAR  0xFFE0U
+#define TXT_R      255
+#define TXT_G      0
+#define TXT_B      0
+#define CROP_MARGIN 28
+#define MIN_FPS_X10 20   /* 10 齿/s 的奈奎斯特下限：每秒至少 20 帧 */
+
+/* Inverse rectify (rectified -> captured), copied from dial_read.c; that file is not edited. */
+#define HI11  1071152
+#define HI12  5069
+#define HI13  (-4317748)
+#define HI21  5544
+#define HI22  1071955
+#define HI23  (-5061496)
+#define HI31  75697
+#define HI32  86945
+
+typedef struct
+{
+  int32_t n;
+  int32_t sx;
+  int32_t sy;
+  int16_t x0, y0, x1, y1;
+} blob_t;
+
+static const uint16_t atan32_mdeg[33] = {
+  0, 1790, 3576, 5356, 7125, 8881, 10620, 12339, 14036, 15709,
+  17354, 18970, 20556, 22109, 23629, 25115, 26565, 27979, 29358, 30700,
+  32005, 33275, 34509, 35707, 36870, 37999, 39094, 40156, 41186, 42184,
+  43152, 44091, 45000
+};
+
+static const int16_t cosq8[91] = {
+  256, 256, 256, 256, 255, 255, 255, 254, 254, 253, 252, 251, 250, 249, 248,
+  247, 246, 245, 243, 242, 241, 239, 237, 236, 234, 232, 230, 228, 226, 224,
+  222, 219, 217, 215, 212, 210, 207, 204, 202, 199, 196, 193, 190, 187, 184,
+  181, 178, 175, 171, 168, 165, 161, 158, 154, 150, 147, 143, 139, 136, 132,
+  128, 124, 120, 116, 112, 108, 104, 100, 96, 92, 88, 83, 79, 75, 71, 66, 62,
+  58, 53, 49, 44, 40, 36, 31, 27, 22, 18, 13, 9, 4, 0
+};
+
+static int16_t icos(int a)
+{
+  while (a < 0) { a += 360; }
+  while (a >= 360) { a -= 360; }
+  if (a <= 90) { return cosq8[a]; }
+  if (a <= 180) { return (int16_t)(-cosq8[180 - a]); }
+  if (a <= 270) { return (int16_t)(-cosq8[a - 180]); }
+  return cosq8[360 - a];
+}
+
+static int16_t isin(int a)
+{
+  return icos(a - 90);
+}
+
+static uint32_t isqrt32(uint32_t x)
+{
+  uint32_t r = 0U;
+  uint32_t b = 1U << 15;
+  uint32_t y;
+  if (x >= 0x40000000UL) { b = 1U << 30; }
+  while (b != 0U)
+  {
+    y = r + b;
+    if (((uint64_t)y * (uint64_t)y) <= (uint64_t)x) { r = y; }
+    b >>= 1;
+  }
+  return r;
+}
+
+static void unpack(uint16_t p, int *r, int *g, int *b)
+{
+  int r5 = (int)((p >> 11) & 31);
+  int g6 = (int)((p >> 5) & 63);
+  int b5 = (int)(p & 31);
+  *r = (r5 * 255 + 15) / 31;
+  *g = (g6 * 255 + 31) / 63;
+  *b = (b5 * 255 + 15) / 31;
+}
+
+static int is_red(int r, int g, int b)
+{
+  return (r >= RED_RMIN) && (r > (g + RED_DG)) && (r > (b + RED_DB)) &&
+         (g < RED_GMAX) && (b < RED_BMAX);
+}
+
+static int luma(int r, int g, int b)
+{
+  return ((r * 2) + (g * 5) + b) / 8;
+}
+
+static uint16_t pix(const uint16_t *rgb, uint16_t stride, int x, int y)
+{
+  return rgb[((uint32_t)y * (uint32_t)stride) + (uint32_t)x];
+}
+
+/* Image convention: y down, result in [0, 360000). */
+static int32_t atan2_mdeg(int32_t y, int32_t x)
+{
+  int32_t ax = (x < 0) ? -x : x;
+  int32_t ay = (y < 0) ? -y : y;
+  int32_t a;
+  if ((ax == 0) && (ay == 0)) { return 0; }
+  if (ax >= ay)
+  {
+    int32_t t = (int32_t)((((int64_t)ay * 32) + (ax / 2)) / ax);
+    if (t > 32) { t = 32; }
+    a = (int32_t)atan32_mdeg[t];
+  }
+  else
+  {
+    int32_t t = (int32_t)((((int64_t)ax * 32) + (ay / 2)) / ay);
+    if (t > 32) { t = 32; }
+    a = 90000 - (int32_t)atan32_mdeg[t];
+  }
+  if ((x >= 0) && (y >= 0)) { return a; }
+  if ((x < 0) && (y >= 0)) { return 180000 - a; }
+  if ((x < 0) && (y < 0)) { return 180000 + a; }
+  return 360000 - a;
+}
+
+static int32_t wrap_diff_mdeg(int32_t now, int32_t prev)
+{
+  int32_t d = now - prev;
+  if (d > 180000) { d -= 360000; }
+  if (d < -180000) { d += 360000; }
+  return d;
+}
+
+static int norm_mdeg(int32_t a)
+{
+  while (a < 0) { a += 360000; }
+  while (a >= 360000) { a -= 360000; }
+  return (int)a;
+}
+
+static void inv_rectify_q8(int32_t x_q8, int32_t y_q8, int32_t *sx_q8, int32_t *sy_q8)
+{
+#if DIAL_RECTIFY_ON
+  int64_t X = (((int64_t)HI11 * x_q8) + ((int64_t)HI12 * y_q8) + 128) >> 8;
+  int64_t Y = (((int64_t)HI21 * x_q8) + ((int64_t)HI22 * y_q8) + 128) >> 8;
+  int64_t D = (((int64_t)HI31 * x_q8) + ((int64_t)HI32 * y_q8) + 128) >> 8;
+  int64_t e30;
+  int64_t e2;
+  int64_t inv;
+  X += HI13;
+  Y += HI23;
+  D += ((int64_t)1 << 32);
+  e30 = (((int64_t)1 << 32) - D) >> 2;
+  e2 = (e30 * e30) >> 30;
+  inv = ((int64_t)1 << 30) + e30 + e2 + ((e2 * e30) >> 30);
+  *sx_q8 = (int32_t)((X * inv) >> 42);
+  *sy_q8 = (int32_t)((Y * inv) >> 42);
+#else
+  *sx_q8 = x_q8;
+  *sy_q8 = y_q8;
+#endif
+}
+
+static void map_to_live(int32_t x_q8, int32_t y_q8, int seam, uint8_t mode,
+                        int w, int h, int *ox, int *oy)
+{
+  int32_t sx_q8;
+  int32_t sy_q8;
+  int32_t x;
+  int32_t y;
+  int32_t ww = (int32_t)w;
+  int32_t hh = (int32_t)h;
+  inv_rectify_q8(x_q8, y_q8, &sx_q8, &sy_q8);
+  x = (sx_q8 + 128) >> 8;
+  y = (sy_q8 + 128) >> 8;
+  if ((ww <= 0) || (hh <= 0))
+  {
+    *ox = (int)x;
+    *oy = (int)y;
+    return;
+  }
+  if (seam > 0)
+  {
+    if (mode == 1U)
+    {
+      int32_t n = ww * hh;
+      int32_t i = (y * ww) + x + (int32_t)seam;
+      i %= n;
+      if (i < 0) { i += n; }
+      *ox = (int)(i % ww);
+      *oy = (int)(i / ww);
+      return;
+    }
+    x += (int32_t)seam;
+    x %= ww;
+    if (x < 0) { x += ww; }
+  }
+  *ox = (int)x;
+  *oy = (int)y;
+}
+
+static int bit_get(const uint8_t *b, uint32_t i)
+{
+  return (int)((b[i >> 3] >> (i & 7U)) & 1U);
+}
+
+static void bit_set(uint8_t *b, uint32_t i)
+{
+  b[i >> 3] = (uint8_t)(b[i >> 3] | (uint8_t)(1U << (i & 7U)));
+}
+
+static int flood_dark(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                      int x0lim, int y0lim, int x1lim, int y1lim,
+                      uint8_t *work, uint32_t work_bytes, blob_t *out, int max_out)
+{
+  uint16_t dw;
+  uint16_t dh;
+  uint32_t bits;
+  uint8_t *vis;
+  uint16_t *qx;
+  uint16_t *qy;
+  uint32_t qmax;
+  int nout = 0;
+  int x;
+  int y;
+
+  if ((work == 0) || (w < 4U) || (h < 4U)) { return 0; }
+  dw = (uint16_t)(w / 2U);
+  dh = (uint16_t)(h / 2U);
+  bits = (((uint32_t)dw * (uint32_t)dh) + 7U) / 8U;
+  if (work_bytes < (bits + 512U)) { return 0; }
+  vis = work;
+  memset(vis, 0, bits);
+  qmax = (work_bytes - ((bits + 1U) & ~1U)) / (2U * sizeof(uint16_t));
+  if (qmax > 8192U) { qmax = 8192U; }
+  if (qmax < 128U) { return 0; }
+  qx = (uint16_t *)(vis + ((bits + 1U) & ~1U));
+  qy = qx + qmax;
+
+  if (x0lim < 0) { x0lim = 0; }
+  if (y0lim < 0) { y0lim = 0; }
+  if (x1lim > (int)w) { x1lim = (int)w; }
+  if (y1lim > (int)h) { y1lim = (int)h; }
+
+  for (y = (y0lim & ~1); y < y1lim; y += 2)
+  {
+    for (x = (x0lim & ~1); x < x1lim; x += 2)
+    {
+      uint32_t id = (((uint32_t)(y / 2) * (uint32_t)dw) + (uint32_t)(x / 2));
+      int r, g, b, ok;
+      uint32_t qh;
+      uint32_t qt;
+      blob_t bl;
+      if (bit_get(vis, id)) { continue; }
+      unpack(pix(rgb, stride, x, y), &r, &g, &b);
+      ok = (luma(r, g, b) < DARK_Y) && (is_red(r, g, b) == 0);
+      if (ok == 0) { continue; }
+
+      qh = 0U;
+      qt = 0U;
+      qx[0] = (uint16_t)(x / 2);
+      qy[0] = (uint16_t)(y / 2);
+      bit_set(vis, id);
+      qt = 1U;
+      memset(&bl, 0, sizeof(bl));
+      bl.x0 = (int16_t)w;
+      bl.y0 = (int16_t)h;
+      while (qh < qt)
+      {
+        int cx = (int)qx[qh];
+        int cy = (int)qy[qh];
+        int k;
+        int px;
+        int py;
+        qh++;
+        px = cx * 2;
+        py = cy * 2;
+        unpack(pix(rgb, stride, px, py), &r, &g, &b);
+        ok = (luma(r, g, b) < DARK_Y) && (is_red(r, g, b) == 0);
+        if (ok == 0) { continue; }
+        bl.n++;
+        bl.sx += px;
+        bl.sy += py;
+        if (px < bl.x0) { bl.x0 = (int16_t)px; }
+        if (py < bl.y0) { bl.y0 = (int16_t)py; }
+        if (px > bl.x1) { bl.x1 = (int16_t)px; }
+        if (py > bl.y1) { bl.y1 = (int16_t)py; }
+        for (k = 0; k < 4; k++)
+        {
+          static const int8_t ddx[4] = { 1, -1, 0, 0 };
+          static const int8_t ddy[4] = { 0, 0, 1, -1 };
+          int nx = cx + ddx[k];
+          int ny = cy + ddy[k];
+          uint32_t nid;
+          if ((nx < 0) || (ny < 0) || (nx >= (int)dw) || (ny >= (int)dh)) { continue; }
+          nid = (((uint32_t)ny * (uint32_t)dw) + (uint32_t)nx);
+          if (bit_get(vis, nid)) { continue; }
+          bit_set(vis, nid);
+          if (qt < qmax)
+          {
+            qx[qt] = (uint16_t)nx;
+            qy[qt] = (uint16_t)ny;
+            qt++;
+          }
+        }
+      }
+      if ((bl.n >= 80) && (nout < max_out))
+      {
+        out[nout++] = bl;
+      }
+    }
+  }
+  return nout;
+}
+
+static int blob_cx(const blob_t *b)
+{
+  return (b->n > 0) ? (int)(b->sx / b->n) : 0;
+}
+
+static int blob_cy(const blob_t *b)
+{
+  return (b->n > 0) ? (int)(b->sy / b->n) : 0;
+}
+
+static int blob_r(const blob_t *b)
+{
+  int bw = (int)b->x1 - (int)b->x0;
+  int bh = (int)b->y1 - (int)b->y0;
+  int m = (bw < bh) ? bw : bh;
+  return (m / 2);
+}
+
+static int count_star_teeth(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                            int cx, int cy, int R, uint8_t *n_out, int32_t *phase_out)
+{
+  enum { NB = 180 };
+  int32_t acc[NB];
+  int32_t cnt[NB];
+  int a;
+  int n;
+  int best_n = 4;
+  int64_t best_e = -1;
+  int32_t best_ph = 0;
+  int r0;
+  int r1;
+  int x;
+  int y;
+
+  if (R < 12) { return -1; }
+  memset(acc, 0, sizeof(acc));
+  memset(cnt, 0, sizeof(cnt));
+  r0 = (R * 40) / 100;
+  r1 = (R * 95) / 100;
+  for (y = cy - R; y <= (cy + R); y++)
+  {
+    if ((y < 0) || (y >= (int)h)) { continue; }
+    for (x = cx - R; x <= (cx + R); x++)
+    {
+      int dx;
+      int dy;
+      int d2;
+      int r, g, b, rr, bin;
+      if ((x < 0) || (x >= (int)w)) { continue; }
+      dx = x - cx;
+      dy = y - cy;
+      d2 = (dx * dx) + (dy * dy);
+      if ((d2 < (r0 * r0)) || (d2 > (r1 * r1))) { continue; }
+      unpack(pix(rgb, stride, x, y), &r, &g, &b);
+      rr = luma(r, g, b);
+      bin = (int)(atan2_mdeg(dy, dx) / (360000 / NB));
+      if (bin < 0) { bin = 0; }
+      if (bin >= NB) { bin = NB - 1; }
+      acc[bin] += (DARK_Y + 20 - rr);
+      cnt[bin]++;
+    }
+  }
+  for (a = 0; a < NB; a++)
+  {
+    if (cnt[a] > 0) { acc[a] = acc[a] / cnt[a]; }
+    else { acc[a] = 0; }
+  }
+  for (n = 2; n <= 12; n++)
+  {
+    int32_t cs = 0;
+    int32_t sn = 0;
+    int64_t e;
+    for (a = 0; a < NB; a++)
+    {
+      int ang = (n * a * 360) / NB;
+      cs += (acc[a] * (int32_t)icos(ang));
+      sn += (acc[a] * (int32_t)isin(ang));
+    }
+    e = ((int64_t)cs * (int64_t)cs) + ((int64_t)sn * (int64_t)sn);
+    if (e > best_e)
+    {
+      best_e = e;
+      best_n = n;
+      best_ph = atan2_mdeg(sn, cs);
+    }
+  }
+  if (best_e < 1000) { return -1; }
+  *n_out = (uint8_t)best_n;
+  *phase_out = best_ph;
+  return 0;
+}
+
+/* Mid-radius ring, n-th harmonic. A few dozen samples — cheap enough at >20 fps. */
+static int track_star_phase(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                            const speed_obj_t *s, int32_t *phase_out)
+{
+  enum { NB = 90 };
+  int32_t cs = 0;
+  int32_t sn = 0;
+  int a;
+  int R = s->r;
+  int rring;
+  int n = (int)s->n_teeth;
+  if ((R < 8) || (n < 2)) { return -1; }
+  rring = (R * 70) / 100;
+  for (a = 0; a < NB; a++)
+  {
+    int ang = (a * 360) / NB;
+    int x = s->cx + (int)(((int32_t)icos(ang) * rring) / 256);
+    int y = s->cy + (int)(((int32_t)isin(ang) * rring) / 256);
+    int r, g, b, v, nang;
+    if ((x < 0) || (y < 0) || (x >= (int)w) || (y >= (int)h)) { continue; }
+    unpack(pix(rgb, stride, x, y), &r, &g, &b);
+    v = (DARK_Y + 20 - luma(r, g, b));
+    nang = (n * ang) % 360;
+    cs += v * (int32_t)icos(nang);
+    sn += v * (int32_t)isin(nang);
+  }
+  *phase_out = atan2_mdeg(sn, cs);
+  return 0;
+}
+
+static void refine_center(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                          int *cx, int *cy, int R, int mode)
+{
+  int x;
+  int y;
+  int64_t sx = 0;
+  int64_t sy = 0;
+  int64_t n = 0;
+  int r0 = (R > 8) ? (R + 8) : 16;
+  for (y = *cy - r0; y <= (*cy + r0); y++)
+  {
+    if ((y < 0) || (y >= (int)h)) { continue; }
+    for (x = *cx - r0; x <= (*cx + r0); x++)
+    {
+      int dx;
+      int dy;
+      int r, g, b, ok;
+      if ((x < 0) || (x >= (int)w)) { continue; }
+      dx = x - *cx;
+      dy = y - *cy;
+      if (((dx * dx) + (dy * dy)) > (r0 * r0)) { continue; }
+      unpack(pix(rgb, stride, x, y), &r, &g, &b);
+      if (mode == 0) { ok = is_red(r, g, b); }
+      else { ok = (luma(r, g, b) < DARK_Y) && (is_red(r, g, b) == 0); }
+      if (ok == 0) { continue; }
+      sx += x;
+      sy += y;
+      n++;
+    }
+  }
+  if (n >= 20)
+  {
+    *cx = (int)(sx / n);
+    *cy = (int)(sy / n);
+  }
+}
+
+/* Walk rays in a +/-win_deg window around pred_mdeg (or full circle if pred_mdeg < 0). */
+static int needle_tip(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                      int cx, int cy, int R, int32_t pred_mdeg, int win_deg,
+                      int *tx, int *ty, int32_t *ang)
+{
+  int a0;
+  int a1;
+  int a;
+  int r0 = (R * 45) / 100;
+  int r1 = R + 4;
+  int best_t = -1;
+  int64_t sx = 0;
+  int64_t sy = 0;
+  int64_t n = 0;
+  int step = 2;
+
+  if (R < 8) { return -1; }
+  if (r0 < 4) { r0 = 4; }
+  if (pred_mdeg < 0)
+  {
+    a0 = 0;
+    a1 = 359;
+    step = 3;
+  }
+  else
+  {
+    int mid = norm_mdeg(pred_mdeg) / 1000;
+    a0 = mid - win_deg;
+    a1 = mid + win_deg;
+  }
+  for (a = a0; a <= a1; a += step)
+  {
+    int t;
+    int last_hit = -1;
+    for (t = r0; t <= r1; t++)
+    {
+      int x = cx + (int)(((int32_t)icos(a) * t) / 256);
+      int y = cy + (int)(((int32_t)isin(a) * t) / 256);
+      int r, g, b;
+      if ((x < 0) || (y < 0) || (x >= (int)w) || (y >= (int)h)) { continue; }
+      unpack(pix(rgb, stride, x, y), &r, &g, &b);
+      if (is_red(r, g, b)) { last_hit = t; }
+    }
+    if (last_hit > best_t) { best_t = last_hit; }
+  }
+  if (best_t < r0) { return -1; }
+  {
+    int cut = best_t - 3;
+    if (cut < r0) { cut = r0; }
+    for (a = a0; a <= a1; a += step)
+    {
+      int t;
+      for (t = cut; t <= r1; t++)
+      {
+        int x = cx + (int)(((int32_t)icos(a) * t) / 256);
+        int y = cy + (int)(((int32_t)isin(a) * t) / 256);
+        int r, g, b;
+        if ((x < 0) || (y < 0) || (x >= (int)w) || (y >= (int)h)) { continue; }
+        unpack(pix(rgb, stride, x, y), &r, &g, &b);
+        if (is_red(r, g, b) == 0) { continue; }
+        sx += x;
+        sy += y;
+        n++;
+      }
+    }
+  }
+  if (n < 1) { return -1; }
+  *tx = (int)(sx / n);
+  *ty = (int)(sy / n);
+  *ang = atan2_mdeg(*ty - cy, *tx - cx);
+  return 0;
+}
+
+static int32_t iir_e2(int32_t filt, int32_t inst, uint32_t dt_us)
+{
+  uint32_t tau = 300000U;
+  int64_t a;
+  int64_t b;
+  if (dt_us >= tau) { return inst; }
+  a = (int64_t)inst * (int64_t)dt_us;
+  b = (int64_t)filt * (int64_t)(tau - dt_us);
+  return (int32_t)((a + b) / (int64_t)tau);
+}
+
+static int32_t iabs32(int32_t v)
+{
+  return (v < 0) ? -v : v;
+}
+
+void SpeedTrack_Reset(speed_state_t *st)
+{
+  if (st == 0) { return; }
+  memset(st, 0, sizeof(*st));
+}
+
+void SpeedTrack_Shift(speed_state_t *st, int16_t dx, int16_t dy)
+{
+  if (st == 0) { return; }
+  st->needle.cx = (int16_t)(st->needle.cx + dx);
+  st->needle.cy = (int16_t)(st->needle.cy + dy);
+  st->needle.tip_x = (int16_t)(st->needle.tip_x + dx);
+  st->needle.tip_y = (int16_t)(st->needle.tip_y + dy);
+  st->star.cx = (int16_t)(st->star.cx + dx);
+  st->star.cy = (int16_t)(st->star.cy + dy);
+  st->crop.x = 0;
+  st->crop.y = 0;
+  st->have_prev = 0U;
+  st->have_speed = 0U;
+}
+
+int SpeedTrack_TakeNeedle(const dial_report_t *rep, speed_state_t *st)
+{
+  const dial_info_t *d = 0;
+  uint8_t i;
+  int hx, hy, tx, ty, r, hr;
+  int seam;
+  uint8_t mode;
+  int fw;
+  int fh;
+
+  if ((rep == 0) || (st == 0)) { return -1; }
+  for (i = 0U; i < rep->n_dials; i++)
+  {
+    if (rep->dial[i].place == 3)
+    {
+      d = &rep->dial[i];
+      break;
+    }
+  }
+  if (d == 0) { return -1; }
+
+  seam = (int)rep->seam_col;
+  mode = rep->seam_mode;
+  fw = 1024;
+  fh = 600;
+  map_to_live(d->cx_q8, d->cy_q8, seam, mode, fw, fh, &hx, &hy);
+  map_to_live(d->tip_x_q8, d->tip_y_q8, seam, mode, fw, fh, &tx, &ty);
+  r = (int)((d->r_q8 + 128) >> 8);
+  hr = (int)d->hub_r;
+  if (r < 20) { r = 20; }
+  if (hr < 8) { hr = r / 3; }
+
+  st->needle.found = 1U;
+  st->needle.cx = (int16_t)hx;
+  st->needle.cy = (int16_t)hy;
+  st->needle.r = (int16_t)r;
+  st->needle.hub_r = (int16_t)hr;
+  st->needle.tip_x = (int16_t)tx;
+  st->needle.tip_y = (int16_t)ty;
+  st->needle.ang_mdeg = atan2_mdeg(ty - hy, tx - hx);
+  return 0;
+}
+
+int SpeedTrack_FindStar(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                        uint8_t *work, uint32_t work_bytes, speed_state_t *st)
+{
+  blob_t dark[MAX_BLOB];
+  int nd;
+  int i;
+  int best = -1;
+  int32_t best_d2 = 0x7FFFFFFF;
+  int hx, hy, hr;
+  int x0, y0, x1, y1;
+  int cx, cy, R;
+  uint8_t nteeth = 0;
+  int32_t phase = 0;
+
+  if ((rgb == 0) || (st == 0) || (st->needle.found == 0U)) { return -1; }
+  hx = st->needle.cx;
+  hy = st->needle.cy;
+  hr = st->needle.r + 16;
+  x0 = hx - 280;
+  x1 = hx + 280;
+  y0 = 80;
+  y1 = hy + 40;
+  nd = flood_dark(rgb, stride, w, h, x0, y0, x1, y1, work, work_bytes, dark, MAX_BLOB);
+  for (i = 0; i < nd; i++)
+  {
+    int bcx = blob_cx(&dark[i]);
+    int bcy = blob_cy(&dark[i]);
+    int br = blob_r(&dark[i]);
+    int bw = (int)dark[i].x1 - (int)dark[i].x0 + 1;
+    int bh = (int)dark[i].y1 - (int)dark[i].y0 + 1;
+    int dx = bcx - hx;
+    int dy = bcy - hy;
+    int32_t d2 = ((int32_t)dx * dx) + ((int32_t)dy * dy);
+    if (dark[i].n < 200) { continue; }
+    if ((br < 30) || (br > 120)) { continue; }
+    if ((bw * 3 < bh * 2) || (bh * 3 < bw * 2)) { continue; }
+    if (d2 < (int32_t)((hr + 20) * (hr + 20))) { continue; }
+    if (d2 > (320 * 320)) { continue; }
+    if (d2 < best_d2)
+    {
+      best_d2 = d2;
+      best = i;
+    }
+  }
+  if (best < 0) { return -1; }
+  cx = blob_cx(&dark[best]);
+  cy = blob_cy(&dark[best]);
+  R = blob_r(&dark[best]);
+  refine_center(rgb, stride, w, h, &cx, &cy, R, 1);
+  if (count_star_teeth(rgb, stride, w, h, cx, cy, R, &nteeth, &phase) != 0)
+  {
+    nteeth = 4U;
+    phase = 0;
+  }
+  st->star.found = 1U;
+  st->star.n_teeth = nteeth;
+  st->star.cx = (int16_t)cx;
+  st->star.cy = (int16_t)cy;
+  st->star.r = (int16_t)R;
+  st->star.phase_mdeg = phase;
+  return 0;
+}
+
+void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame_h)
+{
+  int x0, y0, x1, y1;
+  int m = CROP_MARGIN;
+
+  if ((st == 0) || (st->needle.found == 0U) || (st->star.found == 0U)) { return; }
+  x0 = st->star.cx - st->star.r - m;
+  y0 = st->star.cy - st->star.r - m;
+  x1 = st->star.cx + st->star.r + m;
+  y1 = st->star.cy + st->star.r + m;
+  if ((st->needle.cx - st->needle.r - m) < x0) { x0 = st->needle.cx - st->needle.r - m; }
+  if ((st->needle.cy - st->needle.r - m) < y0) { y0 = st->needle.cy - st->needle.r - m; }
+  if ((st->needle.cx + st->needle.r + m) > x1) { x1 = st->needle.cx + st->needle.r + m; }
+  if ((st->needle.cy + st->needle.r + m) > y1) { y1 = st->needle.cy + st->needle.r + m; }
+  if (x0 < 0) { x0 = 0; }
+  if (y0 < 0) { y0 = 0; }
+  if (x1 > ((int)frame_w - 1)) { x1 = (int)frame_w - 1; }
+  if (y1 > ((int)frame_h - 1)) { y1 = (int)frame_h - 1; }
+  x0 &= ~1;
+  y0 &= ~1;
+  x1 = (x1 + 1) & ~1;
+  y1 = (y1 + 1) & ~1;
+  if ((x1 - x0) < 160) { x1 = x0 + 160; }
+  if ((y1 - y0) < 120) { y1 = y0 + 120; }
+  if (x1 > (int)frame_w)
+  {
+    x0 -= (x1 - (int)frame_w);
+    x1 = (int)frame_w;
+    if (x0 < 0) { x0 = 0; }
+  }
+  if (y1 > (int)frame_h)
+  {
+    y0 -= (y1 - (int)frame_h);
+    y1 = (int)frame_h;
+    if (y0 < 0) { y0 = 0; }
+  }
+  st->crop.x = (uint16_t)x0;
+  st->crop.y = (uint16_t)y0;
+  st->crop.w = (uint16_t)(x1 - x0);
+  st->crop.h = (uint16_t)(y1 - y0);
+  st->loc_ok = 1U;
+  st->track_ok = 1U;
+}
+
+int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                    uint32_t stamp_us, speed_state_t *st)
+{
+  int cx, cy, hx, hy, tx, ty;
+  int32_t ang;
+  int32_t phase;
+  uint32_t dt;
+  int tip_ok;
+  int star_ok;
+
+  if ((rgb == 0) || (st == 0) || (st->loc_ok == 0U)) { return -1; }
+  cx = st->star.cx;
+  cy = st->star.cy;
+  hx = st->needle.cx;
+  hy = st->needle.cy;
+  refine_center(rgb, stride, w, h, &cx, &cy, st->star.r, 1);
+  refine_center(rgb, stride, w, h, &hx, &hy, st->needle.hub_r, 0);
+  st->star.cx = (int16_t)cx;
+  st->star.cy = (int16_t)cy;
+  st->needle.cx = (int16_t)hx;
+  st->needle.cy = (int16_t)hy;
+
+  tip_ok = needle_tip(rgb, stride, w, h, hx, hy, st->needle.r,
+                      (st->have_prev != 0U) ? st->last_ang : -1, 40,
+                      &tx, &ty, &ang);
+  if ((tip_ok != 0) && (st->have_prev != 0U))
+  {
+    tip_ok = needle_tip(rgb, stride, w, h, hx, hy, st->needle.r, -1, 180,
+                        &tx, &ty, &ang);
+  }
+  if (tip_ok == 0)
+  {
+    st->needle.tip_x = (int16_t)tx;
+    st->needle.tip_y = (int16_t)ty;
+    st->needle.ang_mdeg = ang;
+    st->needle.found = 1U;
+  }
+  else
+  {
+    st->needle.found = 0U;
+  }
+
+  star_ok = track_star_phase(rgb, stride, w, h, &st->star, &phase);
+  if (star_ok == 0)
+  {
+    st->star.phase_mdeg = phase;
+    st->star.found = 1U;
+  }
+  else
+  {
+    st->star.found = 0U;
+  }
+  st->track_ok = (uint8_t)((st->needle.found != 0U) && (st->star.found != 0U));
+
+  if (st->have_prev == 0U)
+  {
+    st->stamp_us = stamp_us;
+    st->last_ang = st->needle.ang_mdeg;
+    st->last_phase = st->star.phase_mdeg;
+    st->have_prev = 1U;
+    st->have_speed = 0U;
+    return 0;
+  }
+
+  dt = stamp_us - st->stamp_us;
+  st->dt_us = dt;
+  st->stamp_us = stamp_us;
+  /* 2 ms..500 ms: skip a stalled or implausible gap, but keep unwrapping. */
+  if ((dt < 2000U) || (dt > 500000U))
+  {
+    st->last_ang = st->needle.ang_mdeg;
+    st->last_phase = st->star.phase_mdeg;
+    return 0;
+  }
+
+  if (st->needle.found != 0U)
+  {
+    int32_t dang = wrap_diff_mdeg(st->needle.ang_mdeg, st->last_ang);
+    /* L/h * 100 = deg/s * 100 = dang_mdeg * 100000 / dt_us */
+    int32_t inst = (int32_t)(((int64_t)dang * 100000LL) / (int64_t)dt);
+    inst = iabs32(inst);
+    st->flow_lh_e2 = inst;
+    if (st->have_speed == 0U) { st->flow_filt_e2 = inst; }
+    else { st->flow_filt_e2 = iir_e2(st->flow_filt_e2, inst, dt); }
+    st->last_ang = st->needle.ang_mdeg;
+  }
+  if (st->star.found != 0U)
+  {
+    int32_t dph = wrap_diff_mdeg(st->star.phase_mdeg, st->last_phase);
+    int32_t inst = (int32_t)(((int64_t)dph * 100000LL) / (int64_t)dt);
+    inst = iabs32(inst);
+    st->tps_e2 = inst;
+    if (st->have_speed == 0U) { st->tps_filt_e2 = inst; }
+    else { st->tps_filt_e2 = iir_e2(st->tps_filt_e2, inst, dt); }
+    st->last_phase = st->star.phase_mdeg;
+  }
+  if ((st->tps_filt_e2 > 20) && (st->flow_filt_e2 >= 0))
+  {
+    /* ml/p * 1000 = 1e6 * (L/h * 100) / (36 * (齿/s * 100)) */
+    st->mlp_e3 = (int32_t)(((int64_t)st->flow_filt_e2 * 1000000LL) /
+                            ((int64_t)36 * (int64_t)st->tps_filt_e2));
+  }
+  st->have_speed = 1U;
+  (void)MIN_FPS_X10;
+  return 0;
+}
+
+static void fill_rect(uint16_t *fb, int fb_w, int fb_h, int x0, int y0, int x1, int y1, uint16_t c)
+{
+  int x;
+  int y;
+  if (x0 < 0) { x0 = 0; }
+  if (y0 < 0) { y0 = 0; }
+  if (x1 >= fb_w) { x1 = fb_w - 1; }
+  if (y1 >= fb_h) { y1 = fb_h - 1; }
+  for (y = y0; y <= y1; y++)
+  {
+    uint16_t *row = fb + (y * fb_w);
+    for (x = x0; x <= x1; x++) { row[x] = c; }
+  }
+}
+
+static void plot(uint16_t *fb, int fb_w, int fb_h, int x, int y, uint16_t c, int t)
+{
+  int i;
+  int j;
+  int hw = (t > 1) ? (t / 2) : 0;
+  for (j = -hw; j <= hw; j++)
+  {
+    for (i = -hw; i <= hw; i++)
+    {
+      int xx = x + i;
+      int yy = y + j;
+      if ((xx >= 0) && (yy >= 0) && (xx < fb_w) && (yy < fb_h))
+      {
+        fb[(yy * fb_w) + xx] = c;
+      }
+    }
+  }
+}
+
+static void line_to(uint16_t *fb, int fb_w, int fb_h, int x0, int y0, int x1, int y1, uint16_t c, int t)
+{
+  int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+  int dy = (y1 > y0) ? (y1 - y0) : (y0 - y1);
+  int sx = (x0 < x1) ? 1 : -1;
+  int sy = (y0 < y1) ? 1 : -1;
+  int err = dx - dy;
+  for (;;)
+  {
+    plot(fb, fb_w, fb_h, x0, y0, c, t);
+    if ((x0 == x1) && (y0 == y1)) { break; }
+    {
+      int e2 = err * 2;
+      if (e2 > -dy) { err -= dy; x0 += sx; }
+      if (e2 < dx) { err += dx; y0 += sy; }
+    }
+  }
+}
+
+static void draw_circle(uint16_t *fb, int fb_w, int fb_h, int cx, int cy, int R, uint16_t c, int t)
+{
+  int a;
+  for (a = 0; a < 360; a += 2)
+  {
+    int x = cx + (int)(((int32_t)icos(a) * R) / 256);
+    int y = cy + (int)(((int32_t)isin(a) * R) / 256);
+    plot(fb, fb_w, fb_h, x, y, c, t);
+  }
+}
+
+static const dial_glyph_t *glyph(uint8_t code)
+{
+  uint32_t i;
+  for (i = 0; i < DIAL_FONT_NGLYPH; i++)
+  {
+    if (dial_font_glyphs[i].code == code) { return &dial_font_glyphs[i]; }
+  }
+  return 0;
+}
+
+static void blend_px(uint16_t *fb, int fb_w, int fb_h, int x, int y, int a)
+{
+  uint16_t p;
+  uint16_t out;
+  int pr, pg, pb;
+  if ((a <= 0) || (x < 0) || (y < 0) || (x >= fb_w) || (y >= fb_h)) { return; }
+  if (a > 15) { a = 15; }
+  p = fb[(y * fb_w) + x];
+  pr = (((p >> 11) & 31) * 255) / 31;
+  pg = (((p >> 5) & 63) * 255) / 63;
+  pb = ((p & 31) * 255) / 31;
+  pr = ((pr * (15 - a)) + (TXT_R * a)) / 15;
+  pg = ((pg * (15 - a)) + (TXT_G * a)) / 15;
+  pb = ((pb * (15 - a)) + (TXT_B * a)) / 15;
+  out = (uint16_t)(((pr * 31 / 255) << 11) | ((pg * 63 / 255) << 5) | (pb * 31 / 255));
+  fb[(y * fb_w) + x] = out;
+}
+
+/* 16x16 1-bit 齿. */
+static const uint16_t chi_bits[16] = {
+  0x0000, 0x03E0, 0x03E0, 0x1FFC, 0x1FFC, 0x03E0, 0x03E0, 0x1FFC,
+  0x1FFC, 0x1FFC, 0x1C1C, 0x1C1C, 0x1C1C, 0x1FFC, 0x0FF8, 0x0000
+};
+
+static int draw_extra(uint16_t *fb, int fb_w, int fb_h, int x, int y, uint8_t code)
+{
+  int col;
+  int row;
+  int w = 10;
+  int hgt = 18;
+  if (code == 0xD7U)
+  {
+    for (row = 0; row < 16; row++)
+    {
+      uint16_t bits = chi_bits[row];
+      for (col = 0; col < 16; col++)
+      {
+        if ((bits & (1U << (15 - col))) != 0U)
+        {
+          blend_px(fb, fb_w, fb_h, x + col, y + row + 6, 15);
+        }
+      }
+    }
+    return 18;
+  }
+  for (row = 0; row < hgt; row++)
+  {
+    for (col = 0; col < w; col++)
+    {
+      int on = 0;
+      if (code == (uint8_t)'/')
+      {
+        on = (col == (((hgt - 2 - row) * (w - 1)) / (hgt - 1)));
+      }
+      else if (code == (uint8_t)'h')
+      {
+        on = (col < 2) || (col > (w - 3)) || ((row >= 8) && (row <= 10));
+      }
+      else if (code == (uint8_t)'p')
+      {
+        on = (col < 2) ||
+             ((row < 11) && ((col > (w - 3)) || (row < 2) || ((row >= 8) && (row <= 10))));
+        if ((row >= 11) && (col >= 2)) { on = 0; }
+        if (col < 2) { on = 1; }
+      }
+      else
+      {
+        return 8;
+      }
+      if (on) { blend_px(fb, fb_w, fb_h, x + col, y + row + 4, 15); }
+    }
+  }
+  return w + 2;
+}
+
+static int draw_code(uint16_t *fb, int fb_w, int fb_h, int x, int y, uint8_t code)
+{
+  const dial_glyph_t *g = glyph(code);
+  int ix;
+  int iy;
+  if (g == 0)
+  {
+    return draw_extra(fb, fb_w, fb_h, x, y, code);
+  }
+  for (iy = 0; iy < (int)g->h; iy++)
+  {
+    for (ix = 0; ix < (int)g->w; ix++)
+    {
+      uint32_t bit_i = (((uint32_t)iy * (uint32_t)g->w) + (uint32_t)ix);
+      uint8_t by = g->bits[bit_i / 2U];
+      int a = ((bit_i & 1U) == 0U) ? (int)(by & 0x0FU) : (int)(by >> 4);
+      if (a != 0)
+      {
+        blend_px(fb, fb_w, fb_h, x + (int)g->xoff + ix, y + (int)g->yoff + iy, a);
+      }
+    }
+  }
+  return (int)((g->adv64 + 32) / 64);
+}
+
+static int draw_str(uint16_t *fb, int fb_w, int fb_h, int x, int y, const char *s)
+{
+  int x0 = x;
+  if (s == 0) { return 0; }
+  while (*s)
+  {
+    x += draw_code(fb, fb_w, fb_h, x, y, (uint8_t)*s);
+    s++;
+  }
+  return x - x0;
+}
+
+static int measure_str(const char *s)
+{
+  int x = 0;
+  if (s == 0) { return 0; }
+  while (*s)
+  {
+    uint8_t code = (uint8_t)*s++;
+    const dial_glyph_t *g = glyph(code);
+    if (g != 0) { x += (int)((g->adv64 + 32) / 64); }
+    else if (code == 0xD7U) { x += 18; }
+    else { x += 12; }
+  }
+  return x;
+}
+
+static void put_u(char *p, uint32_t v, int digits)
+{
+  int i;
+  for (i = digits - 1; i >= 0; i--)
+  {
+    p[i] = (char)('0' + (char)(v % 10U));
+    v /= 10U;
+  }
+}
+
+static void fmt_ip_frac(char *dst, uint32_t av, uint32_t scale, int frac)
+{
+  uint32_t ip = av / scale;
+  uint32_t fp = av % scale;
+  char tmp[12];
+  int n = 0;
+  int i;
+  char *p = dst;
+  if (ip == 0U)
+  {
+    tmp[n++] = '0';
+  }
+  else
+  {
+    char rev[12];
+    int k = 0;
+    while (ip > 0U)
+    {
+      rev[k++] = (char)('0' + (char)(ip % 10U));
+      ip /= 10U;
+    }
+    while (k > 0) { tmp[n++] = rev[--k]; }
+  }
+  for (i = 0; i < n; i++) { *p++ = tmp[i]; }
+  *p++ = '.';
+  put_u(p, fp, frac);
+  p += frac;
+  *p = 0;
+}
+
+static void fmt_signed_frac(char *dst, int32_t e, int scale, int frac)
+{
+  char *p = dst;
+  uint32_t av;
+  if (e < 0) { *p++ = '-'; av = (uint32_t)(-e); }
+  else { av = (uint32_t)e; }
+  fmt_ip_frac(p, av, (uint32_t)scale, frac);
+}
+
+void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
+                      int16_t ox, int16_t oy, const speed_state_t *st,
+                      const dial_time_t *t)
+{
+  char l1[48];
+  char l2[32];
+  char l3[32];
+  char l4[32];
+  int ncx, ncy, scx, scy, x0, y0, x1, y1, tw, lines;
+  const int hx = 12;
+  const int hy = 8;
+  const int gap = 28;
+  const int pad = 8;
+
+  if ((fb == 0) || (st == 0) || (fb_w < 16U) || (fb_h < 16U)) { return; }
+
+  ncx = (int)ox + (int)st->needle.cx;
+  ncy = (int)oy + (int)st->needle.cy;
+  scx = (int)ox + (int)st->star.cx;
+  scy = (int)oy + (int)st->star.cy;
+  if (st->star.found != 0U)
+  {
+    draw_circle(fb, (int)fb_w, (int)fb_h, scx, scy, st->star.r, LIVE_STAR, 3);
+  }
+  if (st->needle.found != 0U)
+  {
+    int32_t tdx = (int32_t)st->needle.tip_x - (int32_t)st->needle.cx;
+    int32_t tdy = (int32_t)st->needle.tip_y - (int32_t)st->needle.cy;
+    int32_t tlen = (int32_t)isqrt32((uint32_t)((tdx * tdx) + (tdy * tdy)));
+    draw_circle(fb, (int)fb_w, (int)fb_h, ncx, ncy, st->needle.r, LIVE_CIRC, 3);
+    if (tlen > 8)
+    {
+      int rx = ncx + (int)((tdx * (int32_t)st->needle.r) / tlen);
+      int ry = ncy + (int)((tdy * (int32_t)st->needle.r) / tlen);
+      line_to(fb, (int)fb_w, (int)fb_h, ncx, ncy, rx, ry, LIVE_PTR, 3);
+      plot(fb, (int)fb_w, (int)fb_h, ncx, ncy, LIVE_PTR, 6);
+    }
+  }
+
+  l1[0] = 0;
+  if (t != 0)
+  {
+    char *p = l1;
+    put_u(p, (uint32_t)t->year, 4); p += 4; *p++ = '-';
+    put_u(p, (uint32_t)t->mon, 2); p += 2; *p++ = '-';
+    put_u(p, (uint32_t)t->day, 2); p += 2; *p++ = ' ';
+    put_u(p, (uint32_t)t->hour, 2); p += 2; *p++ = ':';
+    put_u(p, (uint32_t)t->min, 2); p += 2; *p++ = ':';
+    put_u(p, (uint32_t)t->sec, 2); p += 2;
+    if (st->have_speed != 0U)
+    {
+      uint32_t ms = st->dt_us / 1000U;
+      int nd = (ms >= 1000U) ? 4 : 3;
+      *p++ = ' ';
+      put_u(p, ms, nd); p += nd;
+      *p++ = ' ';
+      *p++ = 'm';
+      *p++ = 's';
+    }
+    *p = 0;
+  }
+  else
+  {
+    l1[0] = '?';
+    l1[1] = 0;
+  }
+
+  if (st->have_speed != 0U)
+  {
+    char num[16];
+    char *p;
+    const char *s;
+    fmt_signed_frac(num, st->flow_filt_e2, 100, 2);
+    p = l2; s = num; while (*s) { *p++ = *s++; }
+    *p++ = ' '; *p++ = 'L'; *p++ = '/'; *p++ = 'h'; *p = 0;
+    fmt_signed_frac(num, st->tps_filt_e2, 100, 2);
+    p = l3; s = num; while (*s) { *p++ = *s++; }
+    *p++ = ' '; *p++ = (char)0xD7; *p++ = '/'; *p++ = 's'; *p = 0;
+    fmt_signed_frac(num, st->mlp_e3, 1000, 3);
+    p = l4; s = num; while (*s) { *p++ = *s++; }
+    *p++ = ' '; *p++ = 'm'; *p++ = 'l'; *p++ = '/'; *p++ = 'p'; *p = 0;
+    lines = 4;
+  }
+  else if (st->loc_ok != 0U)
+  {
+    l2[0] = 'o'; l2[1] = 'k'; l2[2] = 0;
+    l3[0] = 0; l4[0] = 0;
+    lines = 2;
+  }
+  else
+  {
+    /* locating */
+    l2[0] = '-'; l2[1] = '-'; l2[2] = '-'; l2[3] = 0;
+    l3[0] = 0; l4[0] = 0;
+    lines = 2;
+  }
+
+  tw = measure_str(l1);
+  {
+    int w2 = measure_str(l2);
+    int w3 = measure_str(l3);
+    int w4 = measure_str(l4);
+    if (w2 > tw) { tw = w2; }
+    if (w3 > tw) { tw = w3; }
+    if (w4 > tw) { tw = w4; }
+  }
+  x0 = hx - pad;
+  y0 = hy - pad;
+  x1 = hx + tw + pad;
+  y1 = hy + (lines * gap) + pad;
+  fill_rect(fb, (int)fb_w, (int)fb_h, x0, y0, x1, y1, 0xFFFF);
+  draw_str(fb, (int)fb_w, (int)fb_h, hx, hy, l1);
+  draw_str(fb, (int)fb_w, (int)fb_h, hx, hy + gap, l2);
+  if (lines >= 3) { draw_str(fb, (int)fb_w, (int)fb_h, hx, hy + (gap * 2), l3); }
+  if (lines >= 4) { draw_str(fb, (int)fb_w, (int)fb_h, hx, hy + (gap * 3), l4); }
+}

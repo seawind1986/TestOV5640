@@ -640,6 +640,7 @@ static uint32_t ov5640_shutter_us = 1000U;
 static uint16_t ov5640_gain = 0x00F0U;
 static uint16_t ov5640_hts = 2308U;
 static uint16_t ov5640_vts_min = 900U;
+static uint8_t ov5640_native;
 
 void OV5640_SetWindowPos(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
 {
@@ -892,8 +893,21 @@ static void OV5640_FitOutput(void)
   uint8_t reg21 = 0x06U;
   uint8_t misc = 0U;
 
-  /* 长宽用同一个比例。先贴住屏幕的长边或短边，另一边留黑。 */
-  if ((uint32_t)width * LCD_HEIGHT >= (uint32_t)height * LCD_WIDTH)
+  /* 转速模式：1:1 原尺寸居中，不放大填屏。普通预览仍按比例贴边留黑。 */
+  if (ov5640_native != 0U)
+  {
+    out_w = width;
+    out_h = height;
+    if (out_w > LCD_WIDTH)
+    {
+      out_w = LCD_WIDTH;
+    }
+    if (out_h > LCD_HEIGHT)
+    {
+      out_h = LCD_HEIGHT;
+    }
+  }
+  else if ((uint32_t)width * LCD_HEIGHT >= (uint32_t)height * LCD_WIDTH)
   {
     out_w = LCD_WIDTH;
     out_h = ((uint32_t)height * LCD_WIDTH) / width;
@@ -1032,9 +1046,13 @@ static void OV5640_FitOutput(void)
     {
       hneed = (uint32_t)cap_w * 2U + 8U;
     }
-    if (hneed < 0x0790U)
+    /* 填屏预览保留原下限，避免大窗读不完。裁窗 1:1 时放开，才能把帧率抬到测 10 齿/s 所需。 */
+    if (ov5640_native == 0U)
     {
-      hneed = 0x0790U;
+      if (hneed < 0x0790U)
+      {
+        hneed = 0x0790U;
+      }
     }
     hts = (uint16_t)(hneed + 252U);
     vneed = timing_h + 32U;
@@ -1042,9 +1060,12 @@ static void OV5640_FitOutput(void)
     {
       vneed = (uint32_t)cap_h + 32U;
     }
-    if (vneed < 0x0384U)
+    if (ov5640_native == 0U)
     {
-      vneed = 0x0384U;
+      if (vneed < 0x0384U)
+      {
+        vneed = 0x0384U;
+      }
     }
     vts = (uint16_t)vneed;
     ov5640_hts = hts;
@@ -1113,6 +1134,48 @@ void OV5640_GetCapture(uint16_t *width, uint16_t *height)
   *width = ov5640_cap_w;
   *height = ov5640_cap_h;
 }
+
+void OV5640_GetWindow(uint16_t *x, uint16_t *y, uint16_t *width, uint16_t *height)
+{
+  *x = ov5640_win_x;
+  *y = ov5640_win_y;
+  *width = ov5640_win_w;
+  *height = ov5640_win_h;
+}
+
+void OV5640_SetNativeOutput(uint8_t on)
+{
+  ov5640_native = (on != 0U) ? 1U : 0U;
+}
+
+void OV5640_SetNativeWindow(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
+{
+  int32_t src_x;
+  int32_t src_y;
+
+  if (width > LCD_WIDTH)
+  {
+    width = LCD_WIDTH;
+  }
+  if (height > LCD_HEIGHT)
+  {
+    height = LCD_HEIGHT;
+  }
+  width = (uint16_t)(width & (uint16_t)~1U);
+  height = (uint16_t)(height & (uint16_t)~1U);
+  ov5640_native = 1U;
+  src_x = (int32_t)x + (int32_t)(width / 2U) - ((int32_t)OV5640_ARRAY_W / 2);
+  src_y = (int32_t)y + (int32_t)(height / 2U)
+          - ((int32_t)OV5640_ARRAY_Y + ((int32_t)OV5640_ARRAY_H / 2));
+  ov5640_src_x = (int16_t)src_x;
+  ov5640_src_y = (int16_t)src_y;
+  ov5640_win_hold = 1U;
+  OV5640_SetWindowPos(x, y, width, height);
+  ov5640_win_hold = 0U;
+  OV5640_FitOutput();
+}
+
+
 
 void OV5640_RgbLcdPreview(uint16_t width, uint16_t height)
 {

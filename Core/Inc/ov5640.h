@@ -19,6 +19,12 @@ void OV5640_ShowOnLcd(int16_t x, int16_t y, uint16_t width, uint16_t height);
 void OV5640_GetView(uint16_t *x, uint16_t *y, uint16_t *width, uint16_t *height);
 /* 传感器实际吐出的宽高。缩小由传感器做，放大时这里仍是开窗原尺寸。 */
 void OV5640_GetCapture(uint16_t *width, uint16_t *height);
+/* 当前传感器开窗在阵列上的起点和宽高。 */
+void OV5640_GetWindow(uint16_t *x, uint16_t *y, uint16_t *width, uint16_t *height);
+/* 1：输出 1:1 原尺寸，不放大填屏。转速模式裁窗用。 */
+void OV5640_SetNativeOutput(uint8_t on);
+/* 按阵列绝对坐标开窗，1:1 输出，并把 src 记下以免后续 RgbLcdPreview 又居中。 */
+void OV5640_SetNativeWindow(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
 /* 整帧快门，单位微秒。只改曝光，不改增益。长过当前帧时把帧周期加长。 */
 void OV5640_SetExposure(uint32_t shutter_us);
 /* 10 位增益，0x350A 的低 2 位和 0x350B。只改增益，不改曝光。 */
