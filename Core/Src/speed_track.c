@@ -608,6 +608,10 @@ int32_t  g_rev_best_d;      /* 与起点的最小角距，mdeg */
 int32_t  g_rev_best_accum;
 uint32_t g_rev_best_t;
 int32_t  g_rev_best_ang;
+int16_t  g_locate_cx;
+int16_t  g_locate_cy;
+int16_t  g_locate_r;
+uint16_t g_track_miss;
 
 static void tip_hist_reset(void)
 {
@@ -810,10 +814,23 @@ static int fit_circle(const int16_t *xs, const int16_t *ys, int n, int *ocx, int
   }
   if (used < 10) { return -1; }
   rad = (int)(sabs / used);
-  if ((rad < 24) || (rad > 220)) { return -1; }
-  /* 平均残差过大则还没走出合格圆弧。 */
+  if ((rad < 50) || (rad > 220)) { return -1; }
+  /* 直径必须覆盖点列最长弦，否则短弧会被拟成偏向弧段的小圆。 */
   {
+    int j;
+    int chord2 = 0;
     int64_t eres = 0;
+    for (i = 0; i < n; i++)
+    {
+      for (j = i + 1; j < n; j++)
+      {
+        int dx = (int)xs[i] - (int)xs[j];
+        int dy = (int)ys[i] - (int)ys[j];
+        int d2 = (dx * dx) + (dy * dy);
+        if (d2 > chord2) { chord2 = d2; }
+      }
+    }
+    if ((rad * 2) < (int)isqrt32((uint32_t)chord2)) { return -1; }
     for (i = 0; i < n; i++)
     {
       int64_t dx = (int64_t)xs[i] - cx;
@@ -821,7 +838,7 @@ static int fit_circle(const int16_t *xs, const int16_t *ys, int n, int *ocx, int
       int d = (int)isqrt32((uint32_t)((dx * dx) + (dy * dy)));
       eres += (d > rad) ? (d - rad) : (rad - d);
     }
-    if ((eres / used) > 6) { return -1; }
+    if ((eres / used) > 3) { return -1; }
   }
   *ocx = cx;
   *ocy = cy;
@@ -855,6 +872,10 @@ void SpeedTrack_Shift(speed_state_t *st, int16_t dx, int16_t dy)
   st->dir_sign = 0;
   tip_hist_reset();
   rev_start(0U, 0);
+  g_locate_cx = st->needle.cx;
+  g_locate_cy = st->needle.cy;
+  g_locate_r = st->needle.r;
+  g_track_miss = 0U;
 }
 
 
@@ -1343,8 +1364,26 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
   st->track_ok = st->needle.found;
   if (st->needle.found == 0U)
   {
+    if (st->hub_locked != 0)
+    {
+      g_track_miss++;
+      if (g_track_miss >= 25U)
+      {
+        /* 跟丢则退回定位时的枢纽，重新描针尖，避免钉在错误小圆上。 */
+        st->hub_locked = 0;
+        st->have_speed = 0U;
+        st->have_prev = 0U;
+        st->needle.cx = g_locate_cx;
+        st->needle.cy = g_locate_cy;
+        st->needle.r = g_locate_r;
+        tip_hist_reset();
+        rev_start(0U, 0);
+        g_track_miss = 0U;
+      }
+    }
     return 0;
   }
+  g_track_miss = 0U;
 
   if (st->have_prev == 0U)
   {
@@ -1448,37 +1487,40 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
             a_prev = ai;
           }
           g_fit_span_mdeg = acc;
-          /* 必须绕拟合圆心走出约 0.3 L（108°），短弧不锁。 */
+          /* 必须绕拟合圆心走出约 0.3 L，且半径、圆心要接近定位结果。 */
           if (iabs32(acc) >= HUB_LOCK_MDEG)
           {
-            int ring = (fr * RING_SHRINK_N) / RING_SHRINK_D;
+            int loc_r = (int)st->needle.r;
+            int dcx = fcx - (int)st->needle.cx;
+            int dcy = fcy - (int)st->needle.cy;
+            int ok = 1;
+            int ring;
             int32_t a1;
-            uint32_t dt;
-            if (ring < 20) { ring = 20; }
-            st->needle.cx = (int16_t)fcx;
-            st->needle.cy = (int16_t)fcy;
-            st->needle.r = (int16_t)ring;
-            st->needle.hub_r = (int16_t)(fr / 4);
-            if (st->needle.hub_r < 10) { st->needle.hub_r = 10; }
-            st->hub_locked = 1;
-            a1 = a_prev;
-            dt = st->dt_us;
-            if (dt >= 200000U)
+            if ((loc_r >= 24) && (fr < ((loc_r * 7) / 10))) { ok = 0; }
+            if (((dcx * dcx) + (dcy * dcy)) > (45 * 45)) { ok = 0; }
+            if (ok != 0)
             {
-              int32_t inst = (int32_t)(((int64_t)iabs32(acc) * 1000000LL) / (int64_t)dt);
-              st->flow_lh_e2 = inst;
-              st->flow_filt_e2 = inst;
-              st->have_speed = 1U;
+              ring = (fr * RING_SHRINK_N) / RING_SHRINK_D;
+              if (ring < 20) { ring = 20; }
+              st->needle.cx = (int16_t)fcx;
+              st->needle.cy = (int16_t)fcy;
+              st->needle.r = (int16_t)ring;
+              st->needle.hub_r = (int16_t)(fr / 4);
+              if (st->needle.hub_r < 10) { st->needle.hub_r = 10; }
+              st->hub_locked = 1;
+              a1 = a_prev;
+              st->last_ang = a1;
+              st->needle.ang_mdeg = a1;
+              st->win_t0 = stamp_us;
+              st->win_accum = 0;
+              st->mid_t = 0U;
+              st->mid_accum = 0;
+              if (acc > 0) { st->dir_sign = 1; }
+              else if (acc < 0) { st->dir_sign = -1; }
+              /* 预估流速等走完一圈再报，避免短弧拟合给出离谱值。 */
+              rev_start(stamp_us, a1);
+              g_track_miss = 0U;
             }
-            st->last_ang = a1;
-            st->needle.ang_mdeg = a1;
-            st->win_t0 = stamp_us;
-            st->win_accum = 0;
-            st->mid_t = 0U;
-            st->mid_accum = 0;
-            if (acc > 0) { st->dir_sign = 1; }
-            else if (acc < 0) { st->dir_sign = -1; }
-            rev_start(stamp_us, a1);
           }
         }
       }
@@ -1818,7 +1860,7 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
 
   ncx = (int)ox + (int)st->needle.cx;
   ncy = (int)oy + (int)st->needle.cy;
-  if (st->needle.found != 0U)
+  if ((st->needle.found != 0U) || (st->hub_locked != 0))
   {
     if (st->hub_locked != 0)
     {
