@@ -19,7 +19,9 @@
 #define TXT_G      0
 #define TXT_B      0
 #define CROP_MARGIN 80
-#define NEEDLE_MIN_R 50   /* 升针在当前物距下半径约 80–110，拒掉壳上小红斑 */     /* 贴合升针，但留足边距，避免画面过小 */
+#define NEEDLE_MIN_R 50   /* 升针在当前物距下半径约 80–110，拒掉壳上小红斑 */
+#define NEEDLE_MIN_R_LO 30 /* 被裁切的升针可能略小于 50 */
+#define NEEDLE_LEFT_GAP 40 /* 左边再有一根明显更靠左的针，就用左边这根 */     /* 贴合升针，但留足边距，避免画面过小 */
 #define FLOW_WIN_MIN_US 1000000U  /* 至少跨 1 s 再报流速 */
 #define FLOW_WIN_US     2000000U  /* 按约 2 s 窗口滑动 */
 #define TIP_HIST        80
@@ -614,6 +616,7 @@ int16_t  g_locate_cy;
 int16_t  g_locate_r;
 uint16_t g_track_miss;
 uint8_t  g_need_relocate;
+uint8_t  g_n_needles;
 int16_t  g_tip_xmax;
 
 static void tip_hist_reset(void)
@@ -930,6 +933,7 @@ void SpeedTrack_Reset(speed_state_t *st)
   g_locate_r = 0;
   g_track_miss = 0U;
   g_need_relocate = 0U;
+  g_n_needles = 0U;
 }
 
 void SpeedTrack_Shift(speed_state_t *st, int16_t dx, int16_t dy)
@@ -1120,30 +1124,78 @@ int SpeedTrack_FindNeedle(const uint16_t *rgb, uint16_t stride, uint16_t w, uint
   if ((rgb == 0) || (st == 0)) { return -1; }
   n = flood_blobs(rgb, stride, w, h, 0, 0, (int)w, (int)h,
                   work, work_bytes, red, MAX_BLOB, 0);
-  for (i = 0; i < n; i++)
+  g_n_needles = 0U;
   {
-    if (pointer_from_blob(rgb, stride, w, h, &red[i], &hx, &hy, &tx, &ty, &rr) != 0)
+    int cand_hx[MAX_BLOB];
+    int cand_hy[MAX_BLOB];
+    int cand_tx[MAX_BLOB];
+    int cand_ty[MAX_BLOB];
+    int cand_rr[MAX_BLOB];
+    int nc = 0;
+    int n_big = 0;
+    int left = -1;
+    int left_big = -1;
+    int left_x = 0x7FFFFFFF;
+    int left_big_x = 0x7FFFFFFF;
+
+    for (i = 0; i < n; i++)
     {
-      continue;
+      if (pointer_from_blob(rgb, stride, w, h, &red[i], &hx, &hy, &tx, &ty, &rr) != 0)
+      {
+        continue;
+      }
+      if (rr < NEEDLE_MIN_R_LO)
+      {
+        continue;
+      }
+      if (nc < MAX_BLOB)
+      {
+        cand_hx[nc] = hx;
+        cand_hy[nc] = hy;
+        cand_tx[nc] = tx;
+        cand_ty[nc] = ty;
+        cand_rr[nc] = rr;
+        if (hx < left_x)
+        {
+          left_x = hx;
+          left = nc;
+        }
+        if (rr >= NEEDLE_MIN_R)
+        {
+          n_big++;
+          if (hx < left_big_x)
+          {
+            left_big_x = hx;
+            left_big = nc;
+          }
+        }
+        nc++;
+      }
     }
-    if (rr < NEEDLE_MIN_R)
+    g_n_needles = (uint8_t)n_big;
+    /* 优先用合格半径里最左边的；若再左边还有一根略小的（多半是被裁切的升针），改用那根。 */
+    best = left_big;
+    if ((left >= 0) && (left_big >= 0) &&
+        ((left_big_x - left_x) >= NEEDLE_LEFT_GAP))
     {
-      continue;
+      best = left;
     }
-    /* 四个红针里，升针是最左边的 ×0.0001。 */
-    if (hx < best_x)
+    else if (best < 0)
     {
-      best_x = hx;
-      best = i;
+      best = left;
+    }
+    if (best >= 0)
+    {
       st->needle.found = 1U;
-      st->needle.cx = (int16_t)hx;
-      st->needle.cy = (int16_t)hy;
-      st->needle.r = (int16_t)rr;
-      st->needle.hub_r = (int16_t)((rr * 30) / 85);
+      st->needle.cx = (int16_t)cand_hx[best];
+      st->needle.cy = (int16_t)cand_hy[best];
+      st->needle.r = (int16_t)cand_rr[best];
+      st->needle.hub_r = (int16_t)((cand_rr[best] * 30) / 85);
       if (st->needle.hub_r < 8) { st->needle.hub_r = 8; }
-      st->needle.tip_x = (int16_t)tx;
-      st->needle.tip_y = (int16_t)ty;
-      st->needle.ang_mdeg = atan2_mdeg(ty - hy, tx - hx);
+      st->needle.tip_x = (int16_t)cand_tx[best];
+      st->needle.tip_y = (int16_t)cand_ty[best];
+      st->needle.ang_mdeg = atan2_mdeg(cand_ty[best] - cand_hy[best],
+                                       cand_tx[best] - cand_hx[best]);
     }
   }
   if ((best < 0) || (st->needle.found == 0U)) { return -1; }

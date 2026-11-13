@@ -3064,6 +3064,11 @@ static void SpeedTrack_Service(void)
   {
     return;
   }
+  /* 全幅要先看到至少两根红针，再取最左边的升针裁窗，避免只认到旁边的 ×0.001。 */
+  if (g_n_needles < 2U)
+  {
+    return;
+  }
   SpeedTrack_FinishLocate(&g_speed, (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT);
   if (g_speed.loc_ok == 0U)
   {
