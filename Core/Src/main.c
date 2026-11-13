@@ -1263,7 +1263,7 @@ static void LCD_PresentLive(void)
   {
     dial_time_t now;
     dial_get_time(&now);
-    if (speed_phase != 0U)
+    if ((speed_phase != 0U) && (g_need_refine == 0U))
     {
       const uint16_t *rgb = (const uint16_t *)lcd_draw;
       SpeedTrack_Tick(rgb + (((uint32_t)cam_oy * LCD_WIDTH) + (uint32_t)cam_ox),
@@ -2999,16 +2999,13 @@ static void SpeedTrack_ApplyCrop(void)
   cam_hold = 0U;
   SpeedTrack_Shift(&g_speed, (int16_t)(-(int16_t)g_speed.crop.x),
                    (int16_t)(-(int16_t)g_speed.crop.y));
-  /* 裁完再认一次升针：若第一刀把针挤到边缘，按新轴心再裁一刀。 */
+  /* 第一刀已对准升针附近。不再二次改摄像头窗口，只在本窗里认升针。 */
+  g_need_refine = 1U;
   {
     uint32_t wb;
     const uint16_t *rgb;
-    int16_t rox = 0;
-    int16_t roy = 0;
-    uint16_t rnw = 0U;
-    uint16_t rnh = 0U;
-    int need;
     uint32_t dest;
+    int ok = -1;
 
     dest = lcd_draw;
     if (dest == 0U)
@@ -3018,23 +3015,15 @@ static void SpeedTrack_ApplyCrop(void)
     wb = DialRead_WorkBytes((uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT);
     rgb = (const uint16_t *)dest;
     rgb = rgb + (((uint32_t)cam_oy * LCD_WIDTH) + (uint32_t)cam_ox);
-    need = -1;
     if ((cam_w >= 80U) && (cam_h >= 80U) &&
         ((DIAL_WORK_ADDR + wb) <= (SDRAM_BASE + 0x2000000UL)))
     {
-      need = SpeedTrack_RefineCrop(rgb, (uint16_t)LCD_WIDTH, cam_w, cam_h,
-                                   (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed,
-                                   &rox, &roy, &rnw, &rnh);
+      ok = SpeedTrack_FindNeedle(rgb, (uint16_t)LCD_WIDTH, cam_w, cam_h,
+                                 (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed);
     }
-    if (need == 1)
+    if ((ok == 0) && ((int)g_speed.needle.cx <= ((int)cam_w / 2)))
     {
-      SpeedTrack_ApplyRefine(rox, roy, rnw, rnh);
       g_need_refine = 0U;
-    }
-    else
-    {
-      /* 第一帧可能还是空的，等实时画面到了再精裁，不要立刻回全幅。 */
-      g_need_refine = 1U;
     }
   }
   speed_phase = 1U;
@@ -3064,11 +3053,7 @@ static void SpeedTrack_Service(void)
     if (g_need_refine != 0U)
     {
       const uint16_t *rgb;
-      int16_t rox = 0;
-      int16_t roy = 0;
-      uint16_t rnw = 0U;
-      uint16_t rnh = 0U;
-      int need = -1;
+      int ok = -1;
 
       wb = DialRead_WorkBytes((uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT);
       if ((cam_w >= 80U) && (cam_h >= 80U) &&
@@ -3076,16 +3061,10 @@ static void SpeedTrack_Service(void)
       {
         rgb = (const uint16_t *)lcd_frame_addr;
         rgb = rgb + (((uint32_t)cam_oy * LCD_WIDTH) + (uint32_t)cam_ox);
-        need = SpeedTrack_RefineCrop(rgb, (uint16_t)LCD_WIDTH, cam_w, cam_h,
-                                     (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed,
-                                     &rox, &roy, &rnw, &rnh);
+        ok = SpeedTrack_FindNeedle(rgb, (uint16_t)LCD_WIDTH, cam_w, cam_h,
+                                   (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed);
       }
-      if (need == 1)
-      {
-        SpeedTrack_ApplyRefine(rox, roy, rnw, rnh);
-        g_need_refine = 0U;
-      }
-      else if (need == 0)
+      if ((ok == 0) && ((int)g_speed.needle.cx <= ((int)cam_w / 2)))
       {
         g_need_refine = 0U;
       }
