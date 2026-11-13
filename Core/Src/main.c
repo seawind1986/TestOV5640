@@ -2817,6 +2817,35 @@ static void LCD_FillBothBlack(void)
   lcd_draw = cur;
 }
 
+static void SpeedTrack_OpenFull(void)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  cam_hold = 1U;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+  (void)HAL_DCMI_Stop(&hdcmi);
+  cam_arm = 0U;
+  cam_curline = 0U;
+  cam_draw_full = 2U;
+  LCD_FillBothBlack();
+  OV5640_PowerCycle();
+  OV5640_RgbLcdPreview(LCD_WIDTH, LCD_HEIGHT);
+  CAM_LoadView();
+  HAL_Delay(20);
+  CAM_Start();
+  HAL_Delay(20);
+  CamDbg_SnapSensor();
+  HAL_Delay(80);
+  CamDbg_SnapLive();
+  cam_hold = 0U;
+  SpeedTrack_Reset(&g_speed);
+  speed_phase = 0U;
+  CamDbg_Mark(8U);
+}
+
 static void SpeedTrack_ApplyCrop(void)
 {
   OV5640_GetWindow((uint16_t *)&g_cam_dbg.win_x, (uint16_t *)&g_cam_dbg.win_y,
@@ -2988,6 +3017,11 @@ static void SpeedTrack_ApplyCrop(void)
       cam_hold = 0U;
       SpeedTrack_Shift(&g_speed, (int16_t)(-rox), (int16_t)(-roy));
     }
+    else if (need < 0)
+    {
+      SpeedTrack_OpenFull();
+      return;
+    }
   }
   speed_phase = 1U;
   CamDbg_Mark(7U);
@@ -3004,6 +3038,11 @@ static void SpeedTrack_Service(void)
   }
   if ((cam_ok == 0U) || (cam_out_jpeg != 0U))
   {
+    return;
+  }
+  if (g_need_relocate != 0U)
+  {
+    SpeedTrack_OpenFull();
     return;
   }
   if (speed_phase != 0U)

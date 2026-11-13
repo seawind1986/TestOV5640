@@ -18,7 +18,8 @@
 #define TXT_R      255
 #define TXT_G      0
 #define TXT_B      0
-#define CROP_MARGIN 80     /* 贴合升针，但留足边距，避免画面过小 */
+#define CROP_MARGIN 80
+#define NEEDLE_MIN_R 50   /* 升针在当前物距下半径约 80–110，拒掉壳上小红斑 */     /* 贴合升针，但留足边距，避免画面过小 */
 #define FLOW_WIN_MIN_US 1000000U  /* 至少跨 1 s 再报流速 */
 #define FLOW_WIN_US     2000000U  /* 按约 2 s 窗口滑动 */
 #define TIP_HIST        80
@@ -612,6 +613,7 @@ int16_t  g_locate_cx;
 int16_t  g_locate_cy;
 int16_t  g_locate_r;
 uint16_t g_track_miss;
+uint8_t  g_need_relocate;
 int16_t  g_tip_xmax;
 
 static void tip_hist_reset(void)
@@ -923,6 +925,11 @@ void SpeedTrack_Reset(speed_state_t *st)
   memset(st, 0, sizeof(*st));
   tip_hist_reset();
   rev_start(0U, 0);
+  g_locate_cx = 0;
+  g_locate_cy = 0;
+  g_locate_r = 0;
+  g_track_miss = 0U;
+  g_need_relocate = 0U;
 }
 
 void SpeedTrack_Shift(speed_state_t *st, int16_t dx, int16_t dy)
@@ -1116,6 +1123,10 @@ int SpeedTrack_FindNeedle(const uint16_t *rgb, uint16_t stride, uint16_t w, uint
   for (i = 0; i < n; i++)
   {
     if (pointer_from_blob(rgb, stride, w, h, &red[i], &hx, &hy, &tx, &ty, &rr) != 0)
+    {
+      continue;
+    }
+    if (rr < NEEDLE_MIN_R)
     {
       continue;
     }
@@ -1495,9 +1506,9 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
   st->track_ok = st->needle.found;
   if (st->needle.found == 0U)
   {
+    g_track_miss++;
     if (st->hub_locked != 0)
     {
-      g_track_miss++;
       if (g_track_miss >= 25U)
       {
         /* 跟丢则退回定位时的枢纽，重新描针尖，避免钉在错误小圆上。 */
@@ -1511,6 +1522,11 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
         rev_start(0U, 0);
         g_track_miss = 0U;
       }
+    }
+    else if (g_track_miss >= 40U)
+    {
+      /* 裁窗里一直没有红针，回到全幅重新定位。 */
+      g_need_relocate = 1U;
     }
     return 0;
   }
