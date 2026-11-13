@@ -25,6 +25,8 @@
 #define HUB_LOCK_MDEG   108000   /* 0.3 L = 108°，用针尖轨迹拟合圆心 */
 #define RING_SHRINK_N   70       /* 锁定后轨迹半径收进针身，避免扫空 */
 #define RING_SHRINK_D   100
+#define REV_HUNT_MDEG  300000    /* 走出约 0.83 圈后再找与起点最接近的位置 */
+#define REV_PASS_MDEG    4000    /* 比最近点再偏 4°，视为已经越过 */
 #define MIN_FPS_X10 20   /* 10 齿/s 的奈奎斯特下限：每秒至少 20 帧 */
 
 /* Inverse rectify (rectified -> captured), copied from dial_read.c; that file is not edited. */
@@ -598,6 +600,14 @@ uint16_t g_tip_n;
 int32_t  g_span_mdeg;
 int32_t  g_path_px;
 int32_t  g_fit_span_mdeg;
+uint32_t g_rev_t0;          /* 一圈测流的起点时刻 */
+int32_t  g_rev_ang0;        /* 起点角度 */
+int32_t  g_rev_accum;       /* 自起点展开的角度，mdeg */
+uint8_t  g_rev_hunt;
+int32_t  g_rev_best_d;      /* 与起点的最小角距，mdeg */
+int32_t  g_rev_best_accum;
+uint32_t g_rev_best_t;
+int32_t  g_rev_best_ang;
 
 static void tip_hist_reset(void)
 {
@@ -607,6 +617,18 @@ static void tip_hist_reset(void)
   g_fit_span_mdeg = 0;
   memset(g_tip_x, 0, sizeof(g_tip_x));
   memset(g_tip_y, 0, sizeof(g_tip_y));
+}
+
+static void rev_start(uint32_t stamp, int32_t ang)
+{
+  g_rev_t0 = stamp;
+  g_rev_ang0 = ang;
+  g_rev_accum = 0;
+  g_rev_hunt = 0U;
+  g_rev_best_d = 180000;
+  g_rev_best_accum = 0;
+  g_rev_best_t = stamp;
+  g_rev_best_ang = ang;
 }
 
 /* 直接取红色指针最外端：先找红像素质心，再取离质心最远的红点。
@@ -813,6 +835,7 @@ void SpeedTrack_Reset(speed_state_t *st)
   if (st == 0) { return; }
   memset(st, 0, sizeof(*st));
   tip_hist_reset();
+  rev_start(0U, 0);
 }
 
 void SpeedTrack_Shift(speed_state_t *st, int16_t dx, int16_t dy)
@@ -831,6 +854,7 @@ void SpeedTrack_Shift(speed_state_t *st, int16_t dx, int16_t dy)
   st->hub_locked = 0;
   st->dir_sign = 0;
   tip_hist_reset();
+  rev_start(0U, 0);
 }
 
 
@@ -1357,13 +1381,17 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
     st->win_accum = 0;
     st->mid_t = 0U;
     st->mid_accum = 0;
-    st->have_speed = 0U;
     if (st->hub_locked == 0)
     {
+      st->have_speed = 0U;
       tip_hist_reset();
       g_tip_x[0] = (int16_t)tx;
       g_tip_y[0] = (int16_t)ty;
       g_tip_n = 1U;
+    }
+    else
+    {
+      rev_start(stamp_us, st->needle.ang_mdeg);
     }
     return 0;
   }
@@ -1450,40 +1478,59 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
             st->mid_accum = 0;
             if (acc > 0) { st->dir_sign = 1; }
             else if (acc < 0) { st->dir_sign = -1; }
+            rev_start(stamp_us, a1);
           }
         }
       }
       return 0;
     }
 
-    /* 圆心已锁定：按一段时间窗口算流速。 */
+    /* 圆心已锁定：以某一帧为起点，指针走约一圈（1 L），
+     * 在最接近起点时用实际转角除以用时得到流量。 */
     {
-      uint32_t dt;
-      st->win_accum += dang;
-      if ((st->dir_sign == 0) && (iabs32(st->win_accum) >= 8000))
+      int32_t off;
+      if ((st->dir_sign == 0) && (iabs32(dang) >= 2000))
       {
-        st->dir_sign = (st->win_accum > 0) ? 1 : -1;
+        st->dir_sign = (dang > 0) ? 1 : -1;
       }
-      dt = stamp_us - st->win_t0;
-      st->dt_us = dt;
-      if (dt >= FLOW_WIN_MIN_US)
+      if (g_rev_t0 == 0U)
       {
-        int32_t inst = (int32_t)(((int64_t)iabs32(st->win_accum) * 1000000LL) / (int64_t)dt);
-        st->flow_lh_e2 = inst;
-        st->flow_filt_e2 = inst;
-        st->have_speed = 1U;
+        rev_start(stamp_us, st->needle.ang_mdeg);
       }
-      if ((st->mid_t == 0U) && (dt >= (FLOW_WIN_US / 2U)))
+      g_rev_accum += dang;
+      off = iabs32(wrap_diff_mdeg(st->needle.ang_mdeg, g_rev_ang0));
+      if (iabs32(g_rev_accum) >= REV_HUNT_MDEG)
       {
-        st->mid_t = stamp_us;
-        st->mid_accum = st->win_accum;
-      }
-      if ((dt >= FLOW_WIN_US) && (st->mid_t != 0U) && (st->mid_t > st->win_t0))
-      {
-        st->win_accum -= st->mid_accum;
-        st->win_t0 = st->mid_t;
-        st->mid_t = 0U;
-        st->mid_accum = 0;
+        if (g_rev_hunt == 0U)
+        {
+          g_rev_hunt = 1U;
+          g_rev_best_d = off;
+          g_rev_best_accum = g_rev_accum;
+          g_rev_best_t = stamp_us;
+          g_rev_best_ang = st->needle.ang_mdeg;
+        }
+        else if (off <= g_rev_best_d)
+        {
+          g_rev_best_d = off;
+          g_rev_best_accum = g_rev_accum;
+          g_rev_best_t = stamp_us;
+          g_rev_best_ang = st->needle.ang_mdeg;
+        }
+        else if (off > (g_rev_best_d + REV_PASS_MDEG))
+        {
+          uint32_t dt = g_rev_best_t - g_rev_t0;
+          if ((dt >= 2000000U) && (iabs32(g_rev_best_accum) >= 250000))
+          {
+            int32_t inst = (int32_t)(((int64_t)iabs32(g_rev_best_accum) * 1000000LL) / (int64_t)dt);
+            st->flow_lh_e2 = inst;
+            st->flow_filt_e2 = inst;
+            st->have_speed = 1U;
+            st->dt_us = dt;
+          }
+          /* 最近点这一帧作为下一圈的起点。 */
+          rev_start(g_rev_best_t, g_rev_best_ang);
+          g_rev_accum = wrap_diff_mdeg(st->needle.ang_mdeg, g_rev_best_ang);
+        }
       }
     }
   }
