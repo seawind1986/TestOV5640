@@ -2943,18 +2943,25 @@ static void SpeedTrack_ApplyCrop(void)
   {
     g_cam_dbg.cap_h = 1U;
   }
-  g_cam_dbg.crop_sx = (uint16_t)((int32_t)g_cam_dbg.win_x
-      + (((g_cam_dbg.lcd_x0 - (int32_t)g_cam_dbg.view_x) * (int32_t)g_cam_dbg.win_w)
-         / (int32_t)g_cam_dbg.cap_w));
-  g_cam_dbg.crop_sy = (uint16_t)((int32_t)g_cam_dbg.win_y
-      + (((g_cam_dbg.lcd_y0 - (int32_t)g_cam_dbg.view_y) * (int32_t)g_cam_dbg.win_h)
-         / (int32_t)g_cam_dbg.cap_h));
   g_cam_dbg.crop_sw = (uint16_t)(((uint32_t)g_speed.crop.w * (uint32_t)g_cam_dbg.win_w)
                                  / (uint32_t)g_cam_dbg.cap_w);
   g_cam_dbg.crop_sh = (uint16_t)(((uint32_t)g_speed.crop.h * (uint32_t)g_cam_dbg.win_h)
                                  / (uint32_t)g_cam_dbg.cap_h);
   g_cam_dbg.crop_sw = (uint16_t)(g_cam_dbg.crop_sw & (uint16_t)~1U);
   g_cam_dbg.crop_sh = (uint16_t)(g_cam_dbg.crop_sh & (uint16_t)~1U);
+  /* 预览左右是镜像的：LCD 左边对应传感器窗口的高端。 */
+  {
+    int32_t sx;
+    sx = (int32_t)g_cam_dbg.win_x + (int32_t)g_cam_dbg.win_w
+         - (((g_cam_dbg.lcd_x0 - (int32_t)g_cam_dbg.view_x) * (int32_t)g_cam_dbg.win_w)
+            / (int32_t)g_cam_dbg.cap_w)
+         - (int32_t)g_cam_dbg.crop_sw;
+    if (sx < 0) { sx = 0; }
+    g_cam_dbg.crop_sx = (uint16_t)sx;
+  }
+  g_cam_dbg.crop_sy = (uint16_t)((int32_t)g_cam_dbg.win_y
+      + (((g_cam_dbg.lcd_y0 - (int32_t)g_cam_dbg.view_y) * (int32_t)g_cam_dbg.win_h)
+         / (int32_t)g_cam_dbg.cap_h));
   if (g_cam_dbg.crop_sw < 80U)
   {
     g_cam_dbg.crop_sw = 80U;
@@ -3091,8 +3098,8 @@ static void SpeedTrack_Service(void)
   {
     return;
   }
-  /* 全幅要先看到至少两根红针，再取最左边的升针裁窗，避免只认到旁边的 ×0.001。 */
-  if (g_n_needles < 2U)
+  /* 左移预览里四根针都在时，最左一根才是升针。 */
+  if (g_n_needles < 4U)
   {
     return;
   }
