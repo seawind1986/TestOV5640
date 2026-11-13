@@ -1421,9 +1421,23 @@ void OV5640_RgbLcdPreview(uint16_t width, uint16_t height)
   OV5640_RgbLcdFinish();
 }
 
+static void OV5640_ReloadBase(void)
+{
+  /* 硬件复位后寄存器回到默认，必须把公共表和 DVP 引脚再写一遍，否则 0x3017 为 0，不会出同步。 */
+  (void)SCCB_WriteReg(0x3103U, 0x11U);
+  (void)SCCB_WriteReg(0x3008U, 0x82U);
+  HAL_Delay(10);
+  (void)OV5640_WriteList(ov5640_common,
+                         (uint32_t)(sizeof(ov5640_common) / sizeof(ov5640_common[0]) / 2U));
+  (void)OV5640_WriteList(ov5640_dvp,
+                         (uint32_t)(sizeof(ov5640_dvp) / sizeof(ov5640_dvp[0]) / 2U));
+  HAL_Delay(50);
+}
+
 void OV5640_RgbLcdNativeWindow(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
 {
-  /* 复位后直接按小窗初始化，避免先开大窗再改行周期把同步卡死。 */
+  /* 复位后先恢复 DVP 和 ISP，再直接按小窗初始化。 */
+  OV5640_ReloadBase();
   OV5640_RgbLcdSetup();
   OV5640_SetStream(0U);
   HAL_Delay(10);
