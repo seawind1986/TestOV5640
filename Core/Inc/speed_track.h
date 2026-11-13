@@ -66,7 +66,7 @@ extern uint16_t g_rev_seq; /* 每测完一圈加一，流量行 [001] */
 extern uint32_t g_frame_dt_us; /* 当前针位与上一帧的时间差，TIM2 微秒 */
 extern uint8_t g_meas_n;
 extern int32_t g_flow_avg_e2;
-extern int32_t g_flow_rep_e2; /* 重复性，0.01% */
+extern int32_t g_flow_rep_e4; /* 重复性，0.0001% */
 
 /* 在实时画面上找升针（不走表盘算法）。成功返回 0。 */
 int SpeedTrack_FindNeedle(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,

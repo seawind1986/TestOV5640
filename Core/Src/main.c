@@ -1855,6 +1855,15 @@ static void CAM_LoadView(void)
   cam_vh = vh;
   cam_w = cw;
   cam_h = ch;
+  /* 速度模式裁窗后，1:1 实时画面固定放在屏幕右上角，左侧给测量列表。 */
+  if ((METER_MODE == METER_MODE_SPEED) &&
+      (cam_w == cam_vw) && (cam_h == cam_vh) &&
+      (cam_w < LCD_WIDTH) && (cam_h < LCD_HEIGHT) &&
+      (cam_w >= 80U) && (cam_h >= 80U))
+  {
+    cam_ox = (uint16_t)(LCD_WIDTH - cam_w);
+    cam_oy = 0U;
+  }
 }
 
 /* 放大不能放在行中断里。300 行拉成 600 行时，写屏幕比行周期长，垂直方向会丢行，画面被压扁。 */

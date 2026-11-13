@@ -623,7 +623,7 @@ uint16_t g_meas_seq[MEAS_HIST];
 uint8_t  g_meas_n;
 uint8_t  g_meas_i;
 int32_t  g_flow_avg_e2;
-int32_t  g_flow_rep_e2;       /* 重复性，0.01%：s / 平均 × 100% */
+int32_t  g_flow_rep_e4;       /* 重复性，0.0001%：s / 平均 × 100% */
 int16_t  g_locate_cx;
 int16_t  g_locate_cy;
 int16_t  g_locate_r;
@@ -676,7 +676,7 @@ static void meas_record(int32_t flow_e2, uint32_t dt_us, int32_t accum)
   }
 
   g_flow_avg_e2 = 0;
-  g_flow_rep_e2 = 0;
+  g_flow_rep_e4 = 0;
   if (g_meas_n >= (uint8_t)MEAS_HIST)
   {
     sum = 0;
@@ -695,7 +695,7 @@ static void meas_record(int32_t flow_e2, uint32_t dt_us, int32_t accum)
         ss += d * d;
       }
       s = isqrt32((uint32_t)(ss / (int64_t)(MEAS_HIST - 1)));
-      g_flow_rep_e2 = (int32_t)((((int64_t)s * 10000LL) + ((int64_t)mean / 2)) / (int64_t)mean);
+      g_flow_rep_e4 = (int32_t)((((int64_t)s * 1000000LL) + ((int64_t)mean / 2)) / (int64_t)mean);
     }
   }
 }
@@ -2307,7 +2307,7 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
   char l2[24];
   char rows[MEAS_HIST][48];
   int ncx, ncy, x0, y0, x1, y1, tw, lines;
-  int k, nk, col_w, xR, yb;
+  int k, nk, col_w;
   const int hx = 12;
   const int hy = 8;
   const int gap = 28;
@@ -2373,7 +2373,7 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
     char num[16];
     char *p;
     const char *s;
-    fmt_signed_frac(num, g_flow_rep_e2, 100, 2);
+    fmt_signed_frac(num, g_flow_rep_e4, 10000, 4);
     p = l2; s = num; while (*s) { *p++ = *s++; }
     *p++ = '%';
     *p = 0;
@@ -2397,7 +2397,7 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
   draw_str(fb, (int)fb_w, (int)fb_h, hx, hy, l1);
   draw_str(fb, (int)fb_w, (int)fb_h, hx, hy + gap, l2);
 
-  /* 最近 10 次排在画面下方两列，以免挡住升针；左列从上到下是最新的 5 次。 */
+  /* 最近 10 次靠左一列，新的紧接在重复性下面。画面在右上角，不会挡住。 */
   nk = (int)g_meas_n;
   col_w = 0;
   for (k = 0; k < nk; k++)
@@ -2411,31 +2411,21 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
   }
   if (nk > 0)
   {
-    int cols = (nk > 5) ? 2 : 1;
-    int rows_c = 5;
     int gapl = 28;
-    int xL = hx;
-    xR = xL + col_w + 16;
-    if ((xR + col_w + pad) > (int)fb_w)
-    {
-      xR = (int)fb_w - pad - col_w;
-      if (xR < (xL + col_w + 8)) { xR = xL + col_w + 8; }
-    }
-    yb = (int)fb_h - pad - (rows_c * gapl) - 12;
-    if (yb < (y1 + 8)) { yb = y1 + 8; }
-    x0 = xL - pad;
-    y0 = yb - pad;
-    x1 = ((cols == 2) ? (xR + col_w) : (xL + col_w)) + pad;
-    y1 = yb + (rows_c * gapl) + pad;
+    int yb = hy + (lines * gap);
+    if (col_w > tw) { tw = col_w; }
+    x0 = hx - pad;
+    y0 = hy - pad;
+    x1 = hx + tw + pad;
+    y1 = yb + (nk * gapl) + pad + 12;
     if (x1 >= (int)fb_w) { x1 = (int)fb_w - 1; }
     if (y1 >= (int)fb_h) { y1 = (int)fb_h - 1; }
     fill_rect(fb, (int)fb_w, (int)fb_h, x0, y0, x1, y1, 0xFFFF);
+    draw_str(fb, (int)fb_w, (int)fb_h, hx, hy, l1);
+    draw_str(fb, (int)fb_w, (int)fb_h, hx, hy + gap, l2);
     for (k = 0; k < nk; k++)
     {
-      int col = k / 5;
-      int row = k % 5;
-      int x = (col == 0) ? xL : xR;
-      draw_str(fb, (int)fb_w, (int)fb_h, x, yb + (row * gapl), rows[k]);
+      draw_str(fb, (int)fb_w, (int)fb_h, hx, yb + (k * gapl), rows[k]);
     }
   }
 }
