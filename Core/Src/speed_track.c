@@ -767,7 +767,7 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
   tip_ok = needle_tip(rgb, stride, w, h, hx, hy, st->needle.r,
                       (st->have_prev != 0U) ? st->last_ang : -1, 40,
                       &tx, &ty, &ang);
-  if ((tip_ok != 0) && (st->have_prev != 0U))
+  if (tip_ok != 0)
   {
     tip_ok = needle_tip(rgb, stride, w, h, hx, hy, st->needle.r, -1, 180,
                         &tx, &ty, &ang);
@@ -1182,15 +1182,9 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
     *p++ = ' '; *p++ = 'm'; *p++ = 'l'; *p++ = '/'; *p++ = 'p'; *p = 0;
     lines = 4;
   }
-  else if (st->loc_ok != 0U)
-  {
-    l2[0] = 'o'; l2[1] = 'k'; l2[2] = 0;
-    l3[0] = 0; l4[0] = 0;
-    lines = 2;
-  }
   else
   {
-    /* locating */
+    /* 定位中或已裁窗但还没有速度：字库没有 o/k，用 --- 避免第二行空白。 */
     l2[0] = '-'; l2[1] = '-'; l2[2] = '-'; l2[3] = 0;
     l3[0] = 0; l4[0] = 0;
     lines = 2;

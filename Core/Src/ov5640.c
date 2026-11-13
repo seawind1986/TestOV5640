@@ -1068,6 +1068,26 @@ static void OV5640_FitOutput(void)
       }
     }
     vts = (uint16_t)vneed;
+    /* 小窗如果只按读完窗口来算行场，帧率会到几百，行中断跟不上，DCMI 会停。
+     * PCLK ≈ 109.375 MHz，把 HTS*VTS 拉到约 50 fps，既高于 10 齿/s 所需，又跑得稳。 */
+    if (ov5640_native != 0U)
+    {
+      uint32_t pclk_hz = 2625000000UL / (6U * 4U);
+      uint32_t target = pclk_hz / 50U;
+      uint32_t prod = (uint32_t)hts * (uint32_t)vts;
+      if (prod < target)
+      {
+        uint32_t v2 = (target + (uint32_t)hts - 1U) / (uint32_t)hts;
+        if (v2 > 0xFFFFU)
+        {
+          v2 = 0xFFFFU;
+        }
+        if (v2 > (uint32_t)vts)
+        {
+          vts = (uint16_t)v2;
+        }
+      }
+    }
     ov5640_hts = hts;
     ov5640_vts_min = vts;
     OV5640_Group(0x03U);

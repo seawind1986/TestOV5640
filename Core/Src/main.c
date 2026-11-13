@@ -2751,7 +2751,10 @@ static void SpeedTrack_ApplyCrop(void)
   }
   LCD_FillBothBlack();
   OV5640_SetNativeWindow(sx, sy, sw, sh);
-  CAM_Apply();
+  /* 已经在 RGB 预览里，不要再走 RgbLcdPreview 整表初始化，小窗时序会被冲乱后停帧。 */
+  CAM_LoadView();
+  HAL_Delay(30);
+  CAM_Start();
   LCD_FillBothBlack();
   SpeedTrack_Shift(&g_speed, (int16_t)(-(int16_t)g_speed.crop.x),
                    (int16_t)(-(int16_t)g_speed.crop.y));
