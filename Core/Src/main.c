@@ -2749,13 +2749,27 @@ static void SpeedTrack_ApplyCrop(void)
   {
     sh = (uint16_t)LCD_HEIGHT;
   }
+  /* 先停采集再改窗口。否则传感器已经吐小行，DMA 还按全幅收，溢出后 DCMI 会停。
+   * 也不要走 RgbLcdPreview 整表初始化，也不要在开采集之后再刷黑。 */
+  {
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    cam_hold = 1U;
+    if (primask == 0U)
+    {
+      __enable_irq();
+    }
+  }
+  (void)HAL_DCMI_Stop(&hdcmi);
+  cam_arm = 0U;
+  cam_curline = 0U;
+  cam_draw_full = 2U;
   LCD_FillBothBlack();
   OV5640_SetNativeWindow(sx, sy, sw, sh);
-  /* 已经在 RGB 预览里，不要再走 RgbLcdPreview 整表初始化，小窗时序会被冲乱后停帧。 */
   CAM_LoadView();
-  HAL_Delay(30);
+  HAL_Delay(50);
   CAM_Start();
-  LCD_FillBothBlack();
+  cam_hold = 0U;
   SpeedTrack_Shift(&g_speed, (int16_t)(-(int16_t)g_speed.crop.x),
                    (int16_t)(-(int16_t)g_speed.crop.y));
   speed_phase = 1U;
