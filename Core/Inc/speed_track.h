@@ -72,6 +72,12 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
 /* 把定位坐标从全幅平移到裁窗坐标系。 */
 void SpeedTrack_Shift(speed_state_t *st, int16_t dx, int16_t dy);
 
+/* 在当前裁窗里重新找升针。若针太靠边，写出新裁窗在本图中的原点与尺寸并返回 1，
+ * 需要主程序再裁一次；已经居中返回 0；没找到返回 -1。 */
+int SpeedTrack_RefineCrop(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                          uint8_t *work, uint32_t work_bytes, speed_state_t *st,
+                          int16_t *ox, int16_t *oy, uint16_t *nw, uint16_t *nh);
+
 /* 用带时间戳的一帧更新转速。速度只用 stamp_us，不用 RTC。 */
 int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
                     uint32_t stamp_us, speed_state_t *st);

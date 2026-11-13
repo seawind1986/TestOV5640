@@ -637,6 +637,9 @@ static void rev_start(uint32_t stamp, int32_t ang)
 }
 
 /* 用红色列直方图找到升针右侧空隙，避免针尖跟到旁边那个红指针。 */
+static int count_red_near(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                          int cx, int cy, int rad);
+
 static int left_red_xmax(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h)
 {
   int x, y;
@@ -667,7 +670,16 @@ static int left_red_xmax(const uint16_t *rgb, uint16_t stride, uint16_t w, uint1
     {
       if (gaplen == 0) { gap0 = x; }
       gaplen++;
-      if (gaplen >= 16) { return (gap0 - 1); }
+      if (gaplen >= 16)
+      {
+        int k;
+        int saw = 0;
+        for (k = x; k < ww; k++)
+        {
+          if (col[k] >= 6) { saw = 1; break; }
+        }
+        if (saw != 0) { return (gap0 - 1); }
+      }
     }
   }
   if (start < 0) { return ((int)w - 1); }
@@ -721,6 +733,7 @@ static int free_tip(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
   mx = (int)(sx / n);
   my = (int)(sy / n);
 
+  /* 先找质心最远端，再找另一端；红点更少的一端是针尖，避免把反光后的针帽当针尖。 */
   for (y = y0; y <= y1; y++)
   {
     for (x = x0; x <= x1; x++)
@@ -734,9 +747,11 @@ static int free_tip(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
   }
   if ((bx < 0) || (best < (18 * 18))) { return -1; }
 
-  /* 最远端附近几个红点取平均，避免单像素抖动。 */
   {
-    int thr = (best * 85) / 100;
+    int cx2 = -1, cy2 = -1;
+    int best2 = -1;
+    int da, db;
+    int tipx, tipy;
     for (y = y0; y <= y1; y++)
     {
       for (x = x0; x <= x1; x++)
@@ -744,23 +759,45 @@ static int free_tip(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
         int d2;
         unpack(pix(rgb, stride, x, y), &r, &g, &b);
         if (is_red(r, g, b) == 0) { continue; }
-        d2 = ((x - mx) * (x - mx)) + ((y - my) * (y - my));
-        if (d2 < thr) { continue; }
-        ax += x;
-        ay += y;
-        an++;
+        d2 = ((x - bx) * (x - bx)) + ((y - by) * (y - by));
+        if (d2 > best2) { best2 = d2; cx2 = x; cy2 = y; }
       }
     }
-  }
-  if (an >= 3)
-  {
-    *tx = (int)((ax + (an / 2)) / an);
-    *ty = (int)((ay + (an / 2)) / an);
-  }
-  else
-  {
-    *tx = bx;
-    *ty = by;
+    if ((cx2 < 0) || (best2 < (18 * 18))) { return -1; }
+    da = count_red_near(rgb, stride, w, h, bx, by, 7);
+    db = count_red_near(rgb, stride, w, h, cx2, cy2, 7);
+    if (da <= db) { tipx = bx; tipy = by; }
+    else { tipx = cx2; tipy = cy2; }
+
+    /* 针尖附近几个红点取平均，避免单像素抖动。 */
+    {
+      int thr = ((da <= db) ? best : best2);
+      thr = (thr * 85) / 100;
+      for (y = y0; y <= y1; y++)
+      {
+        for (x = x0; x <= x1; x++)
+        {
+          int d2;
+          unpack(pix(rgb, stride, x, y), &r, &g, &b);
+          if (is_red(r, g, b) == 0) { continue; }
+          d2 = ((x - tipx) * (x - tipx)) + ((y - tipy) * (y - tipy));
+          if (d2 > (12 * 12)) { continue; }
+          ax += x;
+          ay += y;
+          an++;
+        }
+      }
+    }
+    if (an >= 3)
+    {
+      *tx = (int)((ax + (an / 2)) / an);
+      *ty = (int)((ay + (an / 2)) / an);
+    }
+    else
+    {
+      *tx = tipx;
+      *ty = tipy;
+    }
   }
   return 0;
 }
@@ -909,6 +946,67 @@ void SpeedTrack_Shift(speed_state_t *st, int16_t dx, int16_t dy)
   g_locate_cy = st->needle.cy;
   g_locate_r = st->needle.r;
   g_track_miss = 0U;
+}
+
+int SpeedTrack_RefineCrop(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                          uint8_t *work, uint32_t work_bytes, speed_state_t *st,
+                          int16_t *ox, int16_t *oy, uint16_t *nw, uint16_t *nh)
+{
+  int pad;
+  int tw;
+  int th;
+  int x0;
+  int y0;
+  int need = 0;
+
+  if (ox != 0) { *ox = 0; }
+  if (oy != 0) { *oy = 0; }
+  if (nw != 0) { *nw = w; }
+  if (nh != 0) { *nh = h; }
+  if (SpeedTrack_FindNeedle(rgb, stride, w, h, work, work_bytes, st) != 0)
+  {
+    return -1;
+  }
+  g_locate_cx = st->needle.cx;
+  g_locate_cy = st->needle.cy;
+  g_locate_r = st->needle.r;
+  pad = (int)st->needle.r + CROP_MARGIN;
+  if (pad < 80) { pad = 80; }
+  if ((st->needle.cx < pad) ||
+      (st->needle.cy < pad) ||
+      ((((int)w - 1) - (int)st->needle.cx) < pad) ||
+      ((((int)h - 1) - (int)st->needle.cy) < pad))
+  {
+    need = 1;
+  }
+  if ((st->needle.tip_x < 8) ||
+      (st->needle.tip_y < 8) ||
+      (st->needle.tip_x > ((int)w - 9)) ||
+      (st->needle.tip_y > ((int)h - 9)))
+  {
+    need = 1;
+  }
+  if (need == 0)
+  {
+    return 0;
+  }
+  tw = pad * 2;
+  th = pad * 2;
+  if (tw > 1024) { tw = 1024; }
+  if (th > 600) { th = 600; }
+  tw &= ~1;
+  th &= ~1;
+  if (tw < 80) { tw = 80; }
+  if (th < 80) { th = 80; }
+  x0 = (int)st->needle.cx - (tw / 2);
+  y0 = (int)st->needle.cy - (th / 2);
+  x0 &= ~1;
+  y0 &= ~1;
+  if (ox != 0) { *ox = (int16_t)x0; }
+  if (oy != 0) { *oy = (int16_t)y0; }
+  if (nw != 0) { *nw = (uint16_t)tw; }
+  if (nh != 0) { *nh = (uint16_t)th; }
+  return 1;
 }
 
 

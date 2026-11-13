@@ -2899,6 +2899,96 @@ static void SpeedTrack_ApplyCrop(void)
   cam_hold = 0U;
   SpeedTrack_Shift(&g_speed, (int16_t)(-(int16_t)g_speed.crop.x),
                    (int16_t)(-(int16_t)g_speed.crop.y));
+  /* 裁完再认一次升针：若第一刀把针挤到边缘，按新轴心再裁一刀。 */
+  {
+    uint32_t wb;
+    const uint16_t *rgb;
+    int16_t rox = 0;
+    int16_t roy = 0;
+    uint16_t rnw = 0U;
+    uint16_t rnh = 0U;
+    int need;
+    uint32_t dest;
+
+    dest = lcd_draw;
+    if (dest == 0U)
+    {
+      dest = lcd_frame_addr;
+    }
+    wb = DialRead_WorkBytes((uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT);
+    rgb = (const uint16_t *)dest;
+    rgb = rgb + (((uint32_t)cam_oy * LCD_WIDTH) + (uint32_t)cam_ox);
+    need = -1;
+    if ((cam_w >= 80U) && (cam_h >= 80U) &&
+        ((DIAL_WORK_ADDR + wb) <= (SDRAM_BASE + 0x2000000UL)))
+    {
+      need = SpeedTrack_RefineCrop(rgb, (uint16_t)LCD_WIDTH, cam_w, cam_h,
+                                   (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed,
+                                   &rox, &roy, &rnw, &rnh);
+    }
+    if (need == 1)
+    {
+      uint16_t win_x = 0U, win_y = 0U, win_w = 0U, win_h = 0U;
+      uint16_t view_x = 0U, view_y = 0U, view_w = 0U, view_h = 0U;
+      uint16_t cap_w = 0U, cap_h = 0U;
+      int32_t sx;
+      int32_t sy;
+      int32_t sw;
+      int32_t sh;
+
+      OV5640_GetWindow(&win_x, &win_y, &win_w, &win_h);
+      OV5640_GetView(&view_x, &view_y, &view_w, &view_h);
+      OV5640_GetCapture(&cap_w, &cap_h);
+      if (cap_w < 1U) { cap_w = 1U; }
+      if (cap_h < 1U) { cap_h = 1U; }
+      sx = (int32_t)win_x + (((int32_t)rox * (int32_t)win_w) / (int32_t)cap_w);
+      sy = (int32_t)win_y + (((int32_t)roy * (int32_t)win_h) / (int32_t)cap_h);
+      sw = ((int32_t)rnw * (int32_t)win_w) / (int32_t)cap_w;
+      sh = ((int32_t)rnh * (int32_t)win_h) / (int32_t)cap_h;
+      if (sx < 0) { sx = 0; }
+      if (sy < 0) { sy = 0; }
+      if (sw < 80) { sw = 80; }
+      if (sh < 80) { sh = 80; }
+      if (sw > (int32_t)LCD_WIDTH) { sw = (int32_t)LCD_WIDTH; }
+      if (sh > (int32_t)LCD_HEIGHT) { sh = (int32_t)LCD_HEIGHT; }
+      sw &= ~1;
+      sh &= ~1;
+      g_cam_dbg.crop_sx = (uint16_t)sx;
+      g_cam_dbg.crop_sy = (uint16_t)sy;
+      g_cam_dbg.crop_sw = (uint16_t)sw;
+      g_cam_dbg.crop_sh = (uint16_t)sh;
+      g_speed.crop.x = 0U;
+      g_speed.crop.y = 0U;
+      g_speed.crop.w = rnw;
+      g_speed.crop.h = rnh;
+      {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        cam_hold = 1U;
+        if (primask == 0U)
+        {
+          __enable_irq();
+        }
+      }
+      (void)HAL_DCMI_Stop(&hdcmi);
+      cam_arm = 0U;
+      cam_curline = 0U;
+      cam_draw_full = 2U;
+      LCD_FillBothBlack();
+      OV5640_PowerCycle();
+      OV5640_RgbLcdNativeWindow((uint16_t)sx, (uint16_t)sy,
+                                (uint16_t)sw, (uint16_t)sh);
+      CAM_LoadView();
+      HAL_Delay(20);
+      CAM_Start();
+      HAL_Delay(20);
+      CamDbg_SnapSensor();
+      HAL_Delay(80);
+      CamDbg_SnapLive();
+      cam_hold = 0U;
+      SpeedTrack_Shift(&g_speed, (int16_t)(-rox), (int16_t)(-roy));
+    }
+  }
   speed_phase = 1U;
   CamDbg_Mark(7U);
 }
