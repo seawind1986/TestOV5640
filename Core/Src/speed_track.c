@@ -620,6 +620,7 @@ uint16_t g_track_miss;
 uint8_t  g_need_relocate;
 uint8_t  g_need_refine;
 uint8_t  g_n_needles;
+uint16_t g_left2_cx;
 int16_t  g_tip_xmax;
 
 static void tip_hist_reset(void)
@@ -938,6 +939,7 @@ void SpeedTrack_Reset(speed_state_t *st)
   g_need_relocate = 0U;
   g_need_refine = 0U;
   g_n_needles = 0U;
+  g_left2_cx = 0U;
 }
 
 void SpeedTrack_Shift(speed_state_t *st, int16_t dx, int16_t dy)
@@ -1173,6 +1175,23 @@ int SpeedTrack_FindNeedle(const uint16_t *rgb, uint16_t stride, uint16_t w, uint
       }
     }
     g_n_needles = (uint8_t)n_big;
+    g_left2_cx = 0U;
+    if (n_big >= 2)
+    {
+      int second = 0x7FFFFFFF;
+      int k;
+      for (k = 0; k < nc; k++)
+      {
+        if ((cand_rr[k] >= NEEDLE_MIN_R) && (cand_hx[k] > left_big_x) && (cand_hx[k] < second))
+        {
+          second = cand_hx[k];
+        }
+      }
+      if (second < 0x7FFFFFFF)
+      {
+        g_left2_cx = (uint16_t)second;
+      }
+    }
     /* 优先用合格半径里最左边的；若再左边还有一根略小的（多半是被裁切的升针），改用那根。 */
     best = left_big;
     if ((left >= 0) && (left_big >= 0) &&
@@ -1316,14 +1335,17 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
   int cy;
 
   if ((st == 0) || (st->needle.found == 0U)) { return; }
-  /* 预览左移后，最左针若已落在左区，就是升针；否则仍按 ×0.001 往左一个表盘距。 */
-  if ((int)st->needle.cx < ((int)frame_w / 3))
+  /* 次左针约在一个表盘距外，则最左就是升针；否则最左多半是 ×0.001。 */
   {
-    cx = (int)st->needle.cx;
-  }
-  else
-  {
-    cx = (int)st->needle.cx - SHENG_PITCH;
+    int gap = (int)g_left2_cx - (int)st->needle.cx;
+    if ((g_left2_cx != 0U) && (gap >= 160) && (gap <= 280))
+    {
+      cx = (int)st->needle.cx;
+    }
+    else
+    {
+      cx = (int)st->needle.cx - SHENG_PITCH;
+    }
   }
   cy = (int)st->needle.cy;
   x0 = cx - (int)st->needle.r - m;

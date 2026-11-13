@@ -61,6 +61,7 @@ void SpeedTrack_Reset(speed_state_t *st);
 extern uint8_t g_need_relocate;
 extern uint8_t g_need_refine;
 extern uint8_t g_n_needles;
+extern uint16_t g_left2_cx; /* 全幅次左针圆心，0 表示没有 */
 
 /* 在实时画面上找升针（不走表盘算法）。成功返回 0。 */
 int SpeedTrack_FindNeedle(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
