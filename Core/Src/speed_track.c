@@ -1092,6 +1092,29 @@ static int pointer_from_blob(const uint16_t *rgb, uint16_t stride, uint16_t w, u
   }
   if ((bx < 0) || (best < (20 * 20))) { return -1; }
 
+  /* 裁窗后往往只剩升针帽（针尖被照白），用帽的质心当轴，
+   * 沿帽的指向把针尖放到定位半径上，避免 18% 根移把圆心推到帽沿。 */
+  if (g_locate_r >= 24)
+  {
+    int rdir;
+    rdir = (int)isqrt32((uint32_t)((ax - mx) * (ax - mx) + (ay - my) * (ay - my)));
+    if (rdir < 8) { return -1; }
+    rr = (int)g_locate_r;
+    if (rr > 180) { rr = 180; }
+    tx0 = mx + (((ax - mx) * rr) / rdir);
+    ty0 = my + (((ay - my) * rr) / rdir);
+    if (tx0 < 0) { tx0 = 0; }
+    if (ty0 < 0) { ty0 = 0; }
+    if (tx0 >= (int)w) { tx0 = (int)w - 1; }
+    if (ty0 >= (int)h) { ty0 = (int)h - 1; }
+    *pr = rr;
+    *hx = mx;
+    *hy = my;
+    *tx = tx0;
+    *ty = ty0;
+    return 0;
+  }
+
   da = count_red_near(rgb, stride, w, h, ax, ay, 7);
   db = count_red_near(rgb, stride, w, h, bx, by, 7);
   if (da <= db) { tx0 = ax; ty0 = ay; hx0 = bx; hy0 = by; }
@@ -1215,6 +1238,13 @@ int SpeedTrack_FindNeedle(const uint16_t *rgb, uint16_t stride, uint16_t w, uint
       st->needle.tip_y = (int16_t)cand_ty[best];
       st->needle.ang_mdeg = atan2_mdeg(cand_ty[best] - cand_hy[best],
                                        cand_tx[best] - cand_hx[best]);
+      /* 裁窗后把蓝圈跟到帽心，方便核对轴心。锁定后由拟合圆接管。 */
+      if ((g_locate_r >= 24) && (st->hub_locked == 0))
+      {
+        g_locate_cx = st->needle.cx;
+        g_locate_cy = st->needle.cy;
+        g_locate_r = st->needle.r;
+      }
     }
   }
   if ((best < 0) || (st->needle.found == 0U)) { return -1; }
