@@ -2241,31 +2241,6 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
     }
     plot(fb, (int)fb_w, (int)fb_h, (int)ox + (int)st->needle.tip_x,
          (int)oy + (int)st->needle.tip_y, LIVE_LEAD, 5);
-    if (g_frame_dt_us != 0U)
-    {
-      char dtb[16];
-      char *p;
-      int txp;
-      int typ;
-      int tw2;
-      uint32_t ms = g_frame_dt_us / 1000U;
-      put_u_var(dtb, ms);
-      p = dtb;
-      while (*p) { p++; }
-      *p++ = ' ';
-      *p++ = 'm';
-      *p++ = 's';
-      *p = 0;
-      tw2 = measure_str(dtb);
-      txp = (int)ox + (int)st->needle.tip_x + 10;
-      typ = (int)oy + (int)st->needle.tip_y - 10;
-      if ((txp + tw2 + 6) > (int)fb_w) { txp = (int)ox + (int)st->needle.tip_x - tw2 - 10; }
-      if (txp < 2) { txp = 2; }
-      if (typ < 2) { typ = 2; }
-      if ((typ + 30) > (int)fb_h) { typ = (int)fb_h - 30; }
-      fill_rect(fb, (int)fb_w, (int)fb_h, txp - 3, typ - 2, txp + tw2 + 3, typ + 26, 0xFFFF);
-      (void)draw_str(fb, (int)fb_w, (int)fb_h, txp, typ, dtb);
-    }
   }
 
   l1[0] = 0;
@@ -2278,7 +2253,15 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
     put_u(p, (uint32_t)t->hour, 2); p += 2; *p++ = ':';
     put_u(p, (uint32_t)t->min, 2); p += 2; *p++ = ':';
     put_u(p, (uint32_t)t->sec, 2); p += 2;
-
+    if (g_frame_dt_us != 0U)
+    {
+      *p++ = ' ';
+      put_u_var(p, g_frame_dt_us / 1000U);
+      while (*p) { p++; }
+      *p++ = ' ';
+      *p++ = 'm';
+      *p++ = 's';
+    }
     *p = 0;
   }
   else
