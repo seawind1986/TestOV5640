@@ -32,6 +32,7 @@
 #define RING_SHRINK_D   100
 #define REV_HUNT_MDEG  300000    /* 走出约 0.83 圈后再找与起点最接近的位置 */
 #define REV_PASS_MDEG    4000    /* 比最近点再偏 4°，视为已经越过 */
+#define MEAS_HIST      10      /* 最近 10 次一圈测量 */
 #define MIN_FPS_X10 20   /* 10 齿/s 的奈奎斯特下限：每秒至少 20 帧 */
 
 /* Inverse rectify (rectified -> captured), copied from dial_read.c; that file is not edited. */
@@ -615,6 +616,14 @@ uint32_t g_rev_best_t;
 int32_t  g_rev_best_ang;
 uint16_t g_rev_seq;        /* 每测完一圈加一，HUD 显示 [001] */
 uint32_t g_frame_dt_us;     /* 当前针位与上一帧的时间差，TIM2 微秒 */
+int32_t  g_meas_flow_e2[MEAS_HIST];
+uint32_t g_meas_dt_us[MEAS_HIST];
+int32_t  g_meas_accum[MEAS_HIST];
+uint16_t g_meas_seq[MEAS_HIST];
+uint8_t  g_meas_n;
+uint8_t  g_meas_i;
+int32_t  g_flow_avg_e2;
+int32_t  g_flow_rep_e2;       /* 重复性，0.01%：s / 平均 × 100% */
 int16_t  g_locate_cx;
 int16_t  g_locate_cy;
 int16_t  g_locate_r;
@@ -645,6 +654,50 @@ static void rev_start(uint32_t stamp, int32_t ang)
   g_rev_best_accum = 0;
   g_rev_best_t = stamp;
   g_rev_best_ang = ang;
+}
+
+static void meas_record(int32_t flow_e2, uint32_t dt_us, int32_t accum)
+{
+  uint8_t i = g_meas_i;
+  int k;
+  int64_t sum;
+  int64_t ss;
+  int32_t mean;
+  uint32_t s;
+
+  g_meas_flow_e2[i] = flow_e2;
+  g_meas_dt_us[i] = dt_us;
+  g_meas_accum[i] = accum;
+  g_meas_seq[i] = g_rev_seq;
+  g_meas_i = (uint8_t)((i + 1U) % (uint8_t)MEAS_HIST);
+  if (g_meas_n < (uint8_t)MEAS_HIST)
+  {
+    g_meas_n++;
+  }
+
+  g_flow_avg_e2 = 0;
+  g_flow_rep_e2 = 0;
+  if (g_meas_n >= (uint8_t)MEAS_HIST)
+  {
+    sum = 0;
+    for (k = 0; k < MEAS_HIST; k++)
+    {
+      sum += g_meas_flow_e2[k];
+    }
+    mean = (int32_t)((sum + (int64_t)(MEAS_HIST / 2)) / (int64_t)MEAS_HIST);
+    g_flow_avg_e2 = mean;
+    if (mean > 0)
+    {
+      ss = 0;
+      for (k = 0; k < MEAS_HIST; k++)
+      {
+        int64_t d = (int64_t)g_meas_flow_e2[k] - (int64_t)mean;
+        ss += d * d;
+      }
+      s = isqrt32((uint32_t)(ss / (int64_t)(MEAS_HIST - 1)));
+      g_flow_rep_e2 = (int32_t)((((int64_t)s * 10000LL) + ((int64_t)mean / 2)) / (int64_t)mean);
+    }
+  }
 }
 
 /* 用红色列直方图找到升针右侧空隙，避免针尖跟到旁边那个红指针。 */
@@ -1905,6 +1958,7 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
             st->dt_us = dt;
             if (g_rev_seq < 999U) { g_rev_seq++; }
             else { g_rev_seq = 1U; }
+            meas_record(inst, dt, g_rev_best_accum);
           }
           /* 最近点这一帧作为下一圈的起点。 */
           rev_start(g_rev_best_t, g_rev_best_ang);
@@ -1981,7 +2035,7 @@ static void draw_circle(uint16_t *fb, int fb_w, int fb_h, int cx, int cy, int R,
   }
 }
 
-static const uint8_t speed_extra_bits[860] = {
+static const uint8_t speed_extra_bits[1014] = {
   0xA4,0x1A,0x00,0x00,0x00,0x00,0x60,0xFF,0x02,0x00,0x00,0x00,0x00,0xF6,0x2F,0x00,
   0x00,0x00,0x00,0x60,0xFF,0x02,0x00,0x00,0x00,0x00,0xF6,0x2F,0x00,0x00,0x00,0x00,
   0x60,0xFF,0x02,0x00,0x00,0x00,0x00,0xF6,0x2F,0x00,0x00,0x00,0x00,0x60,0xFF,0x01,
@@ -2036,14 +2090,25 @@ static const uint8_t speed_extra_bits[860] = {
   0xFF,0xFF,0xFF,0xDF,0x00,0x00,0xF9,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
   0xDF,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40,0xDF,0x00,0x00,
   0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x22,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0xD0,0x0F,0x00,0xB5,0x6B,0x00,0x00,0xF0,0x0F,0x30,0xFF,0xFF,0x05,
+  0x00,0xFD,0x0D,0x60,0xFF,0xFF,0x09,0x00,0xDF,0x00,0x50,0xFF,0xFF,0x07,0xF0,0x0F,
+  0x00,0x00,0xF9,0xBF,0x01,0xFD,0x0D,0x00,0x00,0x30,0x03,0x00,0xFF,0x00,0x00,0x00,
+  0x00,0x00,0xD0,0xDF,0x00,0x00,0x00,0x00,0x00,0xF0,0x0F,0x00,0x00,0x00,0x00,0x00,
+  0xFD,0x00,0x00,0x00,0x00,0x00,0x00,0xDF,0x00,0x00,0x00,0x00,0x00,0xF0,0x0F,0x00,
+  0x00,0x00,0x00,0x00,0xFD,0x0D,0x30,0x56,0x00,0x00,0x00,0xFF,0x00,0xE5,0xFF,0x09,
+  0x00,0xD0,0x0F,0x00,0xFB,0xFF,0x3F,0x00,0xF0,0x0F,0x00,0xFB,0xFF,0x3F,0x00,0xFD,
+  0x00,0x00,0xF6,0xFF,0x0B,0x00,0xDF,0x00,0x00,0x50,0x79,0x01,0x00,0x0C,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
 };
 
-static const dial_glyph_t speed_extra_glyphs[5] = {
+static const dial_glyph_t speed_extra_glyphs[6] = {
   {0x68, 2, 11, 13, 22, 1088, &speed_extra_bits[0]},    /* h */
   {0x6C, 2, 10, 5, 23, 509, &speed_extra_bits[143]},    /* l */
   {0x70, 2, 18, 14, 22, 1111, &speed_extra_bits[201]},  /* p */
   {0x2F, 0, 10, 11, 28, 702, &speed_extra_bits[355]},   /* / */
   {0xD7, 1, 9, 26, 27, 1792, &speed_extra_bits[509]},   /* 齿 */
+  {0x25, 1, 11, 14, 22, 1024, &speed_extra_bits[860]},  /* % */
 };
 
 static const dial_glyph_t *glyph(uint8_t code)
@@ -2053,7 +2118,7 @@ static const dial_glyph_t *glyph(uint8_t code)
   {
     if (dial_font_glyphs[i].code == code) { return &dial_font_glyphs[i]; }
   }
-  for (i = 0; i < 5U; i++)
+  for (i = 0; i < 6U; i++)
   {
     if (speed_extra_glyphs[i].code == code) { return &speed_extra_glyphs[i]; }
   }
@@ -2202,15 +2267,47 @@ static void fmt_signed_frac(char *dst, int32_t e, int scale, int frac)
   fmt_ip_frac(p, av, (uint32_t)scale, frac);
 }
 
+static void fmt_meas_line(char *dst, uint8_t idx)
+{
+  char num[16];
+  char *p = dst;
+  const char *s;
+  int32_t vol_e5;
+  int32_t per_e5;
+  uint32_t acc;
+
+  *p++ = '[';
+  put_u(p, (uint32_t)g_meas_seq[idx], 3); p += 3;
+  *p++ = ']';
+  *p++ = ' ';
+  per_e5 = (int32_t)((g_meas_dt_us[idx] + 5U) / 10U);
+  fmt_signed_frac(num, per_e5, 100000, 5);
+  s = num; while (*s) { *p++ = *s++; }
+  *p++ = 's';
+  *p++ = ' ';
+  acc = (uint32_t)iabs32(g_meas_accum[idx]);
+  vol_e5 = (int32_t)((((int64_t)acc * 100000LL) + 180000LL) / 360000LL);
+  fmt_signed_frac(num, vol_e5, 100000, 5);
+  s = num; while (*s) { *p++ = *s++; }
+  *p++ = 'L';
+  *p++ = ' ';
+  fmt_signed_frac(num, g_meas_flow_e2[idx], 100, 2);
+  s = num; while (*s) { *p++ = *s++; }
+  *p++ = 'L';
+  *p++ = '/';
+  *p++ = 'h';
+  *p = 0;
+}
+
 void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
                       int16_t ox, int16_t oy, const speed_state_t *st,
                       const dial_time_t *t)
 {
   char l1[48];
-  char l2[32];
-  char l3[32];
-  char l4[32];
+  char l2[24];
+  char rows[MEAS_HIST][48];
   int ncx, ncy, x0, y0, x1, y1, tw, lines;
+  int k, nk, col_w, xR, yb;
   const int hx = 12;
   const int hy = 8;
   const int gap = 28;
@@ -2270,56 +2367,75 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
     l1[1] = 0;
   }
 
-  if (st->have_speed != 0U)
+  /* 第二行：满 10 次后显示 s / 平均 × 100%；未满则 ---。 */
+  if ((g_meas_n >= (uint8_t)MEAS_HIST) && (g_flow_avg_e2 > 0))
   {
     char num[16];
     char *p;
     const char *s;
-    fmt_signed_frac(num, st->flow_filt_e2, 100, 2);
+    fmt_signed_frac(num, g_flow_rep_e2, 100, 2);
     p = l2; s = num; while (*s) { *p++ = *s++; }
-    *p++ = ' '; *p++ = 'L'; *p++ = '/'; *p++ = 'h';
-    *p++ = ' '; *p++ = '[';
-    put_u(p, (uint32_t)g_rev_seq, 3); p += 3;
-    *p++ = ']'; *p = 0;
-    /* 一圈用时用 TIM2 实测微秒，显示到 0.00001 s。 */
-    if (st->dt_us > 0U)
-    {
-      int32_t per_e5 = (int32_t)((st->dt_us + 5U) / 10U);
-      fmt_signed_frac(num, per_e5, 100000, 5);
-      p = l3; s = num; while (*s) { *p++ = *s++; }
-      *p++ = ' '; *p++ = 's'; *p = 0;
-    }
-    else
-    {
-      l3[0] = '-'; l3[1] = '-'; l3[2] = '-'; l3[3] = 0;
-    }
-    l4[0] = 0;
-    lines = 3;
+    *p++ = '%';
+    *p = 0;
   }
   else
   {
-    /* 定位中或已裁窗但还没有速度：字库没有 o/k，用 --- 避免第二行空白。 */
     l2[0] = '-'; l2[1] = '-'; l2[2] = '-'; l2[3] = 0;
-    l3[0] = 0; l4[0] = 0;
-    lines = 2;
   }
+  lines = 2;
 
   tw = measure_str(l1);
   {
     int w2 = measure_str(l2);
-    int w3 = measure_str(l3);
-    int w4 = measure_str(l4);
     if (w2 > tw) { tw = w2; }
-    if (w3 > tw) { tw = w3; }
-    if (w4 > tw) { tw = w4; }
   }
   x0 = hx - pad;
   y0 = hy - pad;
   x1 = hx + tw + pad;
-  y1 = hy + (lines * gap) + pad + 12;  /* p 和 齿 会落到基线以下 */
+  y1 = hy + (lines * gap) + pad + 12;
   fill_rect(fb, (int)fb_w, (int)fb_h, x0, y0, x1, y1, 0xFFFF);
   draw_str(fb, (int)fb_w, (int)fb_h, hx, hy, l1);
   draw_str(fb, (int)fb_w, (int)fb_h, hx, hy + gap, l2);
-  if (lines >= 3) { draw_str(fb, (int)fb_w, (int)fb_h, hx, hy + (gap * 2), l3); }
-  if (lines >= 4) { draw_str(fb, (int)fb_w, (int)fb_h, hx, hy + (gap * 3), l4); }
+
+  /* 最近 10 次排在画面下方两列，以免挡住升针；左列从上到下是最新的 5 次。 */
+  nk = (int)g_meas_n;
+  col_w = 0;
+  for (k = 0; k < nk; k++)
+  {
+    int idx = (int)g_meas_i - 1 - k;
+    int w;
+    if (idx < 0) { idx += MEAS_HIST; }
+    fmt_meas_line(rows[k], (uint8_t)idx);
+    w = measure_str(rows[k]);
+    if (w > col_w) { col_w = w; }
+  }
+  if (nk > 0)
+  {
+    int cols = (nk > 5) ? 2 : 1;
+    int rows_c = 5;
+    int gapl = 28;
+    int xL = hx;
+    xR = xL + col_w + 16;
+    if ((xR + col_w + pad) > (int)fb_w)
+    {
+      xR = (int)fb_w - pad - col_w;
+      if (xR < (xL + col_w + 8)) { xR = xL + col_w + 8; }
+    }
+    yb = (int)fb_h - pad - (rows_c * gapl) - 12;
+    if (yb < (y1 + 8)) { yb = y1 + 8; }
+    x0 = xL - pad;
+    y0 = yb - pad;
+    x1 = ((cols == 2) ? (xR + col_w) : (xL + col_w)) + pad;
+    y1 = yb + (rows_c * gapl) + pad;
+    if (x1 >= (int)fb_w) { x1 = (int)fb_w - 1; }
+    if (y1 >= (int)fb_h) { y1 = (int)fb_h - 1; }
+    fill_rect(fb, (int)fb_w, (int)fb_h, x0, y0, x1, y1, 0xFFFF);
+    for (k = 0; k < nk; k++)
+    {
+      int col = k / 5;
+      int row = k % 5;
+      int x = (col == 0) ? xL : xR;
+      draw_str(fb, (int)fb_w, (int)fb_h, x, yb + (row * gapl), rows[k]);
+    }
+  }
 }
