@@ -1316,8 +1316,15 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
   int cy;
 
   if ((st == 0) || (st->needle.found == 0U)) { return; }
-  /* 全幅认到的最左针通常是 ×0.001，第一刀改对准它左边的升针。 */
-  cx = (int)st->needle.cx - SHENG_PITCH;
+  /* 预览左移后，最左针若已落在左区，就是升针；否则仍按 ×0.001 往左一个表盘距。 */
+  if ((int)st->needle.cx < ((int)frame_w / 3))
+  {
+    cx = (int)st->needle.cx;
+  }
+  else
+  {
+    cx = (int)st->needle.cx - SHENG_PITCH;
+  }
   cy = (int)st->needle.cy;
   x0 = cx - (int)st->needle.r - m;
   y0 = cy - (int)st->needle.r - m;

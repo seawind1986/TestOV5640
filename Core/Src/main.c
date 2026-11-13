@@ -2817,6 +2817,14 @@ static void LCD_FillBothBlack(void)
   lcd_draw = cur;
 }
 
+/* 升针常在居中预览的左缘之外。速度模式把全幅向左平移，第一刀仍在预览内裁。 */
+#define SPEED_PREVIEW_SRC_X  (-280)
+
+static void SpeedTrack_PreviewLeft(void)
+{
+  OV5640_ShowOnLcd((int16_t)SPEED_PREVIEW_SRC_X, 0, LCD_WIDTH, LCD_HEIGHT);
+}
+
 static void SpeedTrack_OpenFull(void)
 {
   uint32_t primask = __get_PRIMASK();
@@ -2841,6 +2849,7 @@ static void SpeedTrack_OpenFull(void)
     return;
   }
   OV5640_RgbLcdPreview(LCD_WIDTH, LCD_HEIGHT);
+  SpeedTrack_PreviewLeft();
   CAM_LoadView();
   HAL_Delay(20);
   CAM_Start();
@@ -2937,15 +2946,6 @@ static void SpeedTrack_ApplyCrop(void)
   g_cam_dbg.crop_sx = (uint16_t)((int32_t)g_cam_dbg.win_x
       + (((g_cam_dbg.lcd_x0 - (int32_t)g_cam_dbg.view_x) * (int32_t)g_cam_dbg.win_w)
          / (int32_t)g_cam_dbg.cap_w));
-  /* 升针往往在预览左缘之外，传感器窗口再往左移，才能把整根针收进来。 */
-  if (g_cam_dbg.crop_sx > 240U)
-  {
-    g_cam_dbg.crop_sx = (uint16_t)(g_cam_dbg.crop_sx - 240U);
-  }
-  else
-  {
-    g_cam_dbg.crop_sx = 0U;
-  }
   g_cam_dbg.crop_sy = (uint16_t)((int32_t)g_cam_dbg.win_y
       + (((g_cam_dbg.lcd_y0 - (int32_t)g_cam_dbg.view_y) * (int32_t)g_cam_dbg.win_h)
          / (int32_t)g_cam_dbg.cap_h));
@@ -3367,6 +3367,10 @@ static void CAM_Init(void)
     return;
   }
   OV5640_RgbLcdPreview(LCD_WIDTH, LCD_HEIGHT);
+  if (METER_MODE == METER_MODE_SPEED)
+  {
+    SpeedTrack_PreviewLeft();
+  }
   CAM_LoadView();
 
   hdcmi.Instance = DCMI;
