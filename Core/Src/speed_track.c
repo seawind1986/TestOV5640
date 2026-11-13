@@ -618,6 +618,7 @@ int32_t  g_rev_best_accum;
 uint32_t g_rev_best_t;
 int32_t  g_rev_best_ang;
 uint16_t g_rev_seq;        /* 每测完一圈加一，HUD 显示 [001] */
+uint8_t  g_rev_armed;      /* 1：起点已是上一圈最近点，这一圈才记结果 */
 uint32_t g_frame_dt_us;     /* 当前针位与上一帧的时间差，TIM2 微秒 */
 int32_t  g_meas_flow_e2[MEAS_HIST];
 uint32_t g_meas_dt_us[MEAS_HIST];
@@ -1022,6 +1023,7 @@ void SpeedTrack_Reset(speed_state_t *st)
   memset(st, 0, sizeof(*st));
   tip_hist_reset();
   rev_start(0U, 0);
+  g_rev_armed = 0U;
   g_locate_cx = 0;
   g_locate_cy = 0;
   g_locate_r = 0;
@@ -1049,6 +1051,7 @@ void SpeedTrack_Shift(speed_state_t *st, int16_t dx, int16_t dy)
   st->dir_sign = 0;
   tip_hist_reset();
   rev_start(0U, 0);
+  g_rev_armed = 0U;
   g_locate_cx = st->needle.cx;
   g_locate_cy = st->needle.cy;
   g_locate_r = st->needle.r;
@@ -1750,6 +1753,7 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
         st->needle.r = g_locate_r;
         tip_hist_reset();
         rev_start(0U, 0);
+  g_rev_armed = 0U;
         g_track_miss = 0U;
       }
     }
@@ -1809,6 +1813,7 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
     else
     {
       rev_start(stamp_us, st->needle.ang_mdeg);
+      g_rev_armed = 0U;
     }
     return 0;
   }
@@ -1912,6 +1917,7 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
               else if (acc < 0) { st->dir_sign = -1; }
               /* 预估流速等走完一圈再报，避免短弧拟合给出离谱值。 */
               rev_start(stamp_us, a1);
+              g_rev_armed = 0U;
               g_track_miss = 0U;
             }
           }
@@ -1931,6 +1937,7 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
       if (g_rev_t0 == 0U)
       {
         rev_start(stamp_us, st->needle.ang_mdeg);
+      g_rev_armed = 0U;
       }
       g_rev_accum += dang;
       off = iabs32(wrap_diff_mdeg(st->needle.ang_mdeg, g_rev_ang0));
@@ -1954,7 +1961,8 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
         else if (off > (g_rev_best_d + REV_PASS_MDEG))
         {
           uint32_t dt = g_rev_best_t - g_rev_t0;
-          if ((dt >= 2000000U) && (iabs32(g_rev_best_accum) >= 250000))
+          if ((dt >= 2000000U) && (iabs32(g_rev_best_accum) >= 250000)
+              && (g_rev_armed != 0U))
           {
             int32_t inst = (int32_t)(((int64_t)iabs32(g_rev_best_accum) * 1000000LL) / (int64_t)dt);
             st->flow_lh_e2 = inst;
@@ -1965,8 +1973,9 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
             else { g_rev_seq = 1U; }
             meas_record(inst, dt, g_rev_best_accum);
           }
-          /* 最近点这一帧作为下一圈的起点。 */
+          /* 最近点这一帧作为下一圈的起点。第一圈只定起点，不记结果。 */
           rev_start(g_rev_best_t, g_rev_best_ang);
+          g_rev_armed = 1U;
           g_rev_accum = wrap_diff_mdeg(st->needle.ang_mdeg, g_rev_best_ang);
         }
       }

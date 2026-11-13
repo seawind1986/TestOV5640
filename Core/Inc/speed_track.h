@@ -63,6 +63,7 @@ extern uint8_t g_need_refine;
 extern uint8_t g_n_needles;
 extern uint16_t g_left2_cx; /* 全幅次左针圆心，0 表示没有 */
 extern uint16_t g_rev_seq; /* 每测完一圈加一，流量行 [001] */
+extern uint8_t g_rev_armed; /* 1：起点已是最近点，结果可记 */
 extern uint32_t g_frame_dt_us; /* 当前针位与上一帧的时间差，TIM2 微秒 */
 extern uint8_t g_meas_n;
 extern int32_t g_flow_avg_e2;
