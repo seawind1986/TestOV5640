@@ -814,8 +814,10 @@ static void CamDbg_SnapSensor(void)
 }
 static uint8_t speed_phase;
 #define CROP_SETTLE_US  1000000U  /* 裁窗后等自动曝光约 1 s 再开始认针 */
+#define FULL_SETTLE_US  2000000U  /* 全幅找针前等自动曝光约 2 s */
 uint8_t  g_crop_settling;
 uint32_t g_crop_settle_t0;
+uint32_t g_cam_settle_us;
 static uint8_t dial_hud_ready;
 static uint8_t dial_yield_lock;
 static dial_report_t dial_hud_rep;
@@ -2883,7 +2885,9 @@ static void SpeedTrack_OpenFull(void)
   cam_hold = 0U;
   SpeedTrack_Reset(&g_speed);
   speed_phase = 0U;
-  g_crop_settling = 0U;
+  g_crop_settling = 1U;
+  g_crop_settle_t0 = TIM2->CNT;
+  g_cam_settle_us = FULL_SETTLE_US;
   CamDbg_Mark(8U);
 }
 
@@ -3044,6 +3048,7 @@ static void SpeedTrack_ApplyCrop(void)
   g_need_refine = 1U;
   g_crop_settling = 1U;
   g_crop_settle_t0 = TIM2->CNT;
+  g_cam_settle_us = CROP_SETTLE_US;
   speed_phase = 1U;
   CamDbg_Mark(7U);
 }
@@ -3066,16 +3071,21 @@ static void SpeedTrack_Service(void)
     SpeedTrack_OpenFull();
     return;
   }
+  if (g_crop_settling != 0U)
+  {
+    uint32_t need = g_cam_settle_us;
+    if (need == 0U)
+    {
+      need = (speed_phase != 0U) ? CROP_SETTLE_US : FULL_SETTLE_US;
+    }
+    if ((TIM2->CNT - g_crop_settle_t0) < need)
+    {
+      return;
+    }
+    g_crop_settling = 0U;
+  }
   if (speed_phase != 0U)
   {
-    if (g_crop_settling != 0U)
-    {
-      if ((TIM2->CNT - g_crop_settle_t0) < CROP_SETTLE_US)
-      {
-        return;
-      }
-      g_crop_settling = 0U;
-    }
     if (g_need_refine != 0U)
     {
       const uint16_t *rgb;
@@ -3412,6 +3422,13 @@ static void CAM_Init(void)
   CAM_Start();
   cam_hold = 0U;
   meter_next_ms = HAL_GetTick() + 1500U;
+  if (METER_MODE == METER_MODE_SPEED)
+  {
+    /* 上电后摄像头同样要先自动曝光，再开始全幅找针。 */
+    g_crop_settling = 1U;
+    g_crop_settle_t0 = TIM2->CNT;
+    g_cam_settle_us = FULL_SETTLE_US;
+  }
 }
 
 static void MPU_Config(void)
