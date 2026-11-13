@@ -18,6 +18,8 @@
 #define TXT_R      255
 #define TXT_G      0
 #define TXT_B      0
+#define TXT_INK    0xF800U  /* 默认红字 */
+#define TXT_FLOW   0x001FU  /* 流速：蓝字 */
 #define CROP_MARGIN 80
 #define CROP_LEFT_GUARD 360 /* 保留：第一刀不再用它扩边 */
 #define SHENG_PITCH 210    /* 全幅最左一根多半是 ×0.001，升针在它左边约一个表盘距 */
@@ -2125,25 +2127,29 @@ static const dial_glyph_t *glyph(uint8_t code)
   return 0;
 }
 
-static void blend_px(uint16_t *fb, int fb_w, int fb_h, int x, int y, int a)
+static void blend_px(uint16_t *fb, int fb_w, int fb_h, int x, int y, int a, uint16_t ink)
 {
   uint16_t p;
   uint16_t out;
   int pr, pg, pb;
+  int ir, ig, ib;
   if ((a <= 0) || (x < 0) || (y < 0) || (x >= fb_w) || (y >= fb_h)) { return; }
   if (a > 15) { a = 15; }
   p = fb[(y * fb_w) + x];
   pr = (((p >> 11) & 31) * 255) / 31;
   pg = (((p >> 5) & 63) * 255) / 63;
   pb = ((p & 31) * 255) / 31;
-  pr = ((pr * (15 - a)) + (TXT_R * a)) / 15;
-  pg = ((pg * (15 - a)) + (TXT_G * a)) / 15;
-  pb = ((pb * (15 - a)) + (TXT_B * a)) / 15;
+  ir = (((ink >> 11) & 31) * 255) / 31;
+  ig = (((ink >> 5) & 63) * 255) / 63;
+  ib = ((ink & 31) * 255) / 31;
+  pr = ((pr * (15 - a)) + (ir * a)) / 15;
+  pg = ((pg * (15 - a)) + (ig * a)) / 15;
+  pb = ((pb * (15 - a)) + (ib * a)) / 15;
   out = (uint16_t)(((pr * 31 / 255) << 11) | ((pg * 63 / 255) << 5) | (pb * 31 / 255));
   fb[(y * fb_w) + x] = out;
 }
 
-static int draw_code(uint16_t *fb, int fb_w, int fb_h, int x, int y, uint8_t code)
+static int draw_code(uint16_t *fb, int fb_w, int fb_h, int x, int y, uint8_t code, uint16_t ink)
 {
   const dial_glyph_t *g = glyph(code);
   int ix;
@@ -2161,23 +2167,28 @@ static int draw_code(uint16_t *fb, int fb_w, int fb_h, int x, int y, uint8_t cod
       int a = ((bit_i & 1U) == 0U) ? (int)(by & 0x0FU) : (int)(by >> 4);
       if (a != 0)
       {
-        blend_px(fb, fb_w, fb_h, x + (int)g->xoff + ix, y + (int)g->yoff + iy, a);
+        blend_px(fb, fb_w, fb_h, x + (int)g->xoff + ix, y + (int)g->yoff + iy, a, ink);
       }
     }
   }
   return (int)((g->adv64 + 32) / 64);
 }
 
-static int draw_str(uint16_t *fb, int fb_w, int fb_h, int x, int y, const char *s)
+static int draw_str_ink(uint16_t *fb, int fb_w, int fb_h, int x, int y, const char *s, uint16_t ink)
 {
   int x0 = x;
   if (s == 0) { return 0; }
   while (*s)
   {
-    x += draw_code(fb, fb_w, fb_h, x, y, (uint8_t)*s);
+    x += draw_code(fb, fb_w, fb_h, x, y, (uint8_t)*s, ink);
     s++;
   }
   return x - x0;
+}
+
+static int draw_str(uint16_t *fb, int fb_w, int fb_h, int x, int y, const char *s)
+{
+  return draw_str_ink(fb, fb_w, fb_h, x, y, s, TXT_INK);
 }
 
 static int measure_str(const char *s)
@@ -2425,7 +2436,28 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
     draw_str(fb, (int)fb_w, (int)fb_h, hx, hy + gap, l2);
     for (k = 0; k < nk; k++)
     {
-      draw_str(fb, (int)fb_w, (int)fb_h, hx, yb + (k * gapl), rows[k]);
+      /* 一行里最后一段是流量和 L/h，用蓝字单独画，方便对值。 */
+      char *line = rows[k];
+      char *sp = 0;
+      char *q = line;
+      int x;
+      while (*q != 0)
+      {
+        if (*q == ' ') { sp = q; }
+        q++;
+      }
+      if (sp != 0)
+      {
+        *sp = 0;
+        x = hx + draw_str(fb, (int)fb_w, (int)fb_h, hx, yb + (k * gapl), line);
+        x += draw_code(fb, (int)fb_w, (int)fb_h, x, yb + (k * gapl), (uint8_t)' ', TXT_INK);
+        *sp = ' ';
+        (void)draw_str_ink(fb, (int)fb_w, (int)fb_h, x, yb + (k * gapl), sp + 1, TXT_FLOW);
+      }
+      else
+      {
+        draw_str(fb, (int)fb_w, (int)fb_h, hx, yb + (k * gapl), line);
+      }
     }
   }
 }
