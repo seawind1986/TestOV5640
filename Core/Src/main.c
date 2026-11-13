@@ -2832,6 +2832,14 @@ static void SpeedTrack_OpenFull(void)
   cam_draw_full = 2U;
   LCD_FillBothBlack();
   OV5640_PowerCycle();
+  if (OV5640_SensorInit() != 0)
+  {
+    cam_ok = 0U;
+    cam_hold = 0U;
+    speed_phase = 0U;
+    CamDbg_Mark(8U);
+    return;
+  }
   OV5640_RgbLcdPreview(LCD_WIDTH, LCD_HEIGHT);
   CAM_LoadView();
   HAL_Delay(20);
@@ -3017,11 +3025,7 @@ static void SpeedTrack_ApplyCrop(void)
       cam_hold = 0U;
       SpeedTrack_Shift(&g_speed, (int16_t)(-rox), (int16_t)(-roy));
     }
-    else if (need < 0)
-    {
-      SpeedTrack_OpenFull();
-      return;
-    }
+    /* 第一帧可能还是空的，不要立刻回全幅；找不到红针时由 Tick 再请求重定位。 */
   }
   speed_phase = 1U;
   CamDbg_Mark(7U);
