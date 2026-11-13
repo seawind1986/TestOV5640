@@ -1092,26 +1092,45 @@ static int pointer_from_blob(const uint16_t *rgb, uint16_t stride, uint16_t w, u
   }
   if ((bx < 0) || (best < (20 * 20))) { return -1; }
 
-  /* 裁窗后往往只剩升针帽（针尖被照白），用帽的质心当轴，
-   * 沿帽的指向把针尖放到定位半径上，避免 18% 根移把圆心推到帽沿。 */
+  /* 裁窗后用帽的质心当轴；在帽周围更大范围内找最远红点，
+   * 以免高光把针身和帽断开后，误沿帽沿的反方向延长。 */
   if (g_locate_r >= 24)
   {
-    int rdir;
+    int x0s, y0s, x1s, y1s, reach, rdir;
+    reach = (int)g_locate_r + 24;
+    if (reach < 80) { reach = 80; }
+    if (reach > 120) { reach = 120; }
+    x0s = mx - reach;
+    y0s = my - reach;
+    x1s = mx + reach;
+    y1s = my + reach;
+    if (x0s < 0) { x0s = 0; }
+    if (y0s < 0) { y0s = 0; }
+    if (x1s >= (int)w) { x1s = (int)w - 1; }
+    if (y1s >= (int)h) { y1s = (int)h - 1; }
+    best = -1;
+    ax = -1;
+    ay = -1;
+    for (y = y0s; y <= y1s; y++)
+    {
+      for (x = x0s; x <= x1s; x++)
+      {
+        int r, g, b;
+        int32_t d2;
+        unpack(pix(rgb, stride, x, y), &r, &g, &b);
+        if (is_red(r, g, b) == 0) { continue; }
+        d2 = (int32_t)(x - mx) * (x - mx) + (int32_t)(y - my) * (y - my);
+        if (d2 > best) { best = d2; ax = x; ay = y; }
+      }
+    }
     rdir = (int)isqrt32((uint32_t)((ax - mx) * (ax - mx) + (ay - my) * (ay - my)));
-    if (rdir < 8) { return -1; }
-    rr = (int)g_locate_r;
-    if (rr > 180) { rr = 180; }
-    tx0 = mx + (((ax - mx) * rr) / rdir);
-    ty0 = my + (((ay - my) * rr) / rdir);
-    if (tx0 < 0) { tx0 = 0; }
-    if (ty0 < 0) { ty0 = 0; }
-    if (tx0 >= (int)w) { tx0 = (int)w - 1; }
-    if (ty0 >= (int)h) { ty0 = (int)h - 1; }
-    *pr = rr;
+    if ((ax < 0) || (rdir < 24) || (rdir > 180)) { return -1; }
+    *pr = (rdir * 85) / 100;
+    if (*pr < 20) { *pr = 20; }
     *hx = mx;
     *hy = my;
-    *tx = tx0;
-    *ty = ty0;
+    *tx = ax;
+    *ty = ay;
     return 0;
   }
 
