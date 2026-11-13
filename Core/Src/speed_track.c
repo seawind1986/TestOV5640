@@ -1532,136 +1532,181 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
 }
 
 
-/* 用画面里看得见的表盘黑圈定圆心。轴心本身不动，不再靠短弧针尖去“算”一个会漂的轴。 */
-#define RIM_STEP  5
-#define RIM_MAX   72
+/* 用画面里看得见的整圈表盘黑圈定圆心。粗搜再细搜“内亮外暗”的完整圆，
+ * 只在锁定时跑一次；套不上就本帧不锁，绝不退回被针身拉开的帽心。 */
+static int rim_score(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                     int cx, int cy, int R, int step, int *n_out)
+{
+  int a;
+  int s = 0;
+  int n = 0;
+  int rin = R - 6;
+  if (rin < 8) { rin = 8; }
+  for (a = 0; a < 360; a += step)
+  {
+    int xin, yin, xon, yon;
+    int r1, g1, b1, r2, g2, b2, yi, yo;
+    xin = cx + (int)(((int32_t)icos(a) * rin) / 256);
+    yin = cy + (int)(((int32_t)isin(a) * rin) / 256);
+    xon = cx + (int)(((int32_t)icos(a) * R) / 256);
+    yon = cy + (int)(((int32_t)isin(a) * R) / 256);
+    if ((xin < 0) || (yin < 0) || (xon < 0) || (yon < 0) ||
+        (xin >= (int)w) || (yin >= (int)h) || (xon >= (int)w) || (yon >= (int)h))
+    {
+      continue;
+    }
+    unpack(pix(rgb, stride, xin, yin), &r1, &g1, &b1);
+    unpack(pix(rgb, stride, xon, yon), &r2, &g2, &b2);
+    if ((is_red(r1, g1, b1) != 0) || (is_red(r2, g2, b2) != 0)) { continue; }
+    n++;
+    yi = luma(r1, g1, b1);
+    yo = luma(r2, g2, b2);
+    if (((yi - yo) >= 25) && (yo < 140)) { s++; }
+  }
+  if (n_out != 0) { *n_out = n; }
+  return s;
+}
 
 static int fit_dial_rim(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
                         int seed_x, int seed_y, int seed_r,
                         int *ocx, int *ocy, int *orad)
 {
-  int16_t xs[RIM_MAX];
-  int16_t ys[RIM_MAX];
-  int n = 0;
-  int a;
-  int r0;
-  int r1;
+  int best_s = -1;
+  int best_n = 0;
+  int best_cx = 0;
+  int best_cy = 0;
+  int best_r = 0;
   int cx;
   int cy;
-  int rad;
+  int r;
+  int x0, y0, x1, y1, r0, r1;
+  int ntmp;
 
-  if (seed_r < 24) { seed_r = 80; }
-  r0 = (seed_r * 60) / 100;
-  if (r0 < 40) { r0 = 40; }
-  r1 = (seed_r * 160) / 100;
-  if (r1 < (r0 + 20)) { r1 = r0 + 20; }
-  if (r1 > 200) { r1 = 200; }
-
-  for (a = 0; a < 360; a += RIM_STEP)
-  {
-    int r;
-    int face_y = 0;
-    int face_n = 0;
-    int best_r = -1;
-    int best_d = -1;
-    int hit_red = 0;
-    int cs = (int)icos(a);
-    int sn = (int)isin(a);
-
-    /* 先测盘面亮度，再在外侧找比盘面暗的圈。红针挡住的射线丢掉。 */
-    for (r = r0; r <= (r0 + 8); r++)
-    {
-      int x = seed_x + (int)(((int32_t)cs * r) / 256);
-      int y = seed_y + (int)(((int32_t)sn * r) / 256);
-      int cr, cg, cb;
-      if ((x < 0) || (y < 0) || (x >= (int)w) || (y >= (int)h)) { continue; }
-      unpack(pix(rgb, stride, x, y), &cr, &cg, &cb);
-      if (is_red(cr, cg, cb)) { hit_red = 1; break; }
-      face_y += luma(cr, cg, cb);
-      face_n++;
-    }
-    if ((hit_red != 0) || (face_n < 3)) { continue; }
-    face_y /= face_n;
-
-    for (r = (r0 + 10); r <= r1; r++)
-    {
-      int x = seed_x + (int)(((int32_t)cs * r) / 256);
-      int y = seed_y + (int)(((int32_t)sn * r) / 256);
-      int cr, cg, cb, yy, d;
-      if ((x < 0) || (y < 0) || (x >= (int)w) || (y >= (int)h)) { break; }
-      unpack(pix(rgb, stride, x, y), &cr, &cg, &cb);
-      if (is_red(cr, cg, cb)) { hit_red = 1; break; }
-      yy = luma(cr, cg, cb);
-      d = face_y - yy;
-      if ((d >= 25) && (d > best_d))
-      {
-        best_d = d;
-        best_r = r;
-      }
-    }
-    if (hit_red != 0) { continue; }
-    if (best_r > 0)
-    {
-      int x = seed_x + (int)(((int32_t)cs * best_r) / 256);
-      int y = seed_y + (int)(((int32_t)sn * best_r) / 256);
-      if (n < RIM_MAX)
-      {
-        xs[n] = (int16_t)x;
-        ys[n] = (int16_t)y;
-        n++;
-      }
-    }
-  }
-
-  g_rim_n = (uint8_t)n;
-  if (n < 24)
+  (void)seed_r;
+  if ((w < 120U) || (h < 120U))
   {
     g_rim_ok = 0U;
     return -1;
   }
-  if (fit_circle(xs, ys, n, &cx, &cy, &rad) != 0)
+  x0 = 60;
+  y0 = 60;
+  x1 = (int)w - 60;
+  y1 = (int)h - 60;
+  r0 = 72;
+  r1 = 136;
+  if ((seed_x > 40) && (seed_y > 40) &&
+      (seed_x < ((int)w - 40)) && (seed_y < ((int)h - 40)))
   {
-    int i;
-    int64_t sx = 0;
-    int64_t sy = 0;
-    int64_t sr = 0;
-    for (i = 0; i < n; i++)
+    int ax0 = seed_x - 48;
+    int ay0 = seed_y - 48;
+    int ax1 = seed_x + 48;
+    int ay1 = seed_y + 48;
+    if (ax0 > x0) { x0 = ax0; }
+    if (ay0 > y0) { y0 = ay0; }
+    if (ax1 < x1) { x1 = ax1; }
+    if (ay1 < y1) { y1 = ay1; }
+  }
+  if ((x1 - x0) < 16) { x0 = 60; x1 = (int)w - 60; }
+  if ((y1 - y0) < 16) { y0 = 60; y1 = (int)h - 60; }
+
+  for (cy = y0; cy <= y1; cy += 8)
+  {
+    for (cx = x0; cx <= x1; cx += 8)
     {
-      sx += xs[i];
-      sy += ys[i];
-    }
-    cx = (int)(sx / n);
-    cy = (int)(sy / n);
-    for (i = 0; i < n; i++)
-    {
-      int dx = (int)xs[i] - cx;
-      int dy = (int)ys[i] - cy;
-      sr += (int64_t)isqrt32((uint32_t)((dx * dx) + (dy * dy)));
-    }
-    rad = (int)(sr / n);
-    if ((rad < 50) || (rad > 220))
-    {
-      g_rim_ok = 0U;
-      return -1;
+      for (r = r0; r <= r1; r += 4)
+      {
+        int s = rim_score(rgb, stride, w, h, cx, cy, r, 20, &ntmp);
+        if ((ntmp >= 12) && (s > best_s))
+        {
+          best_s = s;
+          best_n = ntmp;
+          best_cx = cx;
+          best_cy = cy;
+          best_r = r;
+        }
+      }
     }
   }
-  /* 圆心不能离种子（帽心）太远，避免扫到外壳圈。 */
+  /* 也从裁窗中心再搜一遍，避免种子落在被针身拉开的帽心附近。 */
   {
-    int dx = cx - seed_x;
-    int dy = cy - seed_y;
-    if (((dx * dx) + (dy * dy)) > (28 * 28))
+    int mx = (int)w / 2;
+    int my = (int)h / 2;
+    int cx0 = mx - 48;
+    int cy0 = my - 48;
+    int cx1 = mx + 48;
+    int cy1 = my + 48;
+    if (cx0 < 60) { cx0 = 60; }
+    if (cy0 < 60) { cy0 = 60; }
+    if (cx1 > ((int)w - 60)) { cx1 = (int)w - 60; }
+    if (cy1 > ((int)h - 60)) { cy1 = (int)h - 60; }
+    for (cy = cy0; cy <= cy1; cy += 8)
     {
-      g_rim_ok = 0U;
-      return -1;
+      for (cx = cx0; cx <= cx1; cx += 8)
+      {
+        for (r = r0; r <= r1; r += 4)
+        {
+          int s = rim_score(rgb, stride, w, h, cx, cy, r, 20, &ntmp);
+          if ((ntmp >= 12) && (s > best_s))
+          {
+            best_s = s;
+            best_n = ntmp;
+            best_cx = cx;
+            best_cy = cy;
+            best_r = r;
+          }
+        }
+      }
     }
   }
-  g_rim_cx = (int16_t)cx;
-  g_rim_cy = (int16_t)cy;
-  g_rim_r = (int16_t)rad;
+  if ((best_s < 8) || (best_r < 60))
+  {
+    g_rim_n = (uint8_t)best_n;
+    g_rim_ok = 0U;
+    return -1;
+  }
+  {
+    int fx0 = best_cx - 8;
+    int fy0 = best_cy - 8;
+    int fx1 = best_cx + 8;
+    int fy1 = best_cy + 8;
+    int fr0 = best_r - 8;
+    int fr1 = best_r + 8;
+    if (fr0 < 60) { fr0 = 60; }
+    if (fr1 > 160) { fr1 = 160; }
+    best_s = -1;
+    for (cy = fy0; cy <= fy1; cy++)
+    {
+      for (cx = fx0; cx <= fx1; cx++)
+      {
+        for (r = fr0; r <= fr1; r++)
+        {
+          int s = rim_score(rgb, stride, w, h, cx, cy, r, 10, &ntmp);
+          if ((ntmp >= 20) && (s > best_s))
+          {
+            best_s = s;
+            best_n = ntmp;
+            best_cx = cx;
+            best_cy = cy;
+            best_r = r;
+          }
+        }
+      }
+    }
+  }
+  if (best_s < 16)
+  {
+    g_rim_n = (uint8_t)best_n;
+    g_rim_ok = 0U;
+    return -1;
+  }
+  g_rim_cx = (int16_t)best_cx;
+  g_rim_cy = (int16_t)best_cy;
+  g_rim_r = (int16_t)best_r;
+  g_rim_n = (uint8_t)best_n;
   g_rim_ok = 1U;
-  *ocx = cx;
-  *ocy = cy;
-  *orad = rad;
+  *ocx = best_cx;
+  *ocy = best_cy;
+  *orad = best_r;
   return 0;
 }
 
@@ -2057,14 +2102,7 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
         int32_t a_prev;
         int32_t acc = 0;
         uint16_t i;
-        /* 圆心看表盘圆；套不上就留在本帧帽心。不要再用短弧针尖把轴顶偏。 */
-        if (fit_dial_rim(rgb, stride, w, h, hx, hy,
-                         ((int)st->needle.r >= 24) ? (int)st->needle.r : 80,
-                         &fcx, &fcy, &rrad) != 0)
-        {
-          fcx = hx;
-          fcy = hy;
-        }
+        /* 先按当前帽心看转过的角度；满 0.3 L 后再花一次算力套整圈表盘圆。 */
         a_prev = atan2_mdeg((int)g_tip_y[0] - fcy, (int)g_tip_x[0] - fcx);
         for (i = 1U; i < g_tip_n; i++)
         {
@@ -2073,7 +2111,7 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
           a_prev = ai;
         }
         g_fit_span_mdeg = acc;
-        /* 必须绕圆心走出约 0.3 L，再开始按圈测流。 */
+        /* 必须绕圆心走出约 0.3 L，再开始按圈测流。表盘圆套不上则本帧不锁。 */
         if (iabs32(acc) >= HUB_LOCK_MDEG)
         {
           int loc_r = (int)st->needle.r;
@@ -2082,6 +2120,24 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
           int32_t a1;
           int nt = 0;
           int64_t sr = 0;
+          if (fit_dial_rim(rgb, stride, w, h, hx, hy,
+                           ((int)st->needle.r >= 24) ? (int)st->needle.r : 80,
+                           &fcx, &fcy, &rrad) != 0)
+          {
+            ok = 0;
+          }
+          else
+          {
+            a_prev = atan2_mdeg((int)g_tip_y[0] - fcy, (int)g_tip_x[0] - fcx);
+            acc = 0;
+            for (i = 1U; i < g_tip_n; i++)
+            {
+              int32_t ai = atan2_mdeg((int)g_tip_y[i] - fcy, (int)g_tip_x[i] - fcx);
+              acc += wrap_diff_mdeg(ai, a_prev);
+              a_prev = ai;
+            }
+            g_fit_span_mdeg = acc;
+          }
           for (i = 0U; i < g_tip_n; i++)
           {
             int dx = (int)g_tip_x[i] - fcx;

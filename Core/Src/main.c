@@ -813,6 +813,9 @@ static void CamDbg_SnapSensor(void)
   CamDbg_SnapLive();
 }
 static uint8_t speed_phase;
+#define CROP_SETTLE_US  1000000U  /* 裁窗后等自动曝光约 1 s 再开始认针 */
+uint8_t  g_crop_settling;
+uint32_t g_crop_settle_t0;
 static uint8_t dial_hud_ready;
 static uint8_t dial_yield_lock;
 static dial_report_t dial_hud_rep;
@@ -2864,6 +2867,7 @@ static void SpeedTrack_OpenFull(void)
     cam_ok = 0U;
     cam_hold = 0U;
     speed_phase = 0U;
+    g_crop_settling = 0U;
     CamDbg_Mark(8U);
     return;
   }
@@ -2879,6 +2883,7 @@ static void SpeedTrack_OpenFull(void)
   cam_hold = 0U;
   SpeedTrack_Reset(&g_speed);
   speed_phase = 0U;
+  g_crop_settling = 0U;
   CamDbg_Mark(8U);
 }
 
@@ -3034,33 +3039,11 @@ static void SpeedTrack_ApplyCrop(void)
   cam_hold = 0U;
   SpeedTrack_Shift(&g_speed, (int16_t)(-(int16_t)g_speed.crop.x),
                    (int16_t)(-(int16_t)g_speed.crop.y));
-  /* 第一刀已对准升针附近。不再二次改摄像头窗口，只在本窗里认升针。 */
+  /* 第一刀已对准升针附近。不再二次改摄像头窗口。
+   * 裁完先让自动曝光走约 1 s，再开始在本窗里认针。 */
   g_need_refine = 1U;
-  {
-    uint32_t wb;
-    const uint16_t *rgb;
-    uint32_t dest;
-    int ok = -1;
-
-    dest = lcd_draw;
-    if (dest == 0U)
-    {
-      dest = lcd_frame_addr;
-    }
-    wb = DialRead_WorkBytes((uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT);
-    rgb = (const uint16_t *)dest;
-    rgb = rgb + (((uint32_t)cam_oy * LCD_WIDTH) + (uint32_t)cam_ox);
-    if ((cam_w >= 80U) && (cam_h >= 80U) &&
-        ((DIAL_WORK_ADDR + wb) <= (SDRAM_BASE + 0x2000000UL)))
-    {
-      ok = SpeedTrack_FindNeedle(rgb, (uint16_t)LCD_WIDTH, cam_w, cam_h,
-                                 (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed);
-    }
-    if ((ok == 0) && ((int)g_speed.needle.cx <= (((int)cam_w * 2) / 3)))
-    {
-      g_need_refine = 0U;
-    }
-  }
+  g_crop_settling = 1U;
+  g_crop_settle_t0 = TIM2->CNT;
   speed_phase = 1U;
   CamDbg_Mark(7U);
 }
@@ -3085,6 +3068,14 @@ static void SpeedTrack_Service(void)
   }
   if (speed_phase != 0U)
   {
+    if (g_crop_settling != 0U)
+    {
+      if ((TIM2->CNT - g_crop_settle_t0) < CROP_SETTLE_US)
+      {
+        return;
+      }
+      g_crop_settling = 0U;
+    }
     if (g_need_refine != 0U)
     {
       const uint16_t *rgb;
