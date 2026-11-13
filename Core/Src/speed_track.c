@@ -613,6 +613,8 @@ int32_t  g_rev_best_d;      /* 与起点的最小角距，mdeg */
 int32_t  g_rev_best_accum;
 uint32_t g_rev_best_t;
 int32_t  g_rev_best_ang;
+uint16_t g_rev_seq;        /* 每测完一圈加一，HUD 显示 [001] */
+uint32_t g_frame_dt_us;     /* 当前针位与上一帧的时间差，TIM2 微秒 */
 int16_t  g_locate_cx;
 int16_t  g_locate_cy;
 int16_t  g_locate_r;
@@ -1729,6 +1731,7 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
   {
     return 0;
   }
+  g_frame_dt_us = step;
   if (step > 2000000U)
   {
     st->stamp_us = stamp_us;
@@ -1900,6 +1903,8 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
             st->flow_filt_e2 = inst;
             st->have_speed = 1U;
             st->dt_us = dt;
+            if (g_rev_seq < 999U) { g_rev_seq++; }
+            else { g_rev_seq = 1U; }
           }
           /* 最近点这一帧作为下一圈的起点。 */
           rev_start(g_rev_best_t, g_rev_best_ang);
@@ -2135,6 +2140,29 @@ static void put_u(char *p, uint32_t v, int digits)
   }
 }
 
+static void put_u_var(char *p, uint32_t v)
+{
+  char rev[12];
+  int k = 0;
+  int i = 0;
+  if (v == 0U)
+  {
+    p[0] = '0';
+    p[1] = 0;
+    return;
+  }
+  while (v > 0U)
+  {
+    rev[k++] = (char)('0' + (char)(v % 10U));
+    v /= 10U;
+  }
+  while (k > 0)
+  {
+    p[i++] = rev[--k];
+  }
+  p[i] = 0;
+}
+
 static void fmt_ip_frac(char *dst, uint32_t av, uint32_t scale, int frac)
 {
   uint32_t ip = av / scale;
@@ -2213,6 +2241,31 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
     }
     plot(fb, (int)fb_w, (int)fb_h, (int)ox + (int)st->needle.tip_x,
          (int)oy + (int)st->needle.tip_y, LIVE_LEAD, 5);
+    if (g_frame_dt_us != 0U)
+    {
+      char dtb[16];
+      char *p;
+      int txp;
+      int typ;
+      int tw2;
+      uint32_t ms = g_frame_dt_us / 1000U;
+      put_u_var(dtb, ms);
+      p = dtb;
+      while (*p) { p++; }
+      *p++ = ' ';
+      *p++ = 'm';
+      *p++ = 's';
+      *p = 0;
+      tw2 = measure_str(dtb);
+      txp = (int)ox + (int)st->needle.tip_x + 10;
+      typ = (int)oy + (int)st->needle.tip_y - 10;
+      if ((txp + tw2 + 6) > (int)fb_w) { txp = (int)ox + (int)st->needle.tip_x - tw2 - 10; }
+      if (txp < 2) { txp = 2; }
+      if (typ < 2) { typ = 2; }
+      if ((typ + 30) > (int)fb_h) { typ = (int)fb_h - 30; }
+      fill_rect(fb, (int)fb_w, (int)fb_h, txp - 3, typ - 2, txp + tw2 + 3, typ + 26, 0xFFFF);
+      (void)draw_str(fb, (int)fb_w, (int)fb_h, txp, typ, dtb);
+    }
   }
 
   l1[0] = 0;
@@ -2225,16 +2278,7 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
     put_u(p, (uint32_t)t->hour, 2); p += 2; *p++ = ':';
     put_u(p, (uint32_t)t->min, 2); p += 2; *p++ = ':';
     put_u(p, (uint32_t)t->sec, 2); p += 2;
-    if (st->have_speed != 0U)
-    {
-      uint32_t ms = st->dt_us / 1000U;
-      int nd = (ms >= 1000U) ? 4 : 3;
-      *p++ = ' ';
-      put_u(p, ms, nd); p += nd;
-      *p++ = ' ';
-      *p++ = 'm';
-      *p++ = 's';
-    }
+
     *p = 0;
   }
   else
@@ -2250,12 +2294,15 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
     const char *s;
     fmt_signed_frac(num, st->flow_filt_e2, 100, 2);
     p = l2; s = num; while (*s) { *p++ = *s++; }
-    *p++ = ' '; *p++ = 'L'; *p++ = '/'; *p++ = 'h'; *p = 0;
-    /* 秒/圈 = 3600 / (L/h)，乘 100 以便两位小数。 */
-    if (st->flow_filt_e2 > 0)
+    *p++ = ' '; *p++ = 'L'; *p++ = '/'; *p++ = 'h';
+    *p++ = ' '; *p++ = '[';
+    put_u(p, (uint32_t)g_rev_seq, 3); p += 3;
+    *p++ = ']'; *p = 0;
+    /* 一圈用时用 TIM2 实测微秒，显示到 0.00001 s。 */
+    if (st->dt_us > 0U)
     {
-      int32_t per_e2 = (int32_t)(36000000LL / (int64_t)st->flow_filt_e2);
-      fmt_signed_frac(num, per_e2, 100, 2);
+      int32_t per_e5 = (int32_t)((st->dt_us + 5U) / 10U);
+      fmt_signed_frac(num, per_e5, 100000, 5);
       p = l3; s = num; while (*s) { *p++ = *s++; }
       *p++ = ' '; *p++ = 's'; *p = 0;
     }
