@@ -714,6 +714,10 @@ typedef struct
   uint32_t dcmi_ris;
   uint32_t dma_cr;
   uint32_t dma_ndtr;
+  uint16_t rb_sys;
+  uint16_t rb_out_w;
+  uint16_t rb_hts;
+  uint16_t rb_vts;
 } cam_dbg_t;
 static volatile cam_dbg_t g_cam_dbg;
 static uint8_t speed_phase;
@@ -2762,8 +2766,8 @@ static void SpeedTrack_ApplyCrop(void)
   {
     sh = (uint16_t)LCD_HEIGHT;
   }
-  /* 先停采集和传感器出流，再改窗口，恢复出流后再开 DCMI。
-   * 不要走 RgbLcdPreview 整表初始化，也不要在开采集之后再刷黑。 */
+  /* 先停采集，再整表重新初始化传感器把卡死的行场拉起来，
+   * 然后停流切到小窗，恢复出流后再开 DCMI。不要在开采集之后再刷黑。 */
   {
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
@@ -2782,6 +2786,9 @@ static void SpeedTrack_ApplyCrop(void)
   LCD_FillBothBlack();
   OV5640_SetStream(0U);
   HAL_Delay(10);
+  OV5640_RgbLcdPreview(LCD_WIDTH, LCD_HEIGHT);
+  OV5640_SetStream(0U);
+  HAL_Delay(10);
   OV5640_SetNativeWindow(sx, sy, sw, sh);
   CAM_LoadView();
   HAL_Delay(20);
@@ -2797,6 +2804,14 @@ static void SpeedTrack_ApplyCrop(void)
     DMA_Stream_TypeDef *dma = (DMA_Stream_TypeDef *)hdma_dcmi.Instance;
     g_cam_dbg.dma_cr = (dma != 0) ? dma->CR : 0U;
     g_cam_dbg.dma_ndtr = (dma != 0) ? dma->NDTR : 0U;
+  }
+  {
+    uint16_t sys = 0U, out_w = 0U, hts = 0U, vts = 0U;
+    OV5640_SnapRegs(&sys, &out_w, &hts, &vts);
+    g_cam_dbg.rb_sys = sys;
+    g_cam_dbg.rb_out_w = out_w;
+    g_cam_dbg.rb_hts = hts;
+    g_cam_dbg.rb_vts = vts;
   }
   cam_hold = 0U;
   SpeedTrack_Shift(&g_speed, (int16_t)(-(int16_t)g_speed.crop.x),

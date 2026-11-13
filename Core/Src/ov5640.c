@@ -1201,6 +1201,37 @@ void OV5640_SetStream(uint8_t on)
   (void)SCCB_WriteReg(0x3008U, (on != 0U) ? 0x02U : 0x42U);
 }
 
+void OV5640_SnapRegs(uint16_t *sys, uint16_t *out_w, uint16_t *hts, uint16_t *vts)
+{
+  uint8_t v = 0U;
+  uint8_t hi = 0U;
+  uint8_t lo = 0U;
+
+  (void)SCCB_ReadReg(0x3008U, &v);
+  if (sys != 0)
+  {
+    *sys = v;
+  }
+  (void)SCCB_ReadReg(0x3808U, &hi);
+  (void)SCCB_ReadReg(0x3809U, &lo);
+  if (out_w != 0)
+  {
+    *out_w = (uint16_t)(((uint16_t)hi << 8) | lo);
+  }
+  (void)SCCB_ReadReg(0x380CU, &hi);
+  (void)SCCB_ReadReg(0x380DU, &lo);
+  if (hts != 0)
+  {
+    *hts = (uint16_t)(((uint16_t)hi << 8) | lo);
+  }
+  (void)SCCB_ReadReg(0x380EU, &hi);
+  (void)SCCB_ReadReg(0x380FU, &lo);
+  if (vts != 0)
+  {
+    *vts = (uint16_t)(((uint16_t)hi << 8) | lo);
+  }
+}
+
 
 
 
