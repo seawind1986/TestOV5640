@@ -1195,6 +1195,13 @@ void OV5640_SetNativeWindow(uint16_t x, uint16_t y, uint16_t width, uint16_t hei
   OV5640_FitOutput();
 }
 
+void OV5640_SetStream(uint8_t on)
+{
+  /* 改窗口前先软件掉电，避免行场卡在半帧后不再出同步。 */
+  (void)SCCB_WriteReg(0x3008U, (on != 0U) ? 0x02U : 0x42U);
+}
+
+
 
 
 void OV5640_RgbLcdPreview(uint16_t width, uint16_t height)

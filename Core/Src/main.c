@@ -703,6 +703,19 @@ static volatile uint32_t cam_stamp_us;
 static volatile uint16_t cam_ox;
 static volatile uint16_t cam_oy;
 static speed_state_t g_speed;
+/* J-Link 监视：裁窗前后的帧计数、DCMI/DMA 状态。 */
+typedef struct
+{
+  uint16_t frames_pre;
+  int16_t  kick_ret;
+  uint32_t stamp_pre;
+  uint32_t dcmi_cr;
+  uint32_t dcmi_sr;
+  uint32_t dcmi_ris;
+  uint32_t dma_cr;
+  uint32_t dma_ndtr;
+} cam_dbg_t;
+static volatile cam_dbg_t g_cam_dbg;
 static uint8_t speed_phase;
 static uint8_t dial_hud_ready;
 static uint8_t dial_yield_lock;
@@ -2749,8 +2762,8 @@ static void SpeedTrack_ApplyCrop(void)
   {
     sh = (uint16_t)LCD_HEIGHT;
   }
-  /* 先停采集再改窗口。否则传感器已经吐小行，DMA 还按全幅收，溢出后 DCMI 会停。
-   * 也不要走 RgbLcdPreview 整表初始化，也不要在开采集之后再刷黑。 */
+  /* 先停采集和传感器出流，再改窗口，恢复出流后再开 DCMI。
+   * 不要走 RgbLcdPreview 整表初始化，也不要在开采集之后再刷黑。 */
   {
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
@@ -2760,15 +2773,31 @@ static void SpeedTrack_ApplyCrop(void)
       __enable_irq();
     }
   }
+  g_cam_dbg.frames_pre = cam_frame_count;
+  g_cam_dbg.stamp_pre = cam_stamp_us;
   (void)HAL_DCMI_Stop(&hdcmi);
   cam_arm = 0U;
   cam_curline = 0U;
   cam_draw_full = 2U;
   LCD_FillBothBlack();
+  OV5640_SetStream(0U);
+  HAL_Delay(10);
   OV5640_SetNativeWindow(sx, sy, sw, sh);
   CAM_LoadView();
+  HAL_Delay(20);
+  OV5640_SetStream(1U);
   HAL_Delay(50);
   CAM_Start();
+  HAL_Delay(20);
+  g_cam_dbg.kick_ret = 0;
+  g_cam_dbg.dcmi_cr = hdcmi.Instance->CR;
+  g_cam_dbg.dcmi_sr = hdcmi.Instance->SR;
+  g_cam_dbg.dcmi_ris = hdcmi.Instance->RISR;
+  {
+    DMA_Stream_TypeDef *dma = (DMA_Stream_TypeDef *)hdma_dcmi.Instance;
+    g_cam_dbg.dma_cr = (dma != 0) ? dma->CR : 0U;
+    g_cam_dbg.dma_ndtr = (dma != 0) ? dma->NDTR : 0U;
+  }
   cam_hold = 0U;
   SpeedTrack_Shift(&g_speed, (int16_t)(-(int16_t)g_speed.crop.x),
                    (int16_t)(-(int16_t)g_speed.crop.y));
