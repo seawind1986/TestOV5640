@@ -29,7 +29,7 @@
 #define FLOW_WIN_MIN_US 1000000U  /* 至少跨 1 s 再报流速 */
 #define FLOW_WIN_US     2000000U  /* 按约 2 s 窗口滑动 */
 #define TIP_HIST        80
-#define HUB_LOCK_MDEG   108000   /* 0.3 L = 108°，用针尖轨迹拟合圆心 */
+#define HUB_LOCK_MDEG   108000   /* 0.3 L = 108°，走够后再锁圆心（圆心看表盘圆，不靠短弧拟合） */
 #define RING_SHRINK_N   70       /* 锁定后轨迹半径收进针身，避免扫空 */
 #define RING_SHRINK_D   100
 #define REV_HUNT_MDEG  300000    /* 走出约 0.83 圈后再找与起点最接近的位置 */
@@ -636,6 +636,11 @@ uint8_t  g_need_refine;
 uint8_t  g_n_needles;
 uint16_t g_left2_cx;
 int16_t  g_tip_xmax;
+int16_t  g_rim_cx;           /* 表盘圆拟合圆心，供 J-Link 钩取 */
+int16_t  g_rim_cy;
+int16_t  g_rim_r;
+uint8_t  g_rim_n;
+uint8_t  g_rim_ok;
 
 static void tip_hist_reset(void)
 {
@@ -1025,6 +1030,11 @@ void SpeedTrack_Reset(speed_state_t *st)
   g_locate_cx = 0;
   g_locate_cy = 0;
   g_locate_r = 0;
+  g_rim_cx = 0;
+  g_rim_cy = 0;
+  g_rim_r = 0;
+  g_rim_n = 0U;
+  g_rim_ok = 0U;
   g_track_miss = 0U;
   g_need_relocate = 0U;
   g_need_refine = 0U;
@@ -1522,7 +1532,141 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
 }
 
 
-/* 在冻结的轨迹圆上找红弧沿运动方向的前沿。dir=0 时先扫整圈取最长红弧。 */
+/* 用画面里看得见的表盘黑圈定圆心。轴心本身不动，不再靠短弧针尖去“算”一个会漂的轴。 */
+#define RIM_STEP  5
+#define RIM_MAX   72
+
+static int fit_dial_rim(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                        int seed_x, int seed_y, int seed_r,
+                        int *ocx, int *ocy, int *orad)
+{
+  int16_t xs[RIM_MAX];
+  int16_t ys[RIM_MAX];
+  int n = 0;
+  int a;
+  int r0;
+  int r1;
+  int cx;
+  int cy;
+  int rad;
+
+  if (seed_r < 24) { seed_r = 80; }
+  r0 = (seed_r * 60) / 100;
+  if (r0 < 40) { r0 = 40; }
+  r1 = (seed_r * 160) / 100;
+  if (r1 < (r0 + 20)) { r1 = r0 + 20; }
+  if (r1 > 200) { r1 = 200; }
+
+  for (a = 0; a < 360; a += RIM_STEP)
+  {
+    int r;
+    int face_y = 0;
+    int face_n = 0;
+    int best_r = -1;
+    int best_d = -1;
+    int hit_red = 0;
+    int cs = (int)icos(a);
+    int sn = (int)isin(a);
+
+    /* 先测盘面亮度，再在外侧找比盘面暗的圈。红针挡住的射线丢掉。 */
+    for (r = r0; r <= (r0 + 8); r++)
+    {
+      int x = seed_x + (int)(((int32_t)cs * r) / 256);
+      int y = seed_y + (int)(((int32_t)sn * r) / 256);
+      int cr, cg, cb;
+      if ((x < 0) || (y < 0) || (x >= (int)w) || (y >= (int)h)) { continue; }
+      unpack(pix(rgb, stride, x, y), &cr, &cg, &cb);
+      if (is_red(cr, cg, cb)) { hit_red = 1; break; }
+      face_y += luma(cr, cg, cb);
+      face_n++;
+    }
+    if ((hit_red != 0) || (face_n < 3)) { continue; }
+    face_y /= face_n;
+
+    for (r = (r0 + 10); r <= r1; r++)
+    {
+      int x = seed_x + (int)(((int32_t)cs * r) / 256);
+      int y = seed_y + (int)(((int32_t)sn * r) / 256);
+      int cr, cg, cb, yy, d;
+      if ((x < 0) || (y < 0) || (x >= (int)w) || (y >= (int)h)) { break; }
+      unpack(pix(rgb, stride, x, y), &cr, &cg, &cb);
+      if (is_red(cr, cg, cb)) { hit_red = 1; break; }
+      yy = luma(cr, cg, cb);
+      d = face_y - yy;
+      if ((d >= 25) && (d > best_d))
+      {
+        best_d = d;
+        best_r = r;
+      }
+    }
+    if (hit_red != 0) { continue; }
+    if (best_r > 0)
+    {
+      int x = seed_x + (int)(((int32_t)cs * best_r) / 256);
+      int y = seed_y + (int)(((int32_t)sn * best_r) / 256);
+      if (n < RIM_MAX)
+      {
+        xs[n] = (int16_t)x;
+        ys[n] = (int16_t)y;
+        n++;
+      }
+    }
+  }
+
+  g_rim_n = (uint8_t)n;
+  if (n < 24)
+  {
+    g_rim_ok = 0U;
+    return -1;
+  }
+  if (fit_circle(xs, ys, n, &cx, &cy, &rad) != 0)
+  {
+    int i;
+    int64_t sx = 0;
+    int64_t sy = 0;
+    int64_t sr = 0;
+    for (i = 0; i < n; i++)
+    {
+      sx += xs[i];
+      sy += ys[i];
+    }
+    cx = (int)(sx / n);
+    cy = (int)(sy / n);
+    for (i = 0; i < n; i++)
+    {
+      int dx = (int)xs[i] - cx;
+      int dy = (int)ys[i] - cy;
+      sr += (int64_t)isqrt32((uint32_t)((dx * dx) + (dy * dy)));
+    }
+    rad = (int)(sr / n);
+    if ((rad < 50) || (rad > 220))
+    {
+      g_rim_ok = 0U;
+      return -1;
+    }
+  }
+  /* 圆心不能离种子（帽心）太远，避免扫到外壳圈。 */
+  {
+    int dx = cx - seed_x;
+    int dy = cy - seed_y;
+    if (((dx * dx) + (dy * dy)) > (28 * 28))
+    {
+      g_rim_ok = 0U;
+      return -1;
+    }
+  }
+  g_rim_cx = (int16_t)cx;
+  g_rim_cy = (int16_t)cy;
+  g_rim_r = (int16_t)rad;
+  g_rim_ok = 1U;
+  *ocx = cx;
+  *ocy = cy;
+  *orad = rad;
+  return 0;
+}
+
+/* 在冻结的轨迹圆上找红弧沿运动方向的前沿。
+ * dir>0 取角度增大的一端，dir<0 取角度减小的一端；dir=0 时取最长红弧中点。 */
 static int ring_lead(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
                      int cx, int cy, int R, int32_t pred_mdeg, int32_t dir,
                      int *lx, int *ly, int32_t *ang)
@@ -1533,10 +1677,9 @@ static int ring_lead(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t 
   int a1;
   int i;
   int n;
-  int best_len = 0;
-  int best_s = 0;
   int lead;
-  int wrap_scan;
+  int start;
+  int sgn;
 
   if (R < 8) { return -1; }
   if ((pred_mdeg < 0) || (dir == 0))
@@ -1547,8 +1690,8 @@ static int ring_lead(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t 
   else
   {
     int mid = norm_mdeg(pred_mdeg) / 1000;
-    int back = 15;
-    int ahead = 40;
+    int back = 20;
+    int ahead = 50;
     if (dir > 0) { a0 = mid - back; a1 = mid + ahead; }
     else { a0 = mid - ahead; a1 = mid + back; }
   }
@@ -1589,66 +1732,107 @@ static int ring_lead(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t 
     }
   }
 
-  wrap_scan = ((a0 == 0) && (a1 == 359)) ? 1 : 0;
-  i = 0;
-  while (i < 360)
+  if (dir != 0)
   {
-    int s;
-    int e;
-    int len;
-    if (red[i] == 0U) { i++; continue; }
-    s = i;
-    e = i;
-    while ((e < 359) && (red[e + 1] != 0U)) { e++; }
-    if ((wrap_scan != 0) && (s == 0) && (red[359] != 0U))
+    sgn = (dir > 0) ? 1 : -1;
+    start = -1;
+    if (pred_mdeg >= 0)
     {
-      /* 整圈扫描时，把跨 0° 的弧并到最后一段去处理。 */
-      i = e + 1;
-      continue;
+      int mid = norm_mdeg(pred_mdeg) / 1000;
+      if (red[mid] != 0U)
+      {
+        start = mid;
+      }
+      else
+      {
+        /* 预测点若刚离开红弧，先往后找（还在针上），再往前找。 */
+        for (i = 1; i <= 50; i++)
+        {
+          int b = (mid - (i * sgn) + 3600) % 360;
+          int f = (mid + (i * sgn) + 3600) % 360;
+          if (red[b] != 0U) { start = b; break; }
+          if (red[f] != 0U) { start = f; break; }
+        }
+      }
     }
-    len = e - s + 1;
-    if ((wrap_scan != 0) && (e == 359) && (red[0] != 0U))
+    if (start < 0)
     {
-      int j = 0;
-      while ((j < s) && (red[j] != 0U)) { j++; }
-      len = (e - s + 1) + j;
-      e = j - 1;
+      int best_len = 0;
+      int best_s = -1;
+      i = 0;
+      while (i < 360)
+      {
+        int s;
+        int e;
+        int len;
+        int j;
+        if (red[i] == 0U) { i++; continue; }
+        s = i;
+        e = i;
+        while ((e < 359) && (red[e + 1] != 0U)) { e++; }
+        len = e - s + 1;
+        if ((e == 359) && (red[0] != 0U))
+        {
+          j = 0;
+          while ((j < s) && (red[j] != 0U)) { j++; }
+          len = (e - s + 1) + j;
+        }
+        if (len > best_len)
+        {
+          best_len = len;
+          best_s = s;
+        }
+        i = e + 1;
+      }
+      if (best_len < 3) { return -1; }
+      start = best_s;
     }
-    if (len > best_len)
+    lead = start;
+    for (i = 1; i < 80; i++)
     {
-      best_len = len;
-      best_s = s;
-      /* stash end in best via encode: keep lead later from s/len */
-      if (e < s) { best_s = s; /* wrap, end = e */ }
+      int aa = (start + (i * sgn) + 3600) % 360;
+      if (red[aa] != 0U) { lead = aa; }
+      else { break; }
     }
-    /* store end in red as we need both; use a second pass on winner */
-    i = (e >= s) ? (e + 1) : 360;
+    {
+      int width = 0;
+      for (i = 0; i < 80; i++)
+      {
+        int aa = (lead - (i * sgn) + 3600) % 360;
+        if (red[aa] != 0U) { width++; }
+        else { break; }
+      }
+      if (width < 3) { return -1; }
+    }
   }
-
-  /* 再扫一次拿到最长弧的起止角。 */
+  else
   {
-    int win_s = 0, win_e = 0;
-    best_len = 0;
+    int best_len = 0;
+    int win_s = 0;
+    int win_e = 0;
     i = 0;
     while (i < 360)
     {
-      int s, e, len;
+      int s;
+      int e;
+      int len;
+      int j;
       if (red[i] == 0U) { i++; continue; }
       s = i;
       e = i;
       while ((e < 359) && (red[e + 1] != 0U)) { e++; }
       len = e - s + 1;
-      if ((wrap_scan != 0) && (e == 359) && (red[0] != 0U))
+      if ((e == 359) && (red[0] != 0U))
       {
-        int j = 0;
-        while ((j < 360) && (red[j] != 0U) && (j < s)) { j++; }
+        j = 0;
+        while ((j < s) && (red[j] != 0U)) { j++; }
         if (j > 0)
         {
           len = (e - s + 1) + j;
           e = j - 1;
         }
       }
-      if ((wrap_scan != 0) && (s == 0) && (red[359] != 0U) && (e < 359))
+      if ((s == 0) && (red[359] != 0U) && (e < 359))
       {
         i = e + 1;
         continue;
@@ -1662,15 +1846,12 @@ static int ring_lead(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t 
       i = (e >= s) ? (e + 1) : 360;
     }
     if (best_len < 3) { return -1; }
-    if (dir > 0) { lead = win_e; }
-    else if (dir < 0) { lead = win_s; }
-    else { lead = (win_e >= win_s) ? ((win_s + win_e) / 2) : (((win_s + win_e + 360) / 2) % 360); }
+    lead = (win_e >= win_s) ? ((win_s + win_e) / 2) : (((win_s + win_e + 360) / 2) % 360);
   }
 
   *lx = cx + (int)(((int32_t)icos(lead) * R) / 256);
   *ly = cy + (int)(((int32_t)isin(lead) * R) / 256);
   *ang = lead * 1000;
-  (void)best_s;
   return 0;
 }
 
@@ -1718,7 +1899,7 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
                        &tx, &ty, &ang);
     if (tip_ok != 0)
     {
-      tip_ok = ring_lead(rgb, stride, w, h, hx, hy, R, -1, 0, &tx, &ty, &ang);
+      tip_ok = ring_lead(rgb, stride, w, h, hx, hy, R, -1, st->dir_sign, &tx, &ty, &ang);
     }
   }
 
@@ -1869,53 +2050,99 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
       st->dt_us = stamp_us - st->win_t0;
       if (g_tip_n >= 12U)
       {
-        int fcx, fcy, fr;
-        if (fit_circle(g_tip_x, g_tip_y, (int)g_tip_n, &fcx, &fcy, &fr) == 0)
+        int fcx = hx;
+        int fcy = hy;
+        int fr = 0;
+        int rrad = 0;
+        int32_t a_prev;
+        int32_t acc = 0;
+        uint16_t i;
+        /* 圆心看表盘圆；套不上就留在本帧帽心。不要再用短弧针尖把轴顶偏。 */
+        if (fit_dial_rim(rgb, stride, w, h, hx, hy,
+                         ((int)st->needle.r >= 24) ? (int)st->needle.r : 80,
+                         &fcx, &fcy, &rrad) != 0)
         {
-          int32_t a_prev;
-          int32_t acc = 0;
-          uint16_t i;
-          a_prev = atan2_mdeg((int)g_tip_y[0] - fcy, (int)g_tip_x[0] - fcx);
-          for (i = 1U; i < g_tip_n; i++)
+          fcx = hx;
+          fcy = hy;
+        }
+        a_prev = atan2_mdeg((int)g_tip_y[0] - fcy, (int)g_tip_x[0] - fcx);
+        for (i = 1U; i < g_tip_n; i++)
+        {
+          int32_t ai = atan2_mdeg((int)g_tip_y[i] - fcy, (int)g_tip_x[i] - fcx);
+          acc += wrap_diff_mdeg(ai, a_prev);
+          a_prev = ai;
+        }
+        g_fit_span_mdeg = acc;
+        /* 必须绕圆心走出约 0.3 L，再开始按圈测流。 */
+        if (iabs32(acc) >= HUB_LOCK_MDEG)
+        {
+          int loc_r = (int)st->needle.r;
+          int ok = 1;
+          int ring;
+          int32_t a1;
+          int nt = 0;
+          int64_t sr = 0;
+          for (i = 0U; i < g_tip_n; i++)
           {
-            int32_t ai = atan2_mdeg((int)g_tip_y[i] - fcy, (int)g_tip_x[i] - fcx);
-            acc += wrap_diff_mdeg(ai, a_prev);
-            a_prev = ai;
-          }
-          g_fit_span_mdeg = acc;
-          /* 必须绕拟合圆心走出约 0.3 L，且半径、圆心要接近定位结果。 */
-          if (iabs32(acc) >= HUB_LOCK_MDEG)
-          {
-            int loc_r = (int)st->needle.r;
-            int ok = 1;
-            int ring;
-            int32_t a1;
-            if ((loc_r >= 24) && (fr < ((loc_r * 7) / 10))) { ok = 0; }
-            if (ok != 0)
+            int dx = (int)g_tip_x[i] - fcx;
+            int dy = (int)g_tip_y[i] - fcy;
+            int d = (int)isqrt32((uint32_t)((dx * dx) + (dy * dy)));
+            if ((d >= 50) && (d <= 160))
             {
-              ring = (fr * RING_SHRINK_N) / RING_SHRINK_D;
-              if (ring < 20) { ring = 20; }
-              st->needle.cx = (int16_t)fcx;
-              st->needle.cy = (int16_t)fcy;
-              st->needle.r = (int16_t)ring;
-              st->needle.hub_r = (int16_t)(fr / 4);
-              if (st->needle.hub_r < 10) { st->needle.hub_r = 10; }
-              st->hub_locked = 1;
-              a1 = a_prev;
-              st->last_ang = a1;
-              st->needle.ang_mdeg = a1;
-              st->win_t0 = stamp_us;
-              st->win_accum = 0;
-              st->mid_t = 0U;
-              st->mid_accum = 0;
-              if (acc > 0) { st->dir_sign = 1; }
-              else if (acc < 0) { st->dir_sign = -1; }
-              /* 预估流速等走完一圈再报，避免短弧拟合给出离谱值。
-               * 起点时刻用上一帧时间戳：锁定发生在本帧算完时，
-               * 若用本帧场结束时刻，首圈会少计一场间隔（约 208 ms）。 */
-              rev_start(stamp_us - step, a1);
-              g_track_miss = 0U;
+              sr += d;
+              nt++;
             }
+          }
+          if (nt >= 8)
+          {
+            fr = (int)(sr / nt);
+          }
+          else if (rrad >= 60)
+          {
+            fr = (rrad * 85) / 100;
+          }
+          else
+          {
+            ok = 0;
+          }
+          if ((loc_r >= 24) && (fr < ((loc_r * 7) / 10))) { ok = 0; }
+          if (ok != 0)
+          {
+            int ltx;
+            int lty;
+            int32_t lang;
+            ring = (fr * RING_SHRINK_N) / RING_SHRINK_D;
+            if (ring < 20) { ring = 20; }
+            st->needle.cx = (int16_t)fcx;
+            st->needle.cy = (int16_t)fcy;
+            st->needle.r = (int16_t)ring;
+            st->needle.hub_r = (int16_t)(fr / 4);
+            if (st->needle.hub_r < 10) { st->needle.hub_r = 10; }
+            st->hub_locked = 1;
+            if (acc > 0) { st->dir_sign = 1; }
+            else if (acc < 0) { st->dir_sign = -1; }
+            /* 起点用前进方向的前沿，避免从针中线跳到边沿把首圈计偏。 */
+            a1 = a_prev;
+            if (ring_lead(rgb, stride, w, h, fcx, fcy, ring,
+                          a_prev, st->dir_sign, &ltx, &lty, &lang) == 0)
+            {
+              a1 = lang;
+              st->needle.tip_x = (int16_t)ltx;
+              st->needle.tip_y = (int16_t)lty;
+              tx = ltx;
+              ty = lty;
+            }
+            st->last_ang = a1;
+            st->needle.ang_mdeg = a1;
+            st->win_t0 = stamp_us;
+            st->win_accum = 0;
+            st->mid_t = 0U;
+            st->mid_accum = 0;
+            /* 预估流速等走完一圈再报。
+             * 起点时刻用上一帧时间戳：锁定发生在本帧算完时，
+             * 若用本帧场结束时刻，首圈会少计一场间隔（约 208 ms）。 */
+            rev_start(stamp_us - step, a1);
+            g_track_miss = 0U;
           }
         }
       }
