@@ -11,6 +11,7 @@
 #define MAX_BLOB   16
 #define LIVE_PATH  0x0000U  /* 轨迹圆：黑线 */
 #define LIVE_LEAD  0xFFFFU  /* 前沿点：白点 */
+#define LIVE_HUB   0x001FU  /* 轴心轮廓：蓝线 */
 #define LIVE_CIRC  0x07E0U
 #define LIVE_PTR   0x029FU
 #define LIVE_STAR  0xFFE0U
@@ -1426,7 +1427,11 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
   ncy = (int)oy + (int)st->needle.cy;
   if (st->needle.found != 0U)
   {
+    int hr = (int)st->needle.hub_r;
+    if (hr < 8) { hr = 8; }
     draw_circle(fb, (int)fb_w, (int)fb_h, ncx, ncy, st->needle.r, LIVE_PATH, 2);
+    draw_circle(fb, (int)fb_w, (int)fb_h, ncx, ncy, hr, LIVE_HUB, 3);
+    plot(fb, (int)fb_w, (int)fb_h, ncx, ncy, LIVE_HUB, 4);
     plot(fb, (int)fb_w, (int)fb_h, (int)ox + (int)st->needle.tip_x,
          (int)oy + (int)st->needle.tip_y, LIVE_LEAD, 5);
   }
