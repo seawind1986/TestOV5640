@@ -3047,7 +3047,7 @@ static void SpeedTrack_ApplyCrop(void)
       ok = SpeedTrack_FindNeedle(rgb, (uint16_t)LCD_WIDTH, cam_w, cam_h,
                                  (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed);
     }
-    if ((ok == 0) && ((int)g_speed.needle.cx <= ((int)cam_w / 2)))
+    if ((ok == 0) && ((int)g_speed.needle.cx <= (((int)cam_w * 2) / 3)))
     {
       g_need_refine = 0U;
     }
@@ -3090,7 +3090,7 @@ static void SpeedTrack_Service(void)
         ok = SpeedTrack_FindNeedle(rgb, (uint16_t)LCD_WIDTH, cam_w, cam_h,
                                    (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed);
       }
-      if ((ok == 0) && ((int)g_speed.needle.cx <= ((int)cam_w / 2)))
+      if ((ok == 0) && ((int)g_speed.needle.cx <= (((int)cam_w * 2) / 3)))
       {
         g_need_refine = 0U;
       }
