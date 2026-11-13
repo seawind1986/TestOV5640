@@ -1266,8 +1266,18 @@ static void LCD_PresentLive(void)
     if ((speed_phase != 0U) && (g_need_refine == 0U))
     {
       const uint16_t *rgb = (const uint16_t *)lcd_draw;
-      SpeedTrack_Tick(rgb + (((uint32_t)cam_oy * LCD_WIDTH) + (uint32_t)cam_ox),
-                      (uint16_t)LCD_WIDTH, cam_w, cam_h, cam_stamp_us, &g_speed);
+      rgb = rgb + (((uint32_t)cam_oy * LCD_WIDTH) + (uint32_t)cam_ox);
+      if (g_speed.hub_locked == 0)
+      {
+        uint32_t wb = DialRead_WorkBytes((uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT);
+        if ((cam_w >= 80U) && (cam_h >= 80U) &&
+            ((DIAL_WORK_ADDR + wb) <= (SDRAM_BASE + 0x2000000UL)))
+        {
+          (void)SpeedTrack_FindNeedle(rgb, (uint16_t)LCD_WIDTH, cam_w, cam_h,
+                                      (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed);
+        }
+      }
+      SpeedTrack_Tick(rgb, (uint16_t)LCD_WIDTH, cam_w, cam_h, cam_stamp_us, &g_speed);
     }
     SpeedTrack_Paint((uint16_t *)lcd_draw, (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
                      (int16_t)cam_ox, (int16_t)cam_oy, &g_speed, &now);

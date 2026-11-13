@@ -917,7 +917,37 @@ static int fit_circle(const int16_t *xs, const int16_t *ys, int n, int *ocx, int
       int d = (int)isqrt32((uint32_t)((dx * dx) + (dy * dy)));
       eres += (d > rad) ? (d - rad) : (rad - d);
     }
-    if ((eres / used) > 3) { return -1; }
+    if ((eres / used) > 3)
+    {
+      /* 丢掉离圆太远的点再拟一次，避免帽上的点或邻针把拟合顶掉。 */
+      static int s_inlier;
+      int16_t fx[TIP_HIST];
+      int16_t fy[TIP_HIST];
+      int nf = 0;
+      if (s_inlier != 0) { return -1; }
+      for (i = 0; i < n; i++)
+      {
+        int64_t dx2 = (int64_t)xs[i] - cx;
+        int64_t dy2 = (int64_t)ys[i] - cy;
+        int d = (int)isqrt32((uint32_t)((dx2 * dx2) + (dy2 * dy2)));
+        int e = (d > rad) ? (d - rad) : (rad - d);
+        if (e <= 6)
+        {
+          fx[nf] = xs[i];
+          fy[nf] = ys[i];
+          nf++;
+        }
+      }
+      if ((nf >= 12) && (nf < n))
+      {
+        int ret;
+        s_inlier = 1;
+        ret = fit_circle(fx, fy, nf, ocx, ocy, orad);
+        s_inlier = 0;
+        return ret;
+      }
+      return -1;
+    }
   }
   *ocx = cx;
   *ocy = cy;
@@ -1599,16 +1629,21 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
 
   if (st->hub_locked == 0)
   {
-    /* 锁定前：直接找红色指针最外端，不绕估错的圆心扫圆环。 */
+    /* 锁定前：优先用本帧已找到的帽心指向的最远红点，避免大范围误抓邻针。 */
+    if (st->needle.found != 0U)
+    {
+      tx = (int)st->needle.tip_x;
+      ty = (int)st->needle.tip_y;
+      ang = st->needle.ang_mdeg;
+      tip_ok = 0;
+    }
+    else
     {
       int pred_x = (st->have_prev != 0U) ? (int)st->needle.tip_x : -1;
       int pred_y = (st->have_prev != 0U) ? (int)st->needle.tip_y : -1;
-      int sr = (R > 16) ? (R + 60) : 140;
+      int sr = (R > 16) ? (R + 40) : 110;
+      if (sr > 120) { sr = 120; }
       tip_ok = free_tip(rgb, stride, w, h, hx, hy, sr, pred_x, pred_y, &tx, &ty);
-      if (tip_ok != 0)
-      {
-        tip_ok = free_tip(rgb, stride, w, h, hx, hy, 160, -1, -1, &tx, &ty);
-      }
       if (tip_ok == 0)
       {
         ang = atan2_mdeg(ty - hy, tx - hx);
@@ -1749,6 +1784,12 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
           int ldx = tx - (int)g_tip_x[g_tip_n - 1U];
           int ldy = ty - (int)g_tip_y[g_tip_n - 1U];
           if (((ldx * ldx) + (ldy * ldy)) < 9) { rec = 0; }
+        }
+        {
+          int ddx = tx - hx;
+          int ddy = ty - hy;
+          int d2 = (ddx * ddx) + (ddy * ddy);
+          if ((d2 < (50 * 50)) || (d2 > (120 * 120))) { rec = 0; }
         }
         if (rec != 0)
         {
