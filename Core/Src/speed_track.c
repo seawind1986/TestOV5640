@@ -19,6 +19,7 @@
 #define TXT_G      0
 #define TXT_B      0
 #define CROP_MARGIN 80
+#define CROP_LEFT_GUARD 180 /* 若第一刀落在右侧邻针，先向左扩出升针再精裁 */
 #define NEEDLE_MIN_R 50   /* 升针在当前物距下半径约 80–110，拒掉壳上小红斑 */
 #define NEEDLE_MIN_R_LO 30 /* 被裁切的升针可能略小于 50 */
 #define NEEDLE_LEFT_GAP 40 /* 左边再有一根明显更靠左的针，就用左边这根 */     /* 贴合升针，但留足边距，避免画面过小 */
