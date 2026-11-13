@@ -2937,6 +2937,15 @@ static void SpeedTrack_ApplyCrop(void)
   g_cam_dbg.crop_sx = (uint16_t)((int32_t)g_cam_dbg.win_x
       + (((g_cam_dbg.lcd_x0 - (int32_t)g_cam_dbg.view_x) * (int32_t)g_cam_dbg.win_w)
          / (int32_t)g_cam_dbg.cap_w));
+  /* 升针往往在预览左缘之外，传感器窗口再往左移，才能把整根针收进来。 */
+  if (g_cam_dbg.crop_sx > 240U)
+  {
+    g_cam_dbg.crop_sx = (uint16_t)(g_cam_dbg.crop_sx - 240U);
+  }
+  else
+  {
+    g_cam_dbg.crop_sx = 0U;
+  }
   g_cam_dbg.crop_sy = (uint16_t)((int32_t)g_cam_dbg.win_y
       + (((g_cam_dbg.lcd_y0 - (int32_t)g_cam_dbg.view_y) * (int32_t)g_cam_dbg.win_h)
          / (int32_t)g_cam_dbg.cap_h));
