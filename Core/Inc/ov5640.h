@@ -25,10 +25,17 @@ void OV5640_GetWindow(uint16_t *x, uint16_t *y, uint16_t *width, uint16_t *heigh
 void OV5640_SetNativeOutput(uint8_t on);
 /* 按阵列绝对坐标开窗，1:1 输出，并把 src 记下以免后续 RgbLcdPreview 又居中。 */
 void OV5640_SetNativeWindow(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
+/* 硬件掉电并拉复位，再上电。 */
+void OV5640_PowerCycle(void);
+/* 复位后直接按阵列坐标开小窗并 1:1 输出，不再先走大窗预览。 */
+void OV5640_RgbLcdNativeWindow(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
 /* 0：软件掉电停流。非 0：恢复出流（0x3008 = 0x02）。 */
 void OV5640_SetStream(uint8_t on);
 /* 读回 0x3008、输出宽、HTS、VTS，供裁窗后用 J-Link 核对。 */
 void OV5640_SnapRegs(uint16_t *sys, uint16_t *out_w, uint16_t *hts, uint16_t *vts);
+/* 再读回输出高、ISP 窗口和 DVP 相关寄存器。 */
+void OV5640_SnapCropRegs(uint16_t *out_h, uint16_t *x0, uint16_t *y0, uint16_t *x1, uint16_t *y1,
+                         uint8_t *sub, uint8_t *r20, uint8_t *r21, uint8_t *dvp);
 /* 整帧快门，单位微秒。只改曝光，不改增益。长过当前帧时把帧周期加长。 */
 void OV5640_SetExposure(uint32_t shutter_us);
 /* 10 位增益，0x350A 的低 2 位和 0x350B。只改增益，不改曝光。 */

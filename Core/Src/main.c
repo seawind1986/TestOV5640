@@ -131,6 +131,9 @@ static void CAM_Init(void);
 static void CAM_Start(void);
 static int CAM_Kick(void);
 static void CAM_Service(void);
+static void CamDbg_Mark(uint16_t step);
+static void CamDbg_SnapLive(void);
+static void CamDbg_SnapSensor(void);
 static void CAM_Apply(void);
 static void CAM_ScaleToLcd(void);
 static void Keys_Poll(void);
@@ -652,6 +655,7 @@ static void CAM_Service(void)
     cam_arm = 0U;
     CAM_Start();
   }
+  CamDbg_SnapLive();
 }
 static uint16_t cam_w;
 static uint16_t cam_h;
@@ -703,7 +707,7 @@ static volatile uint32_t cam_stamp_us;
 static volatile uint16_t cam_ox;
 static volatile uint16_t cam_oy;
 static speed_state_t g_speed;
-/* J-Link 监视：裁窗前后的帧计数、DCMI/DMA 状态。 */
+/* J-Link 监视：裁窗步骤、关键量和 DCMI/DMA/传感器寄存器。字段放全局，随时可钩。 */
 typedef struct
 {
   uint16_t frames_pre;
@@ -718,8 +722,96 @@ typedef struct
   uint16_t rb_out_w;
   uint16_t rb_hts;
   uint16_t rb_vts;
+  uint16_t step;
+  uint16_t rb_out_h;
+  uint16_t rb_x0;
+  uint16_t rb_y0;
+  uint16_t rb_x1;
+  uint16_t rb_y1;
+  uint8_t  rb_sub;
+  uint8_t  rb_3820;
+  uint8_t  rb_3821;
+  uint8_t  rb_dvp;
+  uint16_t win_x;
+  uint16_t win_y;
+  uint16_t win_w;
+  uint16_t win_h;
+  uint16_t view_x;
+  uint16_t view_y;
+  uint16_t view_w;
+  uint16_t view_h;
+  uint16_t cap_w;
+  uint16_t cap_h;
+  uint16_t crop_sx;
+  uint16_t crop_sy;
+  uint16_t crop_sw;
+  uint16_t crop_sh;
+  int32_t  lcd_x0;
+  int32_t  lcd_y0;
+  uint32_t step_us[8];
+  uint16_t frames_now;
+  uint16_t curline_now;
+  uint32_t stamp_now;
+  uint32_t dcmi_sr_now;
+  uint32_t dma_ndtr_now;
+  uint32_t snap_count;
 } cam_dbg_t;
 static volatile cam_dbg_t g_cam_dbg;
+
+static void CamDbg_Mark(uint16_t step)
+{
+  if (step < 8U)
+  {
+    g_cam_dbg.step_us[step] = TIM2->CNT;
+  }
+  g_cam_dbg.step = step;
+}
+
+static void CamDbg_SnapLive(void)
+{
+  DMA_Stream_TypeDef *dma = (DMA_Stream_TypeDef *)hdma_dcmi.Instance;
+
+  g_cam_dbg.frames_now = cam_frame_count;
+  g_cam_dbg.curline_now = cam_curline;
+  g_cam_dbg.stamp_now = cam_stamp_us;
+  g_cam_dbg.dcmi_cr = hdcmi.Instance->CR;
+  g_cam_dbg.dcmi_sr_now = hdcmi.Instance->SR;
+  g_cam_dbg.dcmi_ris = hdcmi.Instance->RISR;
+  g_cam_dbg.dma_cr = (dma != 0) ? dma->CR : 0U;
+  g_cam_dbg.dma_ndtr_now = (dma != 0) ? dma->NDTR : 0U;
+  g_cam_dbg.snap_count++;
+}
+
+static void CamDbg_SnapSensor(void)
+{
+  uint16_t sys = 0U, out_w = 0U, hts = 0U, vts = 0U;
+  uint16_t out_h = 0U, x0 = 0U, y0 = 0U, x1 = 0U, y1 = 0U;
+  uint8_t sub = 0U, r20 = 0U, r21 = 0U, dvp = 0U;
+  DMA_Stream_TypeDef *dma = (DMA_Stream_TypeDef *)hdma_dcmi.Instance;
+
+  g_cam_dbg.kick_ret = 0;
+  g_cam_dbg.dcmi_cr = hdcmi.Instance->CR;
+  g_cam_dbg.dcmi_sr = hdcmi.Instance->SR;
+  g_cam_dbg.dcmi_ris = hdcmi.Instance->RISR;
+  g_cam_dbg.dma_cr = (dma != 0) ? dma->CR : 0U;
+  g_cam_dbg.dma_ndtr = (dma != 0) ? dma->NDTR : 0U;
+  OV5640_SnapRegs(&sys, &out_w, &hts, &vts);
+  OV5640_SnapCropRegs(&out_h, &x0, &y0, &x1, &y1, &sub, &r20, &r21, &dvp);
+  g_cam_dbg.rb_sys = sys;
+  g_cam_dbg.rb_out_w = out_w;
+  g_cam_dbg.rb_hts = hts;
+  g_cam_dbg.rb_vts = vts;
+  g_cam_dbg.rb_out_h = out_h;
+  g_cam_dbg.rb_x0 = x0;
+  g_cam_dbg.rb_y0 = y0;
+  g_cam_dbg.rb_x1 = x1;
+  g_cam_dbg.rb_y1 = y1;
+  g_cam_dbg.rb_sub = sub;
+  g_cam_dbg.rb_3820 = r20;
+  g_cam_dbg.rb_3821 = r21;
+  g_cam_dbg.rb_dvp = dvp;
+  CamDbg_SnapLive();
+}
 static uint8_t speed_phase;
 static uint8_t dial_hud_ready;
 static uint8_t dial_yield_lock;
@@ -2727,47 +2819,51 @@ static void LCD_FillBothBlack(void)
 
 static void SpeedTrack_ApplyCrop(void)
 {
-  uint16_t win_x, win_y, win_w, win_h;
-  uint16_t vx, vy, vw, vh, cw, ch;
-  uint16_t sx, sy, sw, sh;
-  int32_t x0 = (int32_t)g_speed.crop.x;
-  int32_t y0 = (int32_t)g_speed.crop.y;
-
-  OV5640_GetWindow(&win_x, &win_y, &win_w, &win_h);
-  OV5640_GetView(&vx, &vy, &vw, &vh);
-  OV5640_GetCapture(&cw, &ch);
-  if (cw == 0U)
+  OV5640_GetWindow((uint16_t *)&g_cam_dbg.win_x, (uint16_t *)&g_cam_dbg.win_y,
+                   (uint16_t *)&g_cam_dbg.win_w, (uint16_t *)&g_cam_dbg.win_h);
+  OV5640_GetView((uint16_t *)&g_cam_dbg.view_x, (uint16_t *)&g_cam_dbg.view_y,
+                 (uint16_t *)&g_cam_dbg.view_w, (uint16_t *)&g_cam_dbg.view_h);
+  OV5640_GetCapture((uint16_t *)&g_cam_dbg.cap_w, (uint16_t *)&g_cam_dbg.cap_h);
+  g_cam_dbg.lcd_x0 = (int32_t)g_speed.crop.x;
+  g_cam_dbg.lcd_y0 = (int32_t)g_speed.crop.y;
+  if (g_cam_dbg.cap_w == 0U)
   {
-    cw = 1U;
+    g_cam_dbg.cap_w = 1U;
   }
-  if (ch == 0U)
+  if (g_cam_dbg.cap_h == 0U)
   {
-    ch = 1U;
+    g_cam_dbg.cap_h = 1U;
   }
-  sx = (uint16_t)((int32_t)win_x + (((x0 - (int32_t)vx) * (int32_t)win_w) / (int32_t)cw));
-  sy = (uint16_t)((int32_t)win_y + (((y0 - (int32_t)vy) * (int32_t)win_h) / (int32_t)ch));
-  sw = (uint16_t)(((uint32_t)g_speed.crop.w * (uint32_t)win_w) / (uint32_t)cw);
-  sh = (uint16_t)(((uint32_t)g_speed.crop.h * (uint32_t)win_h) / (uint32_t)ch);
-  sw = (uint16_t)(sw & (uint16_t)~1U);
-  sh = (uint16_t)(sh & (uint16_t)~1U);
-  if (sw < 160U)
+  g_cam_dbg.crop_sx = (uint16_t)((int32_t)g_cam_dbg.win_x
+      + (((g_cam_dbg.lcd_x0 - (int32_t)g_cam_dbg.view_x) * (int32_t)g_cam_dbg.win_w)
+         / (int32_t)g_cam_dbg.cap_w));
+  g_cam_dbg.crop_sy = (uint16_t)((int32_t)g_cam_dbg.win_y
+      + (((g_cam_dbg.lcd_y0 - (int32_t)g_cam_dbg.view_y) * (int32_t)g_cam_dbg.win_h)
+         / (int32_t)g_cam_dbg.cap_h));
+  g_cam_dbg.crop_sw = (uint16_t)(((uint32_t)g_speed.crop.w * (uint32_t)g_cam_dbg.win_w)
+                                 / (uint32_t)g_cam_dbg.cap_w);
+  g_cam_dbg.crop_sh = (uint16_t)(((uint32_t)g_speed.crop.h * (uint32_t)g_cam_dbg.win_h)
+                                 / (uint32_t)g_cam_dbg.cap_h);
+  g_cam_dbg.crop_sw = (uint16_t)(g_cam_dbg.crop_sw & (uint16_t)~1U);
+  g_cam_dbg.crop_sh = (uint16_t)(g_cam_dbg.crop_sh & (uint16_t)~1U);
+  if (g_cam_dbg.crop_sw < 160U)
   {
-    sw = 160U;
+    g_cam_dbg.crop_sw = 160U;
   }
-  if (sh < 120U)
+  if (g_cam_dbg.crop_sh < 120U)
   {
-    sh = 120U;
+    g_cam_dbg.crop_sh = 120U;
   }
-  if (sw > LCD_WIDTH)
+  if (g_cam_dbg.crop_sw > LCD_WIDTH)
   {
-    sw = (uint16_t)LCD_WIDTH;
+    g_cam_dbg.crop_sw = (uint16_t)LCD_WIDTH;
   }
-  if (sh > LCD_HEIGHT)
+  if (g_cam_dbg.crop_sh > LCD_HEIGHT)
   {
-    sh = (uint16_t)LCD_HEIGHT;
+    g_cam_dbg.crop_sh = (uint16_t)LCD_HEIGHT;
   }
-  /* 先停采集，再整表重新初始化传感器把卡死的行场拉起来，
-   * 然后停流切到小窗，恢复出流后再开 DCMI。不要在开采集之后再刷黑。 */
+  /* 先停采集，硬件掉电复位后直接按小窗初始化。不要在开采集之后再刷黑。
+   * 裁窗用的窗口和步骤时间都放在 g_cam_dbg，J-Link 随时可读。 */
   {
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
@@ -2779,44 +2875,32 @@ static void SpeedTrack_ApplyCrop(void)
   }
   g_cam_dbg.frames_pre = cam_frame_count;
   g_cam_dbg.stamp_pre = cam_stamp_us;
+  CamDbg_Mark(1U);
   (void)HAL_DCMI_Stop(&hdcmi);
   cam_arm = 0U;
   cam_curline = 0U;
   cam_draw_full = 2U;
   LCD_FillBothBlack();
-  OV5640_SetStream(0U);
-  HAL_Delay(10);
-  OV5640_RgbLcdPreview(LCD_WIDTH, LCD_HEIGHT);
-  OV5640_SetStream(0U);
-  HAL_Delay(10);
-  OV5640_SetNativeWindow(sx, sy, sw, sh);
+  OV5640_PowerCycle();
+  CamDbg_Mark(2U);
+  OV5640_RgbLcdNativeWindow(g_cam_dbg.crop_sx, g_cam_dbg.crop_sy,
+                            g_cam_dbg.crop_sw, g_cam_dbg.crop_sh);
+  CamDbg_Mark(3U);
   CAM_LoadView();
   HAL_Delay(20);
-  OV5640_SetStream(1U);
-  HAL_Delay(50);
+  CamDbg_Mark(4U);
   CAM_Start();
   HAL_Delay(20);
-  g_cam_dbg.kick_ret = 0;
-  g_cam_dbg.dcmi_cr = hdcmi.Instance->CR;
-  g_cam_dbg.dcmi_sr = hdcmi.Instance->SR;
-  g_cam_dbg.dcmi_ris = hdcmi.Instance->RISR;
-  {
-    DMA_Stream_TypeDef *dma = (DMA_Stream_TypeDef *)hdma_dcmi.Instance;
-    g_cam_dbg.dma_cr = (dma != 0) ? dma->CR : 0U;
-    g_cam_dbg.dma_ndtr = (dma != 0) ? dma->NDTR : 0U;
-  }
-  {
-    uint16_t sys = 0U, out_w = 0U, hts = 0U, vts = 0U;
-    OV5640_SnapRegs(&sys, &out_w, &hts, &vts);
-    g_cam_dbg.rb_sys = sys;
-    g_cam_dbg.rb_out_w = out_w;
-    g_cam_dbg.rb_hts = hts;
-    g_cam_dbg.rb_vts = vts;
-  }
+  CamDbg_Mark(5U);
+  CamDbg_SnapSensor();
+  HAL_Delay(80);
+  CamDbg_Mark(6U);
+  CamDbg_SnapLive();
   cam_hold = 0U;
   SpeedTrack_Shift(&g_speed, (int16_t)(-(int16_t)g_speed.crop.x),
                    (int16_t)(-(int16_t)g_speed.crop.y));
   speed_phase = 1U;
+  CamDbg_Mark(7U);
 }
 
 /* 转速模式：先借用四指针结果定位升针，再另找梅花轮，然后裁窗。裁窗后不再跑表盘算法。 */

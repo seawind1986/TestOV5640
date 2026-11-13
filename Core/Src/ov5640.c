@@ -1046,13 +1046,11 @@ static void OV5640_FitOutput(void)
     {
       hneed = (uint32_t)cap_w * 2U + 8U;
     }
-    /* 填屏预览保留原下限，避免大窗读不完。裁窗 1:1 时放开，才能把帧率抬到测 10 齿/s 所需。 */
-    if (ov5640_native == 0U)
+    /* 预览和大窗必须盖住读出窗口。小窗也沿用同一行周期下限，
+     * 帧率改用拉长 VTS 到约 50 fps；行时间骤降时 ISP 会停，不再出同步。 */
+    if (hneed < 0x0790U)
     {
-      if (hneed < 0x0790U)
-      {
-        hneed = 0x0790U;
-      }
+      hneed = 0x0790U;
     }
     hts = (uint16_t)(hneed + 252U);
     vneed = timing_h + 32U;
@@ -1232,10 +1230,71 @@ void OV5640_SnapRegs(uint16_t *sys, uint16_t *out_w, uint16_t *hts, uint16_t *vt
   }
 }
 
+static uint16_t OV5640_ReadU16(uint16_t reg)
+{
+  uint8_t hi = 0U;
+  uint8_t lo = 0U;
+
+  (void)SCCB_ReadReg(reg, &hi);
+  (void)SCCB_ReadReg((uint16_t)(reg + 1U), &lo);
+  return (uint16_t)(((uint16_t)hi << 8) | lo);
+}
+
+void OV5640_SnapCropRegs(uint16_t *out_h, uint16_t *x0, uint16_t *y0, uint16_t *x1, uint16_t *y1,
+                         uint8_t *sub, uint8_t *r20, uint8_t *r21, uint8_t *dvp)
+{
+  uint8_t v = 0U;
+
+  if (out_h != 0)
+  {
+    *out_h = OV5640_ReadU16(0x380AU);
+  }
+  if (x0 != 0)
+  {
+    *x0 = OV5640_ReadU16(0x3800U);
+  }
+  if (y0 != 0)
+  {
+    *y0 = OV5640_ReadU16(0x3802U);
+  }
+  if (x1 != 0)
+  {
+    *x1 = OV5640_ReadU16(0x3804U);
+  }
+  if (y1 != 0)
+  {
+    *y1 = OV5640_ReadU16(0x3806U);
+  }
+  if (sub != 0)
+  {
+    v = 0U;
+    (void)SCCB_ReadReg(0x3814U, &v);
+    *sub = v;
+  }
+  if (r20 != 0)
+  {
+    v = 0U;
+    (void)SCCB_ReadReg(0x3820U, &v);
+    *r20 = v;
+  }
+  if (r21 != 0)
+  {
+    v = 0U;
+    (void)SCCB_ReadReg(0x3821U, &v);
+    *r21 = v;
+  }
+  if (dvp != 0)
+  {
+    v = 0U;
+    (void)SCCB_ReadReg(0x3017U, &v);
+    *dvp = v;
+  }
+}
 
 
 
-void OV5640_RgbLcdPreview(uint16_t width, uint16_t height)
+
+static void OV5640_RgbLcdSetup(void)
 {
   static const uint8_t light_auto[7] = { 0x04U, 0x00U, 0x04U, 0x00U, 0x04U, 0x00U, 0x00U };
   static const uint8_t sat0[6] = { 0x1AU, 0x66U, 0x80U, 0x82U, 0x80U, 0x02U };
@@ -1292,12 +1351,10 @@ void OV5640_RgbLcdPreview(uint16_t width, uint16_t height)
   (void)SCCB_WriteReg(0x530AU, 0x30U);
   (void)SCCB_WriteReg(0x530BU, 0x04U);
   (void)SCCB_WriteReg(0x530CU, 0x06U);
+}
 
-  /* 上电以画面中心为原点，再按同一比例缩进屏幕。 */
-  (void)width;
-  (void)height;
-  OV5640_ShowOnLcd(ov5640_src_x, ov5640_src_y, ov5640_win_w, ov5640_win_h);
-
+static void OV5640_RgbLcdFinish(void)
+{
   /* 自动曝光的目标亮度。消纹步长在开窗写完行场之后再算。 */
   (void)SCCB_WriteReg(0x3A0FU, 0x60U);
   (void)SCCB_WriteReg(0x3A10U, 0x58U);
@@ -1340,6 +1397,39 @@ void OV5640_RgbLcdPreview(uint16_t width, uint16_t height)
       ov5640_rb_bright = hi;
     }
   }
+}
+
+void OV5640_PowerCycle(void)
+{
+  /* 硬件掉电再复位，让 ISP 和 DVP 从干净状态起步。 */
+  Cam_Pwdn(1U);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_RESET);
+  HAL_Delay(20);
+  Cam_Pwdn(0U);
+  HAL_Delay(5);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET);
+  HAL_Delay(20);
+}
+
+void OV5640_RgbLcdPreview(uint16_t width, uint16_t height)
+{
+  (void)width;
+  (void)height;
+  OV5640_RgbLcdSetup();
+  /* 上电以画面中心为原点，再按同一比例缩进屏幕。 */
+  OV5640_ShowOnLcd(ov5640_src_x, ov5640_src_y, ov5640_win_w, ov5640_win_h);
+  OV5640_RgbLcdFinish();
+}
+
+void OV5640_RgbLcdNativeWindow(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
+{
+  /* 复位后直接按小窗初始化，避免先开大窗再改行周期把同步卡死。 */
+  OV5640_RgbLcdSetup();
+  OV5640_SetStream(0U);
+  HAL_Delay(10);
+  OV5640_SetNativeWindow(x, y, width, height);
+  OV5640_SetStream(1U);
+  OV5640_RgbLcdFinish();
 }
 
 /* 10 秒一个来回：前 5 秒释放到最远，后 5 秒单次对焦。 */
