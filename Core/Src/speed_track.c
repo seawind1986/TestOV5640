@@ -19,7 +19,8 @@
 #define TXT_G      0
 #define TXT_B      0
 #define CROP_MARGIN 80
-#define CROP_LEFT_GUARD 360 /* 若第一刀落在右侧邻针，先向左扩出升针再精裁 */
+#define CROP_LEFT_GUARD 360 /* 保留：第一刀不再用它扩边 */
+#define SHENG_PITCH 210    /* 全幅最左一根多半是 ×0.001，升针在它左边约一个表盘距 */
 #define NEEDLE_MIN_R 50   /* 升针在当前物距下半径约 80–110，拒掉壳上小红斑 */
 #define NEEDLE_MIN_R_LO 30 /* 被裁切的升针可能略小于 50 */
 #define NEEDLE_LEFT_GAP 40 /* 左边再有一根明显更靠左的针，就用左边这根 */     /* 贴合升针，但留足边距，避免画面过小 */
@@ -996,9 +997,15 @@ int SpeedTrack_RefineCrop(const uint16_t *rgb, uint16_t stride, uint16_t w, uint
   if (th < 80) { th = 80; }
   x0 = (int)st->needle.cx - (tw / 2);
   y0 = (int)st->needle.cy - (th / 2);
+  /* 若找到的仍在窗口右半，多半还是邻针，把紧窗改到它左边一个表盘距。 */
+  if ((int)st->needle.cx > ((int)w / 2))
+  {
+    x0 = (int)st->needle.cx - SHENG_PITCH - (tw / 2);
+    y0 = (int)st->needle.cy - (th / 2);
+  }
   x0 &= ~1;
   y0 &= ~1;
-  /* 第一刀常是加宽窗口，即使邻针不贴边也要收成以最左针为中心的紧窗。 */
+  /* 已经对准升针且窗口足够紧就不必再裁。 */
   if ((x0 > -8) && (x0 < 8) && (y0 > -8) && (y0 < 8) &&
       (((int)w - tw) > -16) && (((int)w - tw) < 16) &&
       (((int)h - th) > -16) && (((int)h - th) < 16))
@@ -1305,12 +1312,17 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
 {
   int x0, y0, x1, y1;
   int m = CROP_MARGIN;
+  int cx;
+  int cy;
 
   if ((st == 0) || (st->needle.found == 0U)) { return; }
-  x0 = st->needle.cx - st->needle.r - m - CROP_LEFT_GUARD;
-  y0 = st->needle.cy - st->needle.r - m;
-  x1 = st->needle.cx + st->needle.r + m;
-  y1 = st->needle.cy + st->needle.r + m;
+  /* 全幅认到的最左针通常是 ×0.001，第一刀改对准它左边的升针。 */
+  cx = (int)st->needle.cx - SHENG_PITCH;
+  cy = (int)st->needle.cy;
+  x0 = cx - (int)st->needle.r - m;
+  y0 = cy - (int)st->needle.r - m;
+  x1 = cx + (int)st->needle.r + m;
+  y1 = cy + (int)st->needle.r + m;
   if (x0 < 0) { x0 = 0; }
   if (y0 < 0) { y0 = 0; }
   if (x1 > ((int)frame_w - 1)) { x1 = (int)frame_w - 1; }
