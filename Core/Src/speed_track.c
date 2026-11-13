@@ -9,13 +9,17 @@
 #define RED_BMAX   190
 #define DARK_Y     115
 #define MAX_BLOB   16
+#define LIVE_PATH  0x0000U  /* 轨迹圆：黑线 */
+#define LIVE_LEAD  0xFFFFU  /* 前沿点：白点 */
 #define LIVE_CIRC  0x07E0U
 #define LIVE_PTR   0x029FU
 #define LIVE_STAR  0xFFE0U
 #define TXT_R      255
 #define TXT_G      0
 #define TXT_B      0
-#define CROP_MARGIN 80  /* 28 时梅花轮仍会被切到右缘，四周再留余量 */
+#define CROP_MARGIN 10     /* 只包升针，少留空边 */
+#define FLOW_WIN_MIN_US 1000000U  /* 至少跨 1 s 再报流速 */
+#define FLOW_WIN_US     2000000U  /* 按约 2 s 窗口滑动 */
 #define MIN_FPS_X10 20   /* 10 齿/s 的奈奎斯特下限：每秒至少 20 帧 */
 
 /* Inverse rectify (rectified -> captured), copied from dial_read.c; that file is not edited. */
@@ -219,9 +223,10 @@ static void bit_set(uint8_t *b, uint32_t i)
   b[i >> 3] = (uint8_t)(b[i >> 3] | (uint8_t)(1U << (i & 7U)));
 }
 
-static int flood_dark(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
-                      int x0lim, int y0lim, int x1lim, int y1lim,
-                      uint8_t *work, uint32_t work_bytes, blob_t *out, int max_out)
+static int flood_blobs(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                       int x0lim, int y0lim, int x1lim, int y1lim,
+                       uint8_t *work, uint32_t work_bytes, blob_t *out, int max_out,
+                       int mode)
 {
   uint16_t dw;
   uint16_t dh;
@@ -263,7 +268,8 @@ static int flood_dark(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t
       blob_t bl;
       if (bit_get(vis, id)) { continue; }
       unpack(pix(rgb, stride, x, y), &r, &g, &b);
-      ok = (luma(r, g, b) < DARK_Y) && (is_red(r, g, b) == 0);
+      if (mode == 0) { ok = is_red(r, g, b); }
+      else { ok = (luma(r, g, b) < DARK_Y) && (is_red(r, g, b) == 0); }
       if (ok == 0) { continue; }
 
       qh = 0U;
@@ -286,7 +292,8 @@ static int flood_dark(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t
         px = cx * 2;
         py = cy * 2;
         unpack(pix(rgb, stride, px, py), &r, &g, &b);
-        ok = (luma(r, g, b) < DARK_Y) && (is_red(r, g, b) == 0);
+        if (mode == 0) { ok = is_red(r, g, b); }
+        else { ok = (luma(r, g, b) < DARK_Y) && (is_red(r, g, b) == 0); }
         if (ok == 0) { continue; }
         bl.n++;
         bl.sx += px;
@@ -314,13 +321,21 @@ static int flood_dark(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t
           }
         }
       }
-      if ((bl.n >= 80) && (nout < max_out))
+      if ((bl.n >= ((mode == 0) ? 20 : 80)) && (nout < max_out))
       {
         out[nout++] = bl;
       }
     }
   }
   return nout;
+}
+
+static int flood_dark(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                      int x0lim, int y0lim, int x1lim, int y1lim,
+                      uint8_t *work, uint32_t work_bytes, blob_t *out, int max_out)
+{
+  return flood_blobs(rgb, stride, w, h, x0lim, y0lim, x1lim, y1lim,
+                     work, work_bytes, out, max_out, 1);
 }
 
 static int blob_cx(const blob_t *b)
@@ -592,6 +607,136 @@ void SpeedTrack_Shift(speed_state_t *st, int16_t dx, int16_t dy)
   st->have_speed = 0U;
 }
 
+
+static int count_red_near(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                          int cx, int cy, int rad)
+{
+  int x, y, n = 0;
+  int r, g, b;
+  for (y = cy - rad; y <= (cy + rad); y++)
+  {
+    if ((y < 0) || (y >= (int)h)) { continue; }
+    for (x = cx - rad; x <= (cx + rad); x++)
+    {
+      if ((x < 0) || (x >= (int)w)) { continue; }
+      if ((((x - cx) * (x - cx)) + ((y - cy) * (y - cy))) > (rad * rad)) { continue; }
+      unpack(pix(rgb, stride, x, y), &r, &g, &b);
+      if (is_red(r, g, b)) { n++; }
+    }
+  }
+  return n;
+}
+
+/* 从红色连通块里取出针根和针尖，枢纽沿轴线往针尖收一点。 */
+static int pointer_from_blob(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                             const blob_t *bl, int *hx, int *hy, int *tx, int *ty, int *pr)
+{
+  int x, y;
+  int x0 = (int)bl->x0 - 2;
+  int y0 = (int)bl->y0 - 2;
+  int x1 = (int)bl->x1 + 2;
+  int y1 = (int)bl->y1 + 2;
+  int mx = blob_cx(bl);
+  int my = blob_cy(bl);
+  int ax = -1, ay = -1, bx = -1, by = -1;
+  int32_t best = -1;
+  int da, db;
+  int hx0, hy0, tx0, ty0, rr;
+
+  if (x0 < 0) { x0 = 0; }
+  if (y0 < 0) { y0 = 0; }
+  if (x1 >= (int)w) { x1 = (int)w - 1; }
+  if (y1 >= (int)h) { y1 = (int)h - 1; }
+
+  for (y = y0; y <= y1; y++)
+  {
+    for (x = x0; x <= x1; x++)
+    {
+      int r, g, b;
+      int32_t d2;
+      unpack(pix(rgb, stride, x, y), &r, &g, &b);
+      if (is_red(r, g, b) == 0) { continue; }
+      d2 = (int32_t)(x - mx) * (x - mx) + (int32_t)(y - my) * (y - my);
+      if (d2 > best) { best = d2; ax = x; ay = y; }
+    }
+  }
+  if ((ax < 0) || (best < (20 * 20))) { return -1; }
+
+  best = -1;
+  for (y = y0; y <= y1; y++)
+  {
+    for (x = x0; x <= x1; x++)
+    {
+      int r, g, b;
+      int32_t d2;
+      unpack(pix(rgb, stride, x, y), &r, &g, &b);
+      if (is_red(r, g, b) == 0) { continue; }
+      d2 = (int32_t)(x - ax) * (x - ax) + (int32_t)(y - ay) * (y - ay);
+      if (d2 > best) { best = d2; bx = x; by = y; }
+    }
+  }
+  if ((bx < 0) || (best < (20 * 20))) { return -1; }
+
+  da = count_red_near(rgb, stride, w, h, ax, ay, 7);
+  db = count_red_near(rgb, stride, w, h, bx, by, 7);
+  if (da <= db) { tx0 = ax; ty0 = ay; hx0 = bx; hy0 = by; }
+  else { tx0 = bx; ty0 = by; hx0 = ax; hy0 = ay; }
+
+  /* 真枢轴在针根往针尖约 18% 处，轨迹半径用枢纽到针尖。 */
+  hx0 = hx0 + (((tx0 - hx0) * 18) / 100);
+  hy0 = hy0 + (((ty0 - hy0) * 18) / 100);
+  rr = (int)isqrt32((uint32_t)((tx0 - hx0) * (tx0 - hx0) + (ty0 - hy0) * (ty0 - hy0)));
+  if (rr < 24) { return -1; }
+  if (rr > 180) { return -1; }
+  /* 在略小于针尖的半径上跟前沿，红弧更宽、更稳。 */
+  *pr = (rr * 85) / 100;
+  if (*pr < 20) { *pr = 20; }
+  *hx = hx0;
+  *hy = hy0;
+  *tx = tx0;
+  *ty = ty0;
+  return 0;
+}
+
+int SpeedTrack_FindNeedle(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                          uint8_t *work, uint32_t work_bytes, speed_state_t *st)
+{
+  blob_t red[MAX_BLOB];
+  int n;
+  int i;
+  int best = -1;
+  int best_x = 0x7FFFFFFF;
+  int hx, hy, tx, ty, rr;
+
+  if ((rgb == 0) || (st == 0)) { return -1; }
+  n = flood_blobs(rgb, stride, w, h, 0, 0, (int)w, (int)h,
+                  work, work_bytes, red, MAX_BLOB, 0);
+  for (i = 0; i < n; i++)
+  {
+    if (pointer_from_blob(rgb, stride, w, h, &red[i], &hx, &hy, &tx, &ty, &rr) != 0)
+    {
+      continue;
+    }
+    /* 四个红针里，升针是最左边的 ×0.0001。 */
+    if (hx < best_x)
+    {
+      best_x = hx;
+      best = i;
+      st->needle.found = 1U;
+      st->needle.cx = (int16_t)hx;
+      st->needle.cy = (int16_t)hy;
+      st->needle.r = (int16_t)rr;
+      st->needle.hub_r = (int16_t)((rr * 30) / 85);
+      if (st->needle.hub_r < 8) { st->needle.hub_r = 8; }
+      st->needle.tip_x = (int16_t)tx;
+      st->needle.tip_y = (int16_t)ty;
+      st->needle.ang_mdeg = atan2_mdeg(ty - hy, tx - hx);
+    }
+  }
+  if ((best < 0) || (st->needle.found == 0U)) { return -1; }
+  return 0;
+}
+
 int SpeedTrack_TakeNeedle(const dial_report_t *rep, speed_state_t *st)
 {
   const dial_info_t *d = 0;
@@ -703,15 +848,11 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
   int x0, y0, x1, y1;
   int m = CROP_MARGIN;
 
-  if ((st == 0) || (st->needle.found == 0U) || (st->star.found == 0U)) { return; }
-  x0 = st->star.cx - st->star.r - m;
-  y0 = st->star.cy - st->star.r - m;
-  x1 = st->star.cx + st->star.r + m;
-  y1 = st->star.cy + st->star.r + m;
-  if ((st->needle.cx - st->needle.r - m) < x0) { x0 = st->needle.cx - st->needle.r - m; }
-  if ((st->needle.cy - st->needle.r - m) < y0) { y0 = st->needle.cy - st->needle.r - m; }
-  if ((st->needle.cx + st->needle.r + m) > x1) { x1 = st->needle.cx + st->needle.r + m; }
-  if ((st->needle.cy + st->needle.r + m) > y1) { y1 = st->needle.cy + st->needle.r + m; }
+  if ((st == 0) || (st->needle.found == 0U)) { return; }
+  x0 = st->needle.cx - st->needle.r - m;
+  y0 = st->needle.cy - st->needle.r - m;
+  x1 = st->needle.cx + st->needle.r + m;
+  y1 = st->needle.cy + st->needle.r + m;
   if (x0 < 0) { x0 = 0; }
   if (y0 < 0) { y0 = 0; }
   if (x1 > ((int)frame_w - 1)) { x1 = (int)frame_w - 1; }
@@ -720,8 +861,8 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
   y0 &= ~1;
   x1 = (x1 + 1) & ~1;
   y1 = (y1 + 1) & ~1;
-  if ((x1 - x0) < 160) { x1 = x0 + 160; }
-  if ((y1 - y0) < 120) { y1 = y0 + 120; }
+  if ((x1 - x0) < 80) { x1 = x0 + 80; }
+  if ((y1 - y0) < 80) { y1 = y0 + 80; }
   if (x1 > (int)frame_w)
   {
     x0 -= (x1 - (int)frame_w);
@@ -742,37 +883,180 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
   st->track_ok = 1U;
 }
 
+
+/* 在冻结的轨迹圆上找红弧沿运动方向的前沿。dir=0 时先扫整圈取最长红弧。 */
+static int ring_lead(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                     int cx, int cy, int R, int32_t pred_mdeg, int32_t dir,
+                     int *lx, int *ly, int32_t *ang)
+{
+  uint8_t red[360];
+  int a;
+  int a0;
+  int a1;
+  int i;
+  int n;
+  int best_len = 0;
+  int best_s = 0;
+  int lead;
+  int wrap_scan;
+
+  if (R < 8) { return -1; }
+  if ((pred_mdeg < 0) || (dir == 0))
+  {
+    a0 = 0;
+    a1 = 359;
+  }
+  else
+  {
+    int mid = norm_mdeg(pred_mdeg) / 1000;
+    int back = 15;
+    int ahead = 40;
+    if (dir > 0) { a0 = mid - back; a1 = mid + ahead; }
+    else { a0 = mid - ahead; a1 = mid + back; }
+  }
+
+  n = 0;
+  memset(red, 0, sizeof(red));
+  for (a = a0; a <= a1; a++)
+  {
+    int aa = a;
+    int x, y, r, g, b;
+    while (aa < 0) { aa += 360; }
+    while (aa >= 360) { aa -= 360; }
+    x = cx + (int)(((int32_t)icos(aa) * R) / 256);
+    y = cy + (int)(((int32_t)isin(aa) * R) / 256);
+    if ((x < 0) || (y < 0) || (x >= (int)w) || (y >= (int)h)) { continue; }
+    unpack(pix(rgb, stride, x, y), &r, &g, &b);
+    red[aa] = (uint8_t)(is_red(r, g, b) ? 1U : 0U);
+    n++;
+  }
+  if (n < 8) { return -1; }
+
+  /* 填 1～2 度的小孔，避免红弧被拆开。 */
+  for (i = 0; i < 360; i++)
+  {
+    int p = (i + 359) % 360;
+    int q = (i + 1) % 360;
+    if ((red[i] == 0U) && (red[p] != 0U) && (red[q] != 0U)) { red[i] = 1U; }
+  }
+  for (i = 0; i < 360; i++)
+  {
+    int p = (i + 359) % 360;
+    int q = (i + 2) % 360;
+    int m = (i + 1) % 360;
+    if ((red[i] == 0U) && (red[p] != 0U) && (red[q] != 0U))
+    {
+      red[i] = 1U;
+      red[m] = 1U;
+    }
+  }
+
+  wrap_scan = ((a0 == 0) && (a1 == 359)) ? 1 : 0;
+  i = 0;
+  while (i < 360)
+  {
+    int s;
+    int e;
+    int len;
+    if (red[i] == 0U) { i++; continue; }
+    s = i;
+    e = i;
+    while ((e < 359) && (red[e + 1] != 0U)) { e++; }
+    if ((wrap_scan != 0) && (s == 0) && (red[359] != 0U))
+    {
+      /* 整圈扫描时，把跨 0° 的弧并到最后一段去处理。 */
+      i = e + 1;
+      continue;
+    }
+    len = e - s + 1;
+    if ((wrap_scan != 0) && (e == 359) && (red[0] != 0U))
+    {
+      int j = 0;
+      while ((j < s) && (red[j] != 0U)) { j++; }
+      len = (e - s + 1) + j;
+      e = j - 1;
+    }
+    if (len > best_len)
+    {
+      best_len = len;
+      best_s = s;
+      /* stash end in best via encode: keep lead later from s/len */
+      if (e < s) { best_s = s; /* wrap, end = e */ }
+    }
+    /* store end in red as we need both; use a second pass on winner */
+    i = (e >= s) ? (e + 1) : 360;
+  }
+
+  /* 再扫一次拿到最长弧的起止角。 */
+  {
+    int win_s = 0, win_e = 0;
+    best_len = 0;
+    i = 0;
+    while (i < 360)
+    {
+      int s, e, len;
+      if (red[i] == 0U) { i++; continue; }
+      s = i;
+      e = i;
+      while ((e < 359) && (red[e + 1] != 0U)) { e++; }
+      len = e - s + 1;
+      if ((wrap_scan != 0) && (e == 359) && (red[0] != 0U))
+      {
+        int j = 0;
+        while ((j < 360) && (red[j] != 0U) && (j < s)) { j++; }
+        if (j > 0)
+        {
+          len = (e - s + 1) + j;
+          e = j - 1;
+        }
+      }
+      if ((wrap_scan != 0) && (s == 0) && (red[359] != 0U) && (e < 359))
+      {
+        i = e + 1;
+        continue;
+      }
+      if (len > best_len)
+      {
+        best_len = len;
+        win_s = s;
+        win_e = e;
+      }
+      i = (e >= s) ? (e + 1) : 360;
+    }
+    if (best_len < 3) { return -1; }
+    if (dir > 0) { lead = win_e; }
+    else if (dir < 0) { lead = win_s; }
+    else { lead = (win_e >= win_s) ? ((win_s + win_e) / 2) : (((win_s + win_e + 360) / 2) % 360); }
+  }
+
+  *lx = cx + (int)(((int32_t)icos(lead) * R) / 256);
+  *ly = cy + (int)(((int32_t)isin(lead) * R) / 256);
+  *ang = lead * 1000;
+  (void)best_s;
+  return 0;
+}
+
 int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
                     uint32_t stamp_us, speed_state_t *st)
 {
-  int cx, cy, hx, hy, tx, ty;
+  int hx, hy, tx, ty, R;
   int32_t ang;
-  int32_t phase;
-  uint32_t dt;
-  int tip_ok;
-  int star_ok;
+  uint32_t step;
+  int lead_ok;
 
   if ((rgb == 0) || (st == 0) || (st->loc_ok == 0U)) { return -1; }
-  cx = st->star.cx;
-  cy = st->star.cy;
   hx = st->needle.cx;
   hy = st->needle.cy;
-  refine_center(rgb, stride, w, h, &cx, &cy, st->star.r, 1);
-  refine_center(rgb, stride, w, h, &hx, &hy, st->needle.hub_r, 0);
-  st->star.cx = (int16_t)cx;
-  st->star.cy = (int16_t)cy;
-  st->needle.cx = (int16_t)hx;
-  st->needle.cy = (int16_t)hy;
-
-  tip_ok = needle_tip(rgb, stride, w, h, hx, hy, st->needle.r,
-                      (st->have_prev != 0U) ? st->last_ang : -1, 40,
+  R = st->needle.r;
+  /* 裁窗后枢纽和轨迹圆冻结，只在圆上跟运动方向的前沿。 */
+  lead_ok = ring_lead(rgb, stride, w, h, hx, hy, R,
+                      (st->have_prev != 0U) ? st->last_ang : -1, st->dir_sign,
                       &tx, &ty, &ang);
-  if (tip_ok != 0)
+  if (lead_ok != 0)
   {
-    tip_ok = needle_tip(rgb, stride, w, h, hx, hy, st->needle.r, -1, 180,
-                        &tx, &ty, &ang);
+    lead_ok = ring_lead(rgb, stride, w, h, hx, hy, R, -1, 0, &tx, &ty, &ang);
   }
-  if (tip_ok == 0)
+  if (lead_ok == 0)
   {
     st->needle.tip_x = (int16_t)tx;
     st->needle.tip_y = (int16_t)ty;
@@ -783,69 +1067,79 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
   {
     st->needle.found = 0U;
   }
+  st->track_ok = st->needle.found;
 
-  star_ok = track_star_phase(rgb, stride, w, h, &st->star, &phase);
-  if (star_ok == 0)
+  if ((st->needle.found == 0U))
   {
-    st->star.phase_mdeg = phase;
-    st->star.found = 1U;
+    return 0;
   }
-  else
-  {
-    st->star.found = 0U;
-  }
-  st->track_ok = (uint8_t)((st->needle.found != 0U) && (st->star.found != 0U));
 
   if (st->have_prev == 0U)
   {
     st->stamp_us = stamp_us;
     st->last_ang = st->needle.ang_mdeg;
-    st->last_phase = st->star.phase_mdeg;
+    st->win_t0 = stamp_us;
+    st->win_accum = 0;
+    st->mid_t = 0U;
+    st->mid_accum = 0;
+    st->dir_sign = 0;
     st->have_prev = 1U;
+    st->have_speed = 0U;
+    st->dt_us = 0U;
+    return 0;
+  }
+
+  step = stamp_us - st->stamp_us;
+  st->stamp_us = stamp_us;
+  if (step < 2000U)
+  {
+    return 0;
+  }
+  /* 间隔太长，窗口作废，重新起算。 */
+  if (step > 2000000U)
+  {
+    st->last_ang = st->needle.ang_mdeg;
+    st->win_t0 = stamp_us;
+    st->win_accum = 0;
+    st->mid_t = 0U;
+    st->mid_accum = 0;
     st->have_speed = 0U;
     return 0;
   }
 
-  dt = stamp_us - st->stamp_us;
-  st->dt_us = dt;
-  st->stamp_us = stamp_us;
-  /* 2 ms..500 ms: skip a stalled or implausible gap, but keep unwrapping. */
-  if ((dt < 2000U) || (dt > 500000U))
-  {
-    st->last_ang = st->needle.ang_mdeg;
-    st->last_phase = st->star.phase_mdeg;
-    return 0;
-  }
-
-  if (st->needle.found != 0U)
   {
     int32_t dang = wrap_diff_mdeg(st->needle.ang_mdeg, st->last_ang);
-    /* 升针一圈 1 L（一格 0.1 L）。L/h * 100 = 10 * deg/s * 100
-     * = dang_mdeg * 1000000 / dt_us */
-    int32_t inst = (int32_t)(((int64_t)dang * 1000000LL) / (int64_t)dt);
-    inst = iabs32(inst);
-    st->flow_lh_e2 = inst;
-    if (st->have_speed == 0U) { st->flow_filt_e2 = inst; }
-    else { st->flow_filt_e2 = iir_e2(st->flow_filt_e2, inst, dt); }
+    uint32_t dt;
+    st->win_accum += dang;
     st->last_ang = st->needle.ang_mdeg;
+    if ((st->dir_sign == 0) && (iabs32(st->win_accum) >= 8000))
+    {
+      st->dir_sign = (st->win_accum > 0) ? 1 : -1;
+    }
+    dt = stamp_us - st->win_t0;
+    st->dt_us = dt;
+    if (dt >= FLOW_WIN_MIN_US)
+    {
+      /* 升针一圈 1 L。L/h * 100 = 10 * deg/s * 100
+       * = accum_mdeg * 1000000 / dt_us */
+      int32_t inst = (int32_t)(((int64_t)iabs32(st->win_accum) * 1000000LL) / (int64_t)dt);
+      st->flow_lh_e2 = inst;
+      st->flow_filt_e2 = inst;
+      st->have_speed = 1U;
+    }
+    if ((st->mid_t == 0U) && (dt >= (FLOW_WIN_US / 2U)))
+    {
+      st->mid_t = stamp_us;
+      st->mid_accum = st->win_accum;
+    }
+    if ((dt >= FLOW_WIN_US) && (st->mid_t != 0U) && (st->mid_t > st->win_t0))
+    {
+      st->win_accum -= st->mid_accum;
+      st->win_t0 = st->mid_t;
+      st->mid_t = 0U;
+      st->mid_accum = 0;
+    }
   }
-  if (st->star.found != 0U)
-  {
-    int32_t dph = wrap_diff_mdeg(st->star.phase_mdeg, st->last_phase);
-    int32_t inst = (int32_t)(((int64_t)dph * 100000LL) / (int64_t)dt);
-    inst = iabs32(inst);
-    st->tps_e2 = inst;
-    if (st->have_speed == 0U) { st->tps_filt_e2 = inst; }
-    else { st->tps_filt_e2 = iir_e2(st->tps_filt_e2, inst, dt); }
-    st->last_phase = st->star.phase_mdeg;
-  }
-  if ((st->tps_filt_e2 > 20) && (st->flow_filt_e2 >= 0))
-  {
-    /* ml/p * 1000 = 1e6 * (L/h * 100) / (36 * (齿/s * 100)) */
-    st->mlp_e3 = (int32_t)(((int64_t)st->flow_filt_e2 * 1000000LL) /
-                            ((int64_t)36 * (int64_t)st->tps_filt_e2));
-  }
-  st->have_speed = 1U;
   (void)MIN_FPS_X10;
   return 0;
 }
@@ -1120,7 +1414,7 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
   char l2[32];
   char l3[32];
   char l4[32];
-  int ncx, ncy, scx, scy, x0, y0, x1, y1, tw, lines;
+  int ncx, ncy, x0, y0, x1, y1, tw, lines;
   const int hx = 12;
   const int hy = 8;
   const int gap = 28;
@@ -1130,25 +1424,11 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
 
   ncx = (int)ox + (int)st->needle.cx;
   ncy = (int)oy + (int)st->needle.cy;
-  scx = (int)ox + (int)st->star.cx;
-  scy = (int)oy + (int)st->star.cy;
-  if (st->star.found != 0U)
-  {
-    draw_circle(fb, (int)fb_w, (int)fb_h, scx, scy, st->star.r, LIVE_STAR, 3);
-  }
   if (st->needle.found != 0U)
   {
-    int32_t tdx = (int32_t)st->needle.tip_x - (int32_t)st->needle.cx;
-    int32_t tdy = (int32_t)st->needle.tip_y - (int32_t)st->needle.cy;
-    int32_t tlen = (int32_t)isqrt32((uint32_t)((tdx * tdx) + (tdy * tdy)));
-    draw_circle(fb, (int)fb_w, (int)fb_h, ncx, ncy, st->needle.r, LIVE_CIRC, 3);
-    if (tlen > 8)
-    {
-      int rx = ncx + (int)((tdx * (int32_t)st->needle.r) / tlen);
-      int ry = ncy + (int)((tdy * (int32_t)st->needle.r) / tlen);
-      line_to(fb, (int)fb_w, (int)fb_h, ncx, ncy, rx, ry, LIVE_PTR, 3);
-      plot(fb, (int)fb_w, (int)fb_h, ncx, ncy, LIVE_PTR, 6);
-    }
+    draw_circle(fb, (int)fb_w, (int)fb_h, ncx, ncy, st->needle.r, LIVE_PATH, 2);
+    plot(fb, (int)fb_w, (int)fb_h, (int)ox + (int)st->needle.tip_x,
+         (int)oy + (int)st->needle.tip_y, LIVE_LEAD, 5);
   }
 
   l1[0] = 0;
@@ -1187,13 +1467,20 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
     fmt_signed_frac(num, st->flow_filt_e2, 100, 2);
     p = l2; s = num; while (*s) { *p++ = *s++; }
     *p++ = ' '; *p++ = 'L'; *p++ = '/'; *p++ = 'h'; *p = 0;
-    fmt_signed_frac(num, st->tps_filt_e2, 100, 2);
-    p = l3; s = num; while (*s) { *p++ = *s++; }
-    *p++ = ' '; *p++ = (char)0xD7; *p++ = '/'; *p++ = 's'; *p = 0;
-    fmt_signed_frac(num, st->mlp_e3, 1000, 3);
-    p = l4; s = num; while (*s) { *p++ = *s++; }
-    *p++ = ' '; *p++ = 'm'; *p++ = 'l'; *p++ = '/'; *p++ = 'p'; *p = 0;
-    lines = 4;
+    /* 秒/圈 = 3600 / (L/h)，乘 100 以便两位小数。 */
+    if (st->flow_filt_e2 > 0)
+    {
+      int32_t per_e2 = (int32_t)(36000000LL / (int64_t)st->flow_filt_e2);
+      fmt_signed_frac(num, per_e2, 100, 2);
+      p = l3; s = num; while (*s) { *p++ = *s++; }
+      *p++ = ' '; *p++ = 's'; *p = 0;
+    }
+    else
+    {
+      l3[0] = '-'; l3[1] = '-'; l3[2] = '-'; l3[3] = 0;
+    }
+    l4[0] = 0;
+    lines = 3;
   }
   else
   {

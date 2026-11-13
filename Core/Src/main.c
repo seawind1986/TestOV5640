@@ -2846,13 +2846,13 @@ static void SpeedTrack_ApplyCrop(void)
                                  / (uint32_t)g_cam_dbg.cap_h);
   g_cam_dbg.crop_sw = (uint16_t)(g_cam_dbg.crop_sw & (uint16_t)~1U);
   g_cam_dbg.crop_sh = (uint16_t)(g_cam_dbg.crop_sh & (uint16_t)~1U);
-  if (g_cam_dbg.crop_sw < 160U)
+  if (g_cam_dbg.crop_sw < 80U)
   {
-    g_cam_dbg.crop_sw = 160U;
+    g_cam_dbg.crop_sw = 80U;
   }
-  if (g_cam_dbg.crop_sh < 120U)
+  if (g_cam_dbg.crop_sh < 80U)
   {
-    g_cam_dbg.crop_sh = 120U;
+    g_cam_dbg.crop_sh = 80U;
   }
   if (g_cam_dbg.crop_sw > LCD_WIDTH)
   {
@@ -2903,10 +2903,9 @@ static void SpeedTrack_ApplyCrop(void)
   CamDbg_Mark(7U);
 }
 
-/* 转速模式：先借用四指针结果定位升针，再另找梅花轮，然后裁窗。裁窗后不再跑表盘算法。 */
+/* 转速模式：在实时画面上直接找升针，不跑表盘算法，不跟梅花轮。裁窗后沿轨迹圆跟前沿。 */
 static void SpeedTrack_Service(void)
 {
-  static dial_report_t loc_rep;
   uint32_t wb;
 
   if (METER_MODE != METER_MODE_SPEED)
@@ -2926,19 +2925,9 @@ static void SpeedTrack_Service(void)
   {
     return;
   }
-  DialRead_CopyShown((uint16_t *)DIAL_SNAP_ADDR);
-  (void)DialRead_Run((const uint16_t *)DIAL_SNAP_ADDR,
-                     (uint16_t *)DIAL_SNAP_ADDR,
-                     (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
-                     (uint8_t *)DIAL_WORK_ADDR, wb, &loc_rep);
-  if (SpeedTrack_TakeNeedle(&loc_rep, &g_speed) != 0)
-  {
-    return;
-  }
-  /* 梅花轮在实时画面上找，不要用被整流过的分析副本。 */
-  if (SpeedTrack_FindStar((const uint16_t *)lcd_frame_addr, (uint16_t)LCD_WIDTH,
-                          (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
-                          (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed) != 0)
+  if (SpeedTrack_FindNeedle((const uint16_t *)lcd_frame_addr, (uint16_t)LCD_WIDTH,
+                            (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
+                            (uint8_t *)DIAL_WORK_ADDR, wb, &g_speed) != 0)
   {
     return;
   }
