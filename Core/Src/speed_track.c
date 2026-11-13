@@ -617,7 +617,16 @@ int32_t  g_rev_best_d;      /* 与起点的最小角距，mdeg */
 int32_t  g_rev_best_accum;
 uint32_t g_rev_best_t;
 int32_t  g_rev_best_ang;
-uint16_t g_rev_seq;        /* 每测完一圈加一，HUD 显示 [001] */
+uint16_t g_rev_seq;        /* 每测完一次加一，HUD 显示 [001] */
+/* 多圈测量窗：单圈 <10 s 累加到总时长 >30 s；10~20 s 跑 2 圈；>20 s 跑 1 圈。 */
+#define MW_FAST_US    10000000U
+#define MW_SLOW_US    20000000U
+#define MW_TOTAL_US   30000000U
+uint32_t g_mw_t0;           /* 测量窗起点时刻 */
+int32_t  g_mw_accum;        /* 测量窗内整圈角度之和，mdeg */
+uint8_t  g_mw_laps;         /* 测量窗内已走整圈数 */
+uint8_t  g_mw_target;       /* 本次判定需要的圈数（0 = 按总时长 >30 s） */
+uint32_t g_mw_lap_us;       /* 最近一整圈用时 */
 uint32_t g_frame_dt_us;     /* 当前针位与上一帧的时间差，TIM2 微秒 */
 int32_t  g_meas_flow_e2[MEAS_HIST];
 uint32_t g_meas_dt_us[MEAS_HIST];
@@ -662,6 +671,9 @@ static void rev_start(uint32_t stamp, int32_t ang)
   g_rev_best_accum = 0;
   g_rev_best_t = stamp;
   g_rev_best_ang = ang;
+  g_mw_t0 = stamp;
+  g_mw_accum = 0;
+  g_mw_laps = 0U;
 }
 
 static void meas_record(int32_t flow_e2, uint32_t dt_us, int32_t accum)
@@ -2239,19 +2251,58 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
         else if (off > (g_rev_best_d + REV_PASS_MDEG))
         {
           uint32_t dt = g_rev_best_t - g_rev_t0;
+          uint32_t keep_t0 = g_mw_t0;
+          int32_t keep_acc = g_mw_accum;
+          uint8_t keep_laps = g_mw_laps;
+          uint8_t keep = 0U;
           if ((dt >= 2000000U) && (iabs32(g_rev_best_accum) >= 250000))
           {
-            int32_t inst = (int32_t)(((int64_t)iabs32(g_rev_best_accum) * 1000000LL) / (int64_t)dt);
-            st->flow_lh_e2 = inst;
-            st->flow_filt_e2 = inst;
-            st->have_speed = 1U;
-            st->dt_us = dt;
-            if (g_rev_seq < 999U) { g_rev_seq++; }
-            else { g_rev_seq = 1U; }
-            meas_record(inst, dt, g_rev_best_accum);
+            uint32_t tot;
+            uint8_t done = 0U;
+            keep_acc += iabs32(g_rev_best_accum);
+            keep_laps++;
+            tot = g_rev_best_t - keep_t0;
+            g_mw_lap_us = dt;
+            /* 按本圈用时定圈数；单圈 >=25 s 时 1 圈已 >30 s，同样至少跑满 1 圈。 */
+            if (dt > MW_SLOW_US)
+            {
+              g_mw_target = 1U;
+              done = 1U;
+            }
+            else if (dt >= MW_FAST_US)
+            {
+              g_mw_target = 2U;
+              if (keep_laps >= 2U) { done = 1U; }
+            }
+            else
+            {
+              g_mw_target = 0U;
+              if (tot > MW_TOTAL_US) { done = 1U; }
+            }
+            if (done != 0U)
+            {
+              int32_t inst = (int32_t)(((int64_t)keep_acc * 1000000LL) / (int64_t)tot);
+              st->flow_lh_e2 = inst;
+              st->flow_filt_e2 = inst;
+              st->have_speed = 1U;
+              st->dt_us = tot;
+              if (g_rev_seq < 999U) { g_rev_seq++; }
+              else { g_rev_seq = 1U; }
+              meas_record(inst, tot, keep_acc);
+            }
+            else
+            {
+              keep = 1U;
+            }
           }
-          /* 最近点这一帧作为下一圈的起点。 */
+          /* 最近点这一帧作为下一圈的起点；测量窗未满则接着累加。 */
           rev_start(g_rev_best_t, g_rev_best_ang);
+          if (keep != 0U)
+          {
+            g_mw_t0 = keep_t0;
+            g_mw_accum = keep_acc;
+            g_mw_laps = keep_laps;
+          }
           g_rev_accum = wrap_diff_mdeg(st->needle.ang_mdeg, g_rev_best_ang);
         }
       }
