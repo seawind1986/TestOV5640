@@ -35,6 +35,7 @@
 #define REV_HUNT_MDEG  300000    /* 走出约 0.83 圈后再找与起点最接近的位置 */
 #define REV_PASS_MDEG    4000    /* 比最近点再偏 4°，视为已经越过 */
 #define MEAS_HIST      10      /* 最近 10 次一圈测量 */
+#define MEAS_REP_MIN   4       /* 超过 3 次就开始算重复性 */
 #define MIN_FPS_X10 20   /* 10 齿/s 的奈奎斯特下限：每秒至少 20 帧 */
 
 /* Inverse rectify (rectified -> captured), copied from dial_read.c; that file is not edited. */
@@ -679,24 +680,26 @@ static void meas_record(int32_t flow_e2, uint32_t dt_us, int32_t accum)
 
   g_flow_avg_e2 = 0;
   g_flow_rep_e4 = 0;
-  if (g_meas_n >= (uint8_t)MEAS_HIST)
+  /* 超过 3 次就用当前已有样本算 s / 平均 × 100%；满 10 次后用最近 10 次。 */
+  if (g_meas_n >= (uint8_t)MEAS_REP_MIN)
   {
+    int n = (int)g_meas_n;
     sum = 0;
-    for (k = 0; k < MEAS_HIST; k++)
+    for (k = 0; k < n; k++)
     {
       sum += g_meas_flow_e2[k];
     }
-    mean = (int32_t)((sum + (int64_t)(MEAS_HIST / 2)) / (int64_t)MEAS_HIST);
+    mean = (int32_t)((sum + (int64_t)(n / 2)) / (int64_t)n);
     g_flow_avg_e2 = mean;
     if (mean > 0)
     {
       ss = 0;
-      for (k = 0; k < MEAS_HIST; k++)
+      for (k = 0; k < n; k++)
       {
         int64_t d = (int64_t)g_meas_flow_e2[k] - (int64_t)mean;
         ss += d * d;
       }
-      s = isqrt32((uint32_t)(ss / (int64_t)(MEAS_HIST - 1)));
+      s = isqrt32((uint32_t)(ss / (int64_t)(n - 1)));
       g_flow_rep_e4 = (int32_t)((((int64_t)s * 1000000LL) + ((int64_t)mean / 2)) / (int64_t)mean);
     }
   }
@@ -2378,8 +2381,8 @@ void SpeedTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
     l1[1] = 0;
   }
 
-  /* 第二行：满 10 次后显示 s / 平均 × 100%；未满则 ---。 */
-  if ((g_meas_n >= (uint8_t)MEAS_HIST) && (g_flow_avg_e2 > 0))
+  /* 第二行：超过 3 次后显示 s / 平均 × 100%；未满则 ---。 */
+  if ((g_meas_n >= (uint8_t)MEAS_REP_MIN) && (g_flow_avg_e2 > 0))
   {
     char num[16];
     char *p;
