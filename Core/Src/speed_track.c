@@ -820,8 +820,9 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
   if (st->needle.found != 0U)
   {
     int32_t dang = wrap_diff_mdeg(st->needle.ang_mdeg, st->last_ang);
-    /* L/h * 100 = deg/s * 100 = dang_mdeg * 100000 / dt_us */
-    int32_t inst = (int32_t)(((int64_t)dang * 100000LL) / (int64_t)dt);
+    /* 升针一圈 1 L（一格 0.1 L）。L/h * 100 = 10 * deg/s * 100
+     * = dang_mdeg * 1000000 / dt_us */
+    int32_t inst = (int32_t)(((int64_t)dang * 1000000LL) / (int64_t)dt);
     inst = iabs32(inst);
     st->flow_lh_e2 = inst;
     if (st->have_speed == 0U) { st->flow_filt_e2 = inst; }
