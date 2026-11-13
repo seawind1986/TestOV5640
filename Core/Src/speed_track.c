@@ -1314,7 +1314,7 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
   int m = CROP_MARGIN;
 
   if ((st == 0) || (st->needle.found == 0U)) { return; }
-  x0 = st->needle.cx - st->needle.r - m;
+  x0 = st->needle.cx - st->needle.r - m - CROP_LEFT_GUARD;
   y0 = st->needle.cy - st->needle.r - m;
   x1 = st->needle.cx + st->needle.r + m;
   y1 = st->needle.cy + st->needle.r + m;
