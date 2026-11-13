@@ -612,6 +612,7 @@ int16_t  g_locate_cx;
 int16_t  g_locate_cy;
 int16_t  g_locate_r;
 uint16_t g_track_miss;
+int16_t  g_tip_xmax;
 
 static void tip_hist_reset(void)
 {
@@ -635,8 +636,46 @@ static void rev_start(uint32_t stamp, int32_t ang)
   g_rev_best_ang = ang;
 }
 
-/* 直接取红色指针最外端：先找红像素质心，再取离质心最远的红点。
- * 不绕假定圆心扫圆环，否则轨迹会被错误圆心束缚。 */
+/* 用红色列直方图找到升针右侧空隙，避免针尖跟到旁边那个红指针。 */
+static int left_red_xmax(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h)
+{
+  int x, y;
+  int ww = (int)w;
+  int col[360];
+  int start = -1;
+  int gap0 = -1;
+  int gaplen = 0;
+  if (ww > 360) { ww = 360; }
+  for (x = 0; x < ww; x++) { col[x] = 0; }
+  for (y = 0; y < (int)h; y++)
+  {
+    for (x = 0; x < ww; x++)
+    {
+      int r, g, b;
+      unpack(pix(rgb, stride, x, y), &r, &g, &b);
+      if (is_red(r, g, b)) { col[x]++; }
+    }
+  }
+  for (x = 0; x < ww; x++)
+  {
+    if (col[x] >= 6)
+    {
+      if (start < 0) { start = x; }
+      gaplen = 0;
+    }
+    else if (start >= 0)
+    {
+      if (gaplen == 0) { gap0 = x; }
+      gaplen++;
+      if (gaplen >= 16) { return (gap0 - 1); }
+    }
+  }
+  if (start < 0) { return ((int)w - 1); }
+  return (ww - 1);
+}
+
+/* 直接取升针最外端：只在左侧红块里找质心，再取离质心最远的红点。
+ * 不绕假定圆心扫圆环，也不跟丢失后的 56 像素窗口跑到邻针。 */
 static int free_tip(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
                     int approx_x, int approx_y, int search_r,
                     int pred_x, int pred_y,
@@ -652,26 +691,20 @@ static int free_tip(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
   int best = -1;
   int bx = -1, by = -1;
   int64_t ax = 0, ay = 0, an = 0;
+  int xmax = left_red_xmax(rgb, stride, w, h);
 
-  if ((pred_x >= 0) && (pred_y >= 0))
-  {
-    x0 = pred_x - 56;
-    y0 = pred_y - 56;
-    x1 = pred_x + 56;
-    y1 = pred_y + 56;
-  }
-  else
-  {
-    if (search_r < 80) { search_r = 80; }
-    x0 = approx_x - search_r;
-    y0 = approx_y - search_r;
-    x1 = approx_x + search_r;
-    y1 = approx_y + search_r;
-  }
-  if (x0 < 0) { x0 = 0; }
-  if (y0 < 0) { y0 = 0; }
+  g_tip_xmax = (int16_t)xmax;
+  (void)approx_x;
+  (void)approx_y;
+  (void)search_r;
+  (void)pred_x;
+  (void)pred_y;
+  x0 = 0;
+  y0 = 0;
+  x1 = xmax;
+  y1 = (int)h - 1;
   if (x1 >= (int)w) { x1 = (int)w - 1; }
-  if (y1 >= (int)h) { y1 = (int)h - 1; }
+  if (x1 < 8) { x1 = (int)w - 1; }
 
   for (y = y0; y <= y1; y++)
   {
@@ -1446,7 +1479,19 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
 
     if (st->hub_locked == 0)
     {
-      /* 针尖走出 2 像素再记一点，避免 80 点还没走到 0.3 L 就被挤掉。 */
+      /* 针尖走出 2 像素再记一点。缓冲区满仍未锁定时丢掉旧的一半，继续描。 */
+      if (g_tip_n >= (uint16_t)TIP_HIST)
+      {
+        uint16_t keep = (uint16_t)(TIP_HIST / 2);
+        uint16_t i;
+        uint16_t off = (uint16_t)(TIP_HIST - (int)keep);
+        for (i = 0U; i < keep; i++)
+        {
+          g_tip_x[i] = g_tip_x[i + off];
+          g_tip_y[i] = g_tip_y[i + off];
+        }
+        g_tip_n = keep;
+      }
       if (g_tip_n < (uint16_t)TIP_HIST)
       {
         int rec = 1;
@@ -1491,13 +1536,10 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
           if (iabs32(acc) >= HUB_LOCK_MDEG)
           {
             int loc_r = (int)st->needle.r;
-            int dcx = fcx - (int)st->needle.cx;
-            int dcy = fcy - (int)st->needle.cy;
             int ok = 1;
             int ring;
             int32_t a1;
             if ((loc_r >= 24) && (fr < ((loc_r * 7) / 10))) { ok = 0; }
-            if (((dcx * dcx) + (dcy * dcy)) > (45 * 45)) { ok = 0; }
             if (ok != 0)
             {
               ring = (fr * RING_SHRINK_N) / RING_SHRINK_D;
