@@ -2818,7 +2818,7 @@ static void LCD_FillBothBlack(void)
 }
 
 /* 升针常在居中预览的左缘之外。速度模式把全幅向左平移，第一刀仍在预览内裁。 */
-#define SPEED_PREVIEW_SRC_X  (-280)
+#define SPEED_PREVIEW_SRC_X  (240)
 
 static void SpeedTrack_PreviewLeft(void)
 {
