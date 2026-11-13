@@ -15,7 +15,7 @@
 #define TXT_R      255
 #define TXT_G      0
 #define TXT_B      0
-#define CROP_MARGIN 28
+#define CROP_MARGIN 80
 #define MIN_FPS_X10 20   /* 10 齿/s 的奈奎斯特下限：每秒至少 20 帧 */
 
 /* Inverse rectify (rectified -> captured), copied from dial_read.c; that file is not edited. */
