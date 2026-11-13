@@ -17,7 +17,7 @@
 #define TXT_R      255
 #define TXT_G      0
 #define TXT_B      0
-#define CROP_MARGIN 10     /* 只包升针，少留空边 */
+#define CROP_MARGIN 80     /* 贴合升针，但留足边距，避免画面过小 */
 #define FLOW_WIN_MIN_US 1000000U  /* 至少跨 1 s 再报流速 */
 #define FLOW_WIN_US     2000000U  /* 按约 2 s 窗口滑动 */
 #define MIN_FPS_X10 20   /* 10 齿/s 的奈奎斯特下限：每秒至少 20 帧 */
