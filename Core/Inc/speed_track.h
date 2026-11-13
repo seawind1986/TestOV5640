@@ -52,6 +52,7 @@ typedef struct
   uint32_t     mid_t;         /* mid-window snapshot time */
   int32_t      mid_accum;
   int32_t      dir_sign;      /* +1 angle increases, -1 decreases, 0 unknown */
+  int32_t      hub_locked;    /* 针尖走够约 0.3 L 后拟合出圆心 */
 } speed_state_t;
 
 void SpeedTrack_Reset(speed_state_t *st);
