@@ -596,13 +596,114 @@ int16_t  g_tip_x[TIP_HIST];
 int16_t  g_tip_y[TIP_HIST];
 uint16_t g_tip_n;
 int32_t  g_span_mdeg;
+int32_t  g_path_px;
+int32_t  g_fit_span_mdeg;
 
 static void tip_hist_reset(void)
 {
   g_tip_n = 0U;
   g_span_mdeg = 0;
+  g_path_px = 0;
+  g_fit_span_mdeg = 0;
   memset(g_tip_x, 0, sizeof(g_tip_x));
   memset(g_tip_y, 0, sizeof(g_tip_y));
+}
+
+/* 直接取红色指针最外端：先找红像素质心，再取离质心最远的红点。
+ * 不绕假定圆心扫圆环，否则轨迹会被错误圆心束缚。 */
+static int free_tip(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h,
+                    int approx_x, int approx_y, int search_r,
+                    int pred_x, int pred_y,
+                    int *tx, int *ty)
+{
+  int x0, y0, x1, y1;
+  int x, y;
+  int r, g, b;
+  int64_t sx = 0;
+  int64_t sy = 0;
+  int64_t n = 0;
+  int mx, my;
+  int best = -1;
+  int bx = -1, by = -1;
+  int64_t ax = 0, ay = 0, an = 0;
+
+  if ((pred_x >= 0) && (pred_y >= 0))
+  {
+    x0 = pred_x - 56;
+    y0 = pred_y - 56;
+    x1 = pred_x + 56;
+    y1 = pred_y + 56;
+  }
+  else
+  {
+    if (search_r < 80) { search_r = 80; }
+    x0 = approx_x - search_r;
+    y0 = approx_y - search_r;
+    x1 = approx_x + search_r;
+    y1 = approx_y + search_r;
+  }
+  if (x0 < 0) { x0 = 0; }
+  if (y0 < 0) { y0 = 0; }
+  if (x1 >= (int)w) { x1 = (int)w - 1; }
+  if (y1 >= (int)h) { y1 = (int)h - 1; }
+
+  for (y = y0; y <= y1; y++)
+  {
+    for (x = x0; x <= x1; x++)
+    {
+      unpack(pix(rgb, stride, x, y), &r, &g, &b);
+      if (is_red(r, g, b) == 0) { continue; }
+      sx += x;
+      sy += y;
+      n++;
+    }
+  }
+  if (n < 24) { return -1; }
+  mx = (int)(sx / n);
+  my = (int)(sy / n);
+
+  for (y = y0; y <= y1; y++)
+  {
+    for (x = x0; x <= x1; x++)
+    {
+      int d2;
+      unpack(pix(rgb, stride, x, y), &r, &g, &b);
+      if (is_red(r, g, b) == 0) { continue; }
+      d2 = ((x - mx) * (x - mx)) + ((y - my) * (y - my));
+      if (d2 > best) { best = d2; bx = x; by = y; }
+    }
+  }
+  if ((bx < 0) || (best < (18 * 18))) { return -1; }
+
+  /* 最远端附近几个红点取平均，避免单像素抖动。 */
+  {
+    int thr = (best * 85) / 100;
+    for (y = y0; y <= y1; y++)
+    {
+      for (x = x0; x <= x1; x++)
+      {
+        int d2;
+        unpack(pix(rgb, stride, x, y), &r, &g, &b);
+        if (is_red(r, g, b) == 0) { continue; }
+        d2 = ((x - mx) * (x - mx)) + ((y - my) * (y - my));
+        if (d2 < thr) { continue; }
+        ax += x;
+        ay += y;
+        an++;
+      }
+    }
+  }
+  if (an >= 3)
+  {
+    *tx = (int)((ax + (an / 2)) / an);
+    *ty = (int)((ay + (an / 2)) / an);
+  }
+  else
+  {
+    *tx = bx;
+    *ty = by;
+  }
+  return 0;
 }
 
 /* 对针尖点列做代数圆拟合（先减质心，再 Kåsa 最小二乘）。 */
@@ -1176,14 +1277,20 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
 
   if (st->hub_locked == 0)
   {
-    /* 锁定前：用指针最远端描轨迹。 */
-    tip_ok = needle_tip(rgb, stride, w, h, hx, hy, (R > 16) ? (R + 8) : 40,
-                        (st->have_prev != 0U) ? st->last_ang : -1, 50,
-                        &tx, &ty, &ang);
-    if (tip_ok != 0)
+    /* 锁定前：直接找红色指针最外端，不绕估错的圆心扫圆环。 */
     {
-      tip_ok = needle_tip(rgb, stride, w, h, hx, hy, (R > 16) ? (R + 8) : 40,
-                          -1, 180, &tx, &ty, &ang);
+      int pred_x = (st->have_prev != 0U) ? (int)st->needle.tip_x : -1;
+      int pred_y = (st->have_prev != 0U) ? (int)st->needle.tip_y : -1;
+      int sr = (R > 16) ? (R + 60) : 140;
+      tip_ok = free_tip(rgb, stride, w, h, hx, hy, sr, pred_x, pred_y, &tx, &ty);
+      if (tip_ok != 0)
+      {
+        tip_ok = free_tip(rgb, stride, w, h, hx, hy, 160, -1, -1, &tx, &ty);
+      }
+      if (tip_ok == 0)
+      {
+        ang = atan2_mdeg(ty - hy, tx - hx);
+      }
     }
   }
   else
@@ -1284,6 +1391,12 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
         }
         if (rec != 0)
         {
+          if (g_tip_n > 0U)
+          {
+            int ldx = tx - (int)g_tip_x[g_tip_n - 1U];
+            int ldy = ty - (int)g_tip_y[g_tip_n - 1U];
+            g_path_px += (int32_t)isqrt32((uint32_t)((ldx * ldx) + (ldy * ldy)));
+          }
           g_tip_x[g_tip_n] = (int16_t)tx;
           g_tip_y[g_tip_n] = (int16_t)ty;
           g_tip_n++;
@@ -1291,49 +1404,53 @@ int SpeedTrack_Tick(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h
       }
       g_span_mdeg += dang;
       st->dt_us = stamp_us - st->win_t0;
-      if ((iabs32(g_span_mdeg) >= HUB_LOCK_MDEG) && (g_tip_n >= 12U))
+      if (g_tip_n >= 12U)
       {
         int fcx, fcy, fr;
         if (fit_circle(g_tip_x, g_tip_y, (int)g_tip_n, &fcx, &fcy, &fr) == 0)
         {
-          int ring = (fr * RING_SHRINK_N) / RING_SHRINK_D;
-          int32_t a0;
-          int32_t a1;
-          int32_t dang2;
-          uint32_t dt;
-          if (ring < 20) { ring = 20; }
-          st->needle.cx = (int16_t)fcx;
-          st->needle.cy = (int16_t)fcy;
-          st->needle.r = (int16_t)ring;
-          st->needle.hub_r = (int16_t)(fr / 4);
-          if (st->needle.hub_r < 10) { st->needle.hub_r = 10; }
-          st->hub_locked = 1;
-          /* 用拟合圆心重算这段 0.3 L 的流速，并作为窗口起点。 */
-          a0 = atan2_mdeg((int)g_tip_y[0] - fcy, (int)g_tip_x[0] - fcx);
-          a1 = atan2_mdeg(ty - fcy, tx - fcx);
-          dang2 = wrap_diff_mdeg(a1, a0);
-          /* 跨过约 108°，若 wrap 成反向小角则按累计符号拉开。 */
-          if ((iabs32(dang2) < (HUB_LOCK_MDEG / 2)) && (g_span_mdeg != 0))
+          int32_t a_prev;
+          int32_t acc = 0;
+          uint16_t i;
+          a_prev = atan2_mdeg((int)g_tip_y[0] - fcy, (int)g_tip_x[0] - fcx);
+          for (i = 1U; i < g_tip_n; i++)
           {
-            if (g_span_mdeg > 0) { dang2 += 360000; }
-            else { dang2 -= 360000; }
+            int32_t ai = atan2_mdeg((int)g_tip_y[i] - fcy, (int)g_tip_x[i] - fcx);
+            acc += wrap_diff_mdeg(ai, a_prev);
+            a_prev = ai;
           }
-          dt = st->dt_us;
-          if (dt >= 200000U)
+          g_fit_span_mdeg = acc;
+          /* 必须绕拟合圆心走出约 0.3 L（108°），短弧不锁。 */
+          if (iabs32(acc) >= HUB_LOCK_MDEG)
           {
-            int32_t inst = (int32_t)(((int64_t)iabs32(dang2) * 1000000LL) / (int64_t)dt);
-            st->flow_lh_e2 = inst;
-            st->flow_filt_e2 = inst;
-            st->have_speed = 1U;
+            int ring = (fr * RING_SHRINK_N) / RING_SHRINK_D;
+            int32_t a1;
+            uint32_t dt;
+            if (ring < 20) { ring = 20; }
+            st->needle.cx = (int16_t)fcx;
+            st->needle.cy = (int16_t)fcy;
+            st->needle.r = (int16_t)ring;
+            st->needle.hub_r = (int16_t)(fr / 4);
+            if (st->needle.hub_r < 10) { st->needle.hub_r = 10; }
+            st->hub_locked = 1;
+            a1 = a_prev;
+            dt = st->dt_us;
+            if (dt >= 200000U)
+            {
+              int32_t inst = (int32_t)(((int64_t)iabs32(acc) * 1000000LL) / (int64_t)dt);
+              st->flow_lh_e2 = inst;
+              st->flow_filt_e2 = inst;
+              st->have_speed = 1U;
+            }
+            st->last_ang = a1;
+            st->needle.ang_mdeg = a1;
+            st->win_t0 = stamp_us;
+            st->win_accum = 0;
+            st->mid_t = 0U;
+            st->mid_accum = 0;
+            if (acc > 0) { st->dir_sign = 1; }
+            else if (acc < 0) { st->dir_sign = -1; }
           }
-          st->last_ang = a1;
-          st->needle.ang_mdeg = a1;
-          st->win_t0 = stamp_us;
-          st->win_accum = 0;
-          st->mid_t = 0U;
-          st->mid_accum = 0;
-          if (dang2 > 0) { st->dir_sign = 1; }
-          else if (dang2 < 0) { st->dir_sign = -1; }
         }
       }
       return 0;
