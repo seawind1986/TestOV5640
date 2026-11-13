@@ -19,7 +19,7 @@
 #define TXT_G      0
 #define TXT_B      0
 #define CROP_MARGIN 80
-#define CROP_LEFT_GUARD 180 /* 若第一刀落在右侧邻针，先向左扩出升针再精裁 */
+#define CROP_LEFT_GUARD 360 /* 若第一刀落在右侧邻针，先向左扩出升针再精裁 */
 #define NEEDLE_MIN_R 50   /* 升针在当前物距下半径约 80–110，拒掉壳上小红斑 */
 #define NEEDLE_MIN_R_LO 30 /* 被裁切的升针可能略小于 50 */
 #define NEEDLE_LEFT_GAP 40 /* 左边再有一根明显更靠左的针，就用左边这根 */     /* 贴合升针，但留足边距，避免画面过小 */
@@ -617,6 +617,7 @@ int16_t  g_locate_cy;
 int16_t  g_locate_r;
 uint16_t g_track_miss;
 uint8_t  g_need_relocate;
+uint8_t  g_need_refine;
 uint8_t  g_n_needles;
 int16_t  g_tip_xmax;
 
@@ -934,6 +935,7 @@ void SpeedTrack_Reset(speed_state_t *st)
   g_locate_r = 0;
   g_track_miss = 0U;
   g_need_relocate = 0U;
+  g_need_refine = 0U;
   g_n_needles = 0U;
 }
 
@@ -984,24 +986,6 @@ int SpeedTrack_RefineCrop(const uint16_t *rgb, uint16_t stride, uint16_t w, uint
   g_locate_r = st->needle.r;
   pad = (int)st->needle.r + CROP_MARGIN;
   if (pad < 80) { pad = 80; }
-  if ((st->needle.cx < pad) ||
-      (st->needle.cy < pad) ||
-      ((((int)w - 1) - (int)st->needle.cx) < pad) ||
-      ((((int)h - 1) - (int)st->needle.cy) < pad))
-  {
-    need = 1;
-  }
-  if ((st->needle.tip_x < 8) ||
-      (st->needle.tip_y < 8) ||
-      (st->needle.tip_x > ((int)w - 9)) ||
-      (st->needle.tip_y > ((int)h - 9)))
-  {
-    need = 1;
-  }
-  if (need == 0)
-  {
-    return 0;
-  }
   tw = pad * 2;
   th = pad * 2;
   if (tw > 1024) { tw = 1024; }
@@ -1014,10 +998,18 @@ int SpeedTrack_RefineCrop(const uint16_t *rgb, uint16_t stride, uint16_t w, uint
   y0 = (int)st->needle.cy - (th / 2);
   x0 &= ~1;
   y0 &= ~1;
+  /* 第一刀常是加宽窗口，即使邻针不贴边也要收成以最左针为中心的紧窗。 */
+  if ((x0 > -8) && (x0 < 8) && (y0 > -8) && (y0 < 8) &&
+      (((int)w - tw) > -16) && (((int)w - tw) < 16) &&
+      (((int)h - th) > -16) && (((int)h - th) < 16))
+  {
+    return 0;
+  }
   if (ox != 0) { *ox = (int16_t)x0; }
   if (oy != 0) { *oy = (int16_t)y0; }
   if (nw != 0) { *nw = (uint16_t)tw; }
   if (nh != 0) { *nh = (uint16_t)th; }
+  (void)need;
   return 1;
 }
 

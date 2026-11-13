@@ -59,6 +59,7 @@ void SpeedTrack_Reset(speed_state_t *st);
 
 /* 裁窗后如果持续找不到升针，Tick 置 1，主程序应回到全幅重新定位。 */
 extern uint8_t g_need_relocate;
+extern uint8_t g_need_refine;
 extern uint8_t g_n_needles;
 
 /* 在实时画面上找升针（不走表盘算法）。成功返回 0。 */
