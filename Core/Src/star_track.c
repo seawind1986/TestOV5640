@@ -17,9 +17,7 @@
 #define GAP_US       120000U   /* 相邻有效帧超过 120 ms 不再展开，重新起算 */
 #define RATE_WIN_US  2000000U  /* 实时齿/s 按约 2 s 窗口 */
 #define RATE_MIN_US  1000000U
-/* 测量窗与升针一致：单圈 <10 s 累加整圈到总时长 >30 s；10~20 s（含）跑 2 圈；>20 s 跑 1 圈。 */
-#define MW_FAST_US   10000000U
-#define MW_SLOW_US   20000000U
+/* 测量窗（梅花轮）：单圈 <30 s 累加整圈到总时长 >30 s；单圈 >=30 s 跑 1 圈（至少一整圈）。 */
 #define MW_TOTAL_US  30000000U
 #define LOST_US      1500000U
 #define MAX_CAND     24
@@ -814,15 +812,11 @@ static void lap_step(uint32_t stamp)
     if (g_star_mw_laps < 255U) { g_star_mw_laps++; }
     g_star_lap_us = lap_dt;
     tot = stamp - s_mw_t0;
-    if (lap_dt > MW_SLOW_US)
+    /* 梅花轮专用：单圈 >=30 s 跑 1 圈；单圈 <30 s 累加整圈到总时长 >30 s。 */
+    if (lap_dt >= MW_TOTAL_US)
     {
       g_star_mw_target = 1U;
       done = 1U;
-    }
-    else if (lap_dt >= MW_FAST_US)
-    {
-      g_star_mw_target = 2U;
-      if (g_star_mw_laps >= 2U) { done = 1U; }
     }
     else
     {
