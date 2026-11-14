@@ -160,11 +160,7 @@ static void track_reset(void)
   g_star_lap_deg = 0.0;
   g_star_tps_e3 = 0;
   g_star_fps_e1 = 0;
-  g_star_seq = 0U;
-  g_star_meas_n = 0U;
-  g_star_meas_i = 0U;
-  g_star_meas_total = 0U;
-  g_star_rep_e4 = 0;
+  /* 列表、序号、重复性只在上电时为 0（BSS），重定位/重建表/断帧都接着往下记。 */
   g_star_gap_n = 0U;
   g_star_lowq_n = 0U;
   g_star_good_n = 0U;
