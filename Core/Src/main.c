@@ -3437,7 +3437,6 @@ static void StarMode_Service(void)
   static uint8_t prev_ok;
   static uint32_t entry_epoch;
   uint32_t wb;
-  uint32_t debug_raw_copied = 0U;
   if (entry_epoch != g_meter_epoch) { entry_epoch = g_meter_epoch; prev_ok = 0U; }
 
   if (g_meter_mode != METER_MODE_STAR)
@@ -3549,6 +3548,7 @@ static void DialRead_Service(void)
   static dial_report_t work_rep;
   static uint32_t entry_epoch;
   uint32_t wb;
+  uint32_t debug_raw_copied = 0U;
   if (entry_epoch != g_meter_epoch)
   {
     entry_epoch = g_meter_epoch;
