@@ -1225,58 +1225,7 @@ static void LCD_FillBackground(void)
   }
 }
 
-/* No yield/present inside this copy: cam_draw_full==1 leases lcd_draw
- * to the main loop. The line ISR only writes at state 0; frame callbacks
- * leave state 1 alone. IRQs/camera continue, but cannot recycle this buffer.
- * SDRAM is MPU non-cacheable and D-cache is not enabled; no invalidate of
- * CPU-produced DMA-line copies is required (and could discard real writes). */
-static uint32_t VolumeRaw_Hash(const uint32_t *p)
-{
-  uint32_t i, h = 2166136261U;
-  for (i = 0U; i < LCD_FB_BYTES / 4U; i++) { h = (h ^ p[i]) * 16777619U; }
-  return h;
-}
-
-static void VolumeRaw_Capture(void)
-{
-  uint32_t src, gen, stamp, t0, i, h = 2166136261U;
-  const uint32_t *p;
-  uint32_t *d = (uint32_t *)DIAL_SNAP_ADDR;
-  if ((g_meter_mode != METER_MODE_VOLUME) || (g_meter_switching != 0U)
-      || (g_meter_raw_diag.request == 0U) || (g_meter_raw_diag.ready != 0U)
-      || (g_meter_raw_diag.busy != 0U) || (cam_draw_full != 1U)) { return; }
-  /* Volume restores full-frame 1024x600 RGB565, one sensor row per LCD row.
-   * Never mistake an old/scaled/HUD-painted LCD surface for camera RAW. */
-  if ((cam_out_jpeg != 0U) || (cam_w != LCD_WIDTH) || (cam_h != LCD_HEIGHT)
-      || (cam_vw != cam_w) || (cam_vh != cam_h) || (cam_ox != 0U) || (cam_oy != 0U))
-  { return; }
-  gen = g_meter_raw_diag.frame_gen;
-  if ((gen == 0U) || (g_meter_raw_diag.paint_gen == gen))
-  { g_meter_raw_diag.painted_skip++; return; }
-  src = lcd_draw; stamp = cam_stamp_us; t0 = TIM2->CNT;
-  p = (const uint32_t *)src;
-  __DMB();
-  for (i = 0U; i < LCD_FB_BYTES / 4U; i++)
-  {
-    uint32_t v = p[i]; d[i] = v; h = (h ^ v) * 16777619U;
-  }
-  __DMB();
-  g_meter_raw_diag.hold_gen0 = gen;
-  g_meter_raw_diag.hold_gen1 = g_meter_raw_diag.frame_gen;
-  if ((cam_draw_full != 1U) || (lcd_draw != src) || (cam_stamp_us != stamp)
-      || (g_meter_raw_diag.frame_gen != gen) || (g_meter_raw_diag.paint_gen == gen))
-  { g_meter_raw_diag.bad_copy++; return; }
-  g_meter_raw_diag.source = src;
-  g_meter_raw_diag.snap_gen = gen;
-  g_meter_raw_diag.snap_stamp = stamp;
-  g_meter_raw_diag.hash_saved = h;
-  g_meter_raw_diag.copy_us = TIM2->CNT - t0;
-  g_meter_raw_diag.copy_n++;
-  g_meter_raw_diag.before_hud_n++;
-  g_meter_raw_diag.request = 0U;
-  __DMB();
-  g_meter_raw_diag.ready = 1U; /* publish only after the complete copy */
-}
+static void VolumeRaw_Capture(void);
 
 /* 返回 0 表示已经在场消隐里切到 shown，可以开始往另一块缓冲写。 */
 static int LCD_Present(void)
@@ -1974,6 +1923,59 @@ static volatile uint16_t cam_scale_vw;
 static volatile uint16_t cam_scale_vh;
 static volatile uint16_t cam_scale_ox;
 static volatile uint16_t cam_scale_oy;
+
+/* No yield/present inside this copy: cam_draw_full==1 leases lcd_draw
+ * to the main loop. The line ISR only writes at state 0; frame callbacks
+ * leave state 1 alone. IRQs/camera continue, but cannot recycle this buffer.
+ * SDRAM is MPU non-cacheable and D-cache is not enabled; no invalidate of
+ * CPU-produced DMA-line copies is required (and could discard real writes). */
+static uint32_t VolumeRaw_Hash(const uint32_t *p)
+{
+  uint32_t i, h = 2166136261U;
+  for (i = 0U; i < LCD_FB_BYTES / 4U; i++) { h = (h ^ p[i]) * 16777619U; }
+  return h;
+}
+
+static void VolumeRaw_Capture(void)
+{
+  uint32_t src, gen, stamp, t0, i, h = 2166136261U;
+  const uint32_t *p;
+  uint32_t *d = (uint32_t *)DIAL_SNAP_ADDR;
+  if ((g_meter_mode != METER_MODE_VOLUME) || (g_meter_switching != 0U)
+      || (g_meter_raw_diag.request == 0U) || (g_meter_raw_diag.ready != 0U)
+      || (g_meter_raw_diag.busy != 0U) || (cam_draw_full != 1U)) { return; }
+  /* Volume restores full-frame 1024x600 RGB565, one sensor row per LCD row.
+   * Never mistake an old/scaled/HUD-painted LCD surface for camera RAW. */
+  if ((cam_out_jpeg != 0U) || (cam_w != LCD_WIDTH) || (cam_h != LCD_HEIGHT)
+      || (cam_vw != cam_w) || (cam_vh != cam_h) || (cam_ox != 0U) || (cam_oy != 0U))
+  { return; }
+  gen = g_meter_raw_diag.frame_gen;
+  if ((gen == 0U) || (g_meter_raw_diag.paint_gen == gen))
+  { g_meter_raw_diag.painted_skip++; return; }
+  src = lcd_draw; stamp = cam_stamp_us; t0 = TIM2->CNT;
+  p = (const uint32_t *)src;
+  __DMB();
+  for (i = 0U; i < LCD_FB_BYTES / 4U; i++)
+  {
+    uint32_t v = p[i]; d[i] = v; h = (h ^ v) * 16777619U;
+  }
+  __DMB();
+  g_meter_raw_diag.hold_gen0 = gen;
+  g_meter_raw_diag.hold_gen1 = g_meter_raw_diag.frame_gen;
+  if ((cam_draw_full != 1U) || (lcd_draw != src) || (cam_stamp_us != stamp)
+      || (g_meter_raw_diag.frame_gen != gen) || (g_meter_raw_diag.paint_gen == gen))
+  { g_meter_raw_diag.bad_copy++; return; }
+  g_meter_raw_diag.source = src;
+  g_meter_raw_diag.snap_gen = gen;
+  g_meter_raw_diag.snap_stamp = stamp;
+  g_meter_raw_diag.hash_saved = h;
+  g_meter_raw_diag.copy_us = TIM2->CNT - t0;
+  g_meter_raw_diag.copy_n++;
+  g_meter_raw_diag.before_hud_n++;
+  g_meter_raw_diag.request = 0U;
+  __DMB();
+  g_meter_raw_diag.ready = 1U; /* publish only after the complete copy */
+}
 
 static void CAM_LoadView(void)
 {
