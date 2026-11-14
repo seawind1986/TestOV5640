@@ -21,6 +21,9 @@
 #define LOST_US      1500000U
 #define MAX_CAND     24
 #define DARK_PCT     55        /* 暗阈值 = 亮度中位数 × 55% */
+#ifndef STAR_T_FRAC
+#define STAR_T_FRAC  45
+#endif
 #define CHROMA_MAX   70        /* 红针、蓝圈、红字不算暗 */
 #ifndef FILL_MIN
 #define FILL_MIN     30
@@ -339,8 +342,80 @@ static int eval_cand(const uint8_t *cmap, int W, int H, uint8_t id, const cand_t
   return 0;
 }
 
+/* 在原图亮度上按半径扫 N 次谐波幅度，采样圆环放在齿/缺口明暗交替最强的那一段。 */
+uint16_t g_star_rad_amp[STAR_RAD_MAX];   /* 每个半径（原图像素）的 N 次谐波幅度 ×10 */
+uint16_t g_star_rad_n;
+
+static int pick_annulus(const uint16_t *rgb, uint16_t stride, int w, int h,
+                        float cx, float cy, int n, float r_out, int *o_r0, int *o_r1, int *o_rpk)
+{
+  int ra = (int)(0.45f * r_out), rb = (int)(1.35f * r_out) + 2;
+  int r, k, rpk = -1, r0, r1;
+  float amax = 0.0f;
+  static float amp[STAR_RAD_MAX];
+  if (ra < 3) { ra = 3; }
+  if (rb >= (int)STAR_RAD_MAX) { rb = (int)STAR_RAD_MAX - 1; }
+  g_star_rad_n = 0U;
+  if ((n < 3) || (rb <= ra)) { return -1; }
+  for (r = 0; r < (int)STAR_RAD_MAX; r++) { amp[r] = 0.0f; g_star_rad_amp[r] = 0U; }
+  for (r = ra; r <= rb; r++)
+  {
+    float c = 0.0f, s = 0.0f, m = 0.0f;
+    int cnt = 0, out = 0;
+    for (k = 0; k < 360; k++)
+    {
+      int x = (int)(cx + ((float)r * s_c360[k]) + 0.5f);
+      int y = (int)(cy + ((float)r * s_s360[k]) + 0.5f);
+      int ch, Y, a;
+      if ((x < 0) || (y < 0) || (x >= w) || (y >= h)) { out++; continue; }
+      Y = px_luma_chroma(rgb[((uint32_t)y * stride) + (uint32_t)x], &ch);
+      a = (n * k) % 360;
+      c += (float)Y * s_c360[a];
+      s += (float)Y * s_s360[a];
+      m += (float)Y;
+      cnt++;
+    }
+    if ((out > 18) || (cnt == 0)) { continue; }   /* 圆出了画面就不用 */
+    (void)m;
+    amp[r] = 2.0f * sqrtf((c * c) + (s * s)) / (float)cnt;
+    g_star_rad_amp[r] = (uint16_t)(amp[r] * 10.0f);
+    if (amp[r] > amax) { amax = amp[r]; rpk = r; }
+  }
+  g_star_rad_n = (uint16_t)(rb + 1);
+  if ((rpk < 0) || (amax < 12.0f)) { return -1; }
+  r0 = rpk; r1 = rpk;
+  while ((r0 > ra) && (amp[r0 - 1] >= (0.6f * amax))) { r0--; }
+  while ((r1 < rb) && (amp[r1 + 1] >= (0.6f * amax))) { r1++; }
+  /* 边上留 1 像素，保证至少 6 像素宽 */
+  if ((r1 - r0) > 8) { r0++; r1--; }
+  while ((r1 - r0) < 6) { if (r0 > ra) { r0--; } if (r1 < rb) { r1++; } if ((r0 <= ra) && (r1 >= rb)) { break; } }
+  *o_r0 = r0; *o_r1 = r1; *o_rpk = rpk;
+  return 0;
+}
+
+static int locate_once(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h, uint8_t ds,
+                       uint8_t *work, uint32_t work_bytes, uint16_t skip_x1, uint16_t skip_y1, int tmode);
+
+uint8_t g_star_tmode;   /* 最近一次定位成功用的阈值：1=暗峰-中位数插值，0=中位数×55% */
+
 int StarTrack_Locate(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h, uint8_t ds,
                      uint8_t *work, uint32_t work_bytes, uint16_t skip_x1, uint16_t skip_y1)
+{
+  if (locate_once(rgb, stride, w, h, ds, work, work_bytes, skip_x1, skip_y1, 1) == 0)
+  {
+    g_star_tmode = 1U;
+    return 0;
+  }
+  if (locate_once(rgb, stride, w, h, ds, work, work_bytes, skip_x1, skip_y1, 0) == 0)
+  {
+    g_star_tmode = 0U;
+    return 0;
+  }
+  return -1;
+}
+
+static int locate_once(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t h, uint8_t ds,
+                       uint8_t *work, uint32_t work_bytes, uint16_t skip_x1, uint16_t skip_y1, int tmode)
 {
   int W, H, x, y, i;
   uint8_t *mask;
@@ -385,6 +460,19 @@ int StarTrack_Locate(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t 
     if ((acc * 2U) >= tot) { med = i; break; }
   }
   T = (med * DARK_PCT) / 100;
+  {
+    /* Otsu 双峰阈值：小窗里轮子占比大，中位数×55% 会落在轮面亮度里（齿被切掉）。 */
+    /* 暗峰（第 5 百分位）与中位数之间取 STAR_T_FRAC，比固定 55% 更贴近轮面与背景的分界。 */
+    uint32_t a5 = 0U;
+    int p5 = 0, To;
+    for (i = 0; i < 256; i++)
+    {
+      a5 += hist[i];
+      if ((a5 * 20U) >= tot) { p5 = i; break; }
+    }
+    To = p5 + (((med - p5) * STAR_T_FRAC) / 100);
+    if ((tmode != 0) && (To > T)) { T = To; }
+  }
   if (T < 30) { T = 30; }
   if (T > 180) { T = 180; }
   g_star.med = (uint16_t)med;
@@ -471,6 +559,22 @@ int StarTrack_Locate(const uint16_t *rgb, uint16_t stride, uint16_t w, uint16_t 
     g_star.n_teeth = (uint8_t)best_ev.n;
     g_star.trans = (uint16_t)best_ev.trans;
     g_star.score_e3 = (uint16_t)(best_ev.score * 1000.0f);
+    g_star.ann_r0 = 0;
+    g_star.ann_r1 = 0;
+    g_star.ann_pk = 0;
+    {
+      int a0 = 0, a1 = 0, apk = 0;
+      if (pick_annulus(rgb, stride, (int)w, (int)h, (best_ev.cx * f) + off, (best_ev.cy * f) + off,
+                       best_ev.n, best_ev.r_out * f, &a0, &a1, &apk) != 0)
+      {
+        g_star.found = 0U;
+        return -1;
+      }
+      g_star.ann_r0 = (int16_t)a0;
+      g_star.ann_r1 = (int16_t)a1;
+      g_star.ann_pk = (int16_t)apk;
+      if (a1 > g_star.r_out) { g_star.r_out = (int16_t)a1; }
+    }
     g_star.found = 1U;
   }
   return 0;
@@ -490,6 +594,12 @@ int StarTrack_Arm(uint16_t cap_w, uint16_t cap_h)
   float ro = (float)g_star.r_out, ri = (float)g_star.r_in;
   float r0 = ri + (0.15f * (ro - ri));
   float r1 = ro - (0.12f * (ro - ri));
+  if ((g_star.ann_r1 > g_star.ann_r0) && (g_star.ann_r0 > 0))
+  {
+    /* 定位时按亮度径向扫描选好的齿带 */
+    r0 = (float)g_star.ann_r0;
+    r1 = (float)g_star.ann_r1 + 0.5f;
+  }
   int y0, y1, x, y, k, step = 1, pass;
   uint32_t n = 0U;
   uint32_t cnt[STAR_BINS];
@@ -537,7 +647,7 @@ int StarTrack_Arm(uint16_t cap_w, uint16_t cap_h)
     s_sinn[k] = sinf(a);
     s_cinv[k] = 1.0f / (float)cnt[k];
   }
-  g_star.ann_r0 = (int16_t)r0;
+  g_star.ann_r0 = (int16_t)(r0 + 0.5f);
   g_star.ann_r1 = (int16_t)r1;
   g_star.tab_n = (uint16_t)n;
   track_reset();

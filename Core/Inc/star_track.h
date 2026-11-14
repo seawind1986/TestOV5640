@@ -27,6 +27,7 @@ typedef struct
   int16_t  r_in;       /* 缺口底半径 */
   int16_t  ann_r0;     /* 采样圆环内外半径 */
   int16_t  ann_r1;
+  int16_t  ann_pk;     /* 径向扫描 N 次谐波最强的半径 */
   int16_t  full_cx;    /* 全幅定位结果 */
   int16_t  full_cy;
   int16_t  full_r;
@@ -38,6 +39,9 @@ typedef struct
 } star_info_t;
 
 extern star_info_t g_star;
+#define STAR_RAD_MAX 200U
+extern uint16_t g_star_rad_amp[STAR_RAD_MAX];
+extern uint16_t g_star_rad_n;
 extern volatile uint32_t g_star_isr_frames;   /* 行中断统计到的完整帧 */
 extern volatile uint32_t g_star_isr_bad;      /* 行数不对、未建表的帧 */
 extern volatile uint16_t g_star_isr_lines;    /* 最近一帧行数 */
