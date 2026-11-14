@@ -857,6 +857,17 @@ uint32_t g_cam_settle_us;
 static uint8_t dial_hud_ready;
 static uint8_t dial_yield_lock;
 static dial_report_t dial_hud_rep;
+/* 一次识别完成时保存拒绝理由，避免 J-Link 恰好读到下一次 Run 清空中的工作诊断。 */
+volatile struct
+{
+  uint32_t seq, status, flags;
+  uint8_t n_dials, n_scale_bad, n_cand, miss_place;
+  uint8_t reason[4];
+  int16_t cx[4], cy[4];
+  dial_dbg_cand_t cand[8];
+} g_meter_volume_diag;
+uint16_t g_meter_volume_seq;
+
 volatile uint32_t lcd_frame_addr = LCD_FB_ADDR;
 volatile uint32_t web_frame_addr;
 volatile uint16_t web_frame_w;
@@ -2858,6 +2869,32 @@ static void DialRead_CopyShown(uint16_t *dst)
 
 static void DialRead_FinishReport(dial_report_t *work_rep, dial_time_t *prev_ts, uint8_t *have_prev)
 {
+  uint8_t k;
+  char *br;
+  /* 只适配“新测试”的显示序号，不改四指针算法内部累计诊断计数。 */
+  if (g_meter_volume_seq < 999U) { g_meter_volume_seq++; } else { g_meter_volume_seq = 1U; }
+  br = strchr(work_rep->line1, '[');
+  if ((br != 0) && (br[1] != 0) && (br[2] != 0) && (br[3] != 0) && (br[4] == ']'))
+  {
+    br[1] = (char)('0' + ((g_meter_volume_seq / 100U) % 10U));
+    br[2] = (char)('0' + ((g_meter_volume_seq / 10U) % 10U));
+    br[3] = (char)('0' + (g_meter_volume_seq % 10U));
+  }
+  g_meter_volume_diag.seq = g_meter_volume_seq;
+  g_meter_volume_diag.status = (uint32_t)work_rep->status;
+  g_meter_volume_diag.flags = work_rep->suspect_flags;
+  g_meter_volume_diag.n_dials = work_rep->n_dials;
+  g_meter_volume_diag.n_scale_bad = work_rep->n_scale_bad;
+  g_meter_volume_diag.n_cand = g_dial_dbg.n_cand;
+  g_meter_volume_diag.miss_place = g_dial_dbg.miss_place;
+  for (k = 0U; k < 4U; k++)
+  {
+    g_meter_volume_diag.reason[k] = g_dial_dbg.last_reason[k];
+    g_meter_volume_diag.cx[k] = g_dial_dbg.last_cx[k];
+    g_meter_volume_diag.cy[k] = g_dial_dbg.last_cy[k];
+  }
+  for (k = 0U; k < 8U; k++) { g_meter_volume_diag.cand[k] = g_dial_dbg.cand[k]; }
+
   if (*have_prev != 0U)
   {
     uint32_t now_ms = dial_tod_ms(&work_rep->ts);
@@ -3650,6 +3687,8 @@ static void MeterMode_Service(void)
   DialRead_ResetTrack();
   memset(&dial_hud_rep, 0, sizeof(dial_hud_rep));
   dial_hud_ready = 0U;
+  g_meter_volume_seq = 0U;
+  memset((void *)&g_meter_volume_diag, 0, sizeof(g_meter_volume_diag));
   speed_phase = 0U; g_star_phase = 0U; g_star_loc_fail = 0U;
   shutter_armed = 0U; shutter_done = 0U;
   cam_arm = 0U; cam_restart = 0U; cam_ready = 0U;
@@ -3663,6 +3702,7 @@ static void MeterMode_Service(void)
   OV5640_PowerCycle();
   cam_ok = 0U;
   CAM_Init(); /* 全幅、默认自动曝光：volume 居中；speed/star 左移，随后各自原裁窗流程 */
+  if (cam_ok != 0U) { CamDbg_SnapSensor(); }
   g_crop_settling = 1U;
   g_cam_settle_us = FULL_SETTLE_US;
   g_crop_settle_t0 = TIM2->CNT;
