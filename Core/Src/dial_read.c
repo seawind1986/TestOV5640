@@ -6,6 +6,7 @@
  * All large buffers live in the caller's work area (SDRAM).
  */
 #include "dial_read.h"
+#include "dial_path_debug.h"
 #include "dial_font.h"
 #include <string.h>
 #include <limits.h>
@@ -21,6 +22,32 @@
 
 extern const int32_t dial_cos_q16[361];
 extern const int32_t dial_atan_mdeg[257];
+
+volatile dial_path_latch_t g_dial_path_success, g_dial_path_failure, g_dial_path_held;
+static dial_path_record_t s_path_work;
+static void path_why(int32_t a, uint32_t why)
+{
+  uint32_t k;
+  for (k=0U;k<s_path_work.raw_n && k<DIAL_PATH_PK;k++)
+    if (s_path_work.raw_a[k]==a) { s_path_work.why[k]=why; break; }
+}
+static void path_publish(uint32_t reason, uint32_t nvis, int32_t place,
+                         int16_t hx,int16_t hy,uint32_t area,uint16_t dtm,uint8_t tip)
+{
+  uint32_t k;
+  volatile dial_path_latch_t *p;
+  if (place != 0) { return; }
+  s_path_work.reason=reason; s_path_work.n_vis=nvis; s_path_work.place=place;
+  s_path_work.hub_x=hx; s_path_work.hub_y=hy; s_path_work.area=area;
+  s_path_work.dtm=dtm; s_path_work.tip_sub=tip;
+  for(k=0;k<9;k++)s_path_work.drop_counts[k]=0;
+  for(k=0;k<s_path_work.raw_n && k<DIAL_PATH_PK;k++)
+    if(s_path_work.why[k]<9)s_path_work.drop_counts[s_path_work.why[k]]++;
+  p=(reason==0U)?&g_dial_path_success:&g_dial_path_failure;
+  p->version++; __atomic_thread_fence(__ATOMIC_RELEASE);
+  p->record=s_path_work; p->count++;
+  __atomic_thread_fence(__ATOMIC_RELEASE); p->version++;
+}
 
 /* ---------------- parameters (same numbers as dial_read.py) ---------------- */
 #define RED_RMIN        95
@@ -365,6 +392,23 @@ static int64_t circle_ss(const pt_t *p, int n, int32_t cx, int32_t cy, int32_t r
     ss += (int64_t)d * d;
   }
   return ss;
+}
+
+static void path_trace(const pt_t *p,int n,int32_t cx,int32_t cy,int32_t R,
+                       int32_t scx,int32_t scy,int32_t sR)
+{
+  uint8_t bins[36]={0}; int i;
+  s_path_work.trace_cx=cx;s_path_work.trace_cy=cy;s_path_work.trace_R=R;
+  s_path_work.trace_n=(uint32_t)n;
+  s_path_work.trace_ss=(uint64_t)circle_ss(p,n,cx,cy,R);
+  s_path_work.seed_ss=(uint64_t)circle_ss(p,n,scx,scy,sR);
+  s_path_work.inliers=0;s_path_work.bins=0;
+  for(i=0;i<n;i++) {
+    int64_t dx=(int64_t)p[i].x-cx,dy=(int64_t)p[i].y-cy;
+    int32_t dr=(int32_t)isqrt64((uint64_t)(dx*dx+dy*dy))-R;
+    if(iabs32(dr)<=2*256) { s_path_work.inliers++;bins[atan2_mdeg(dy,dx)/10000]=1; }
+  }
+  for(i=0;i<36;i++)s_path_work.bins+=bins[i];
 }
 
 /* ---------------- chamfer 3-4 distance on a window ---------------- */
@@ -938,6 +982,12 @@ static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_
       {
         int64_t dcx = (int64_t)cx - hx, dcy = (int64_t)cy - hy;
         int64_t lim = (int64_t)15 * 256 * 15 * 256;
+        s_path_work.longest_cx=cx;s_path_work.longest_cy=cy;s_path_work.longest_R=R;
+        s_path_work.longest_n=nseed;s_path_work.longest_start=best_s;
+        s_path_work.longest_ss=(uint64_t)circle_ss(s_seed,nseed,cx,cy,R);
+        s_path_work.longest_veto=((R<R_MIN_Q8 || R>R_MAX_Q8)?1U:0U)
+          | ((dcx*dcx+dcy*dcy>lim)?2U:0U)
+          | ((s_path_work.longest_ss*100U>(uint64_t)ARC_SEED_RMS2_X100*nseed*65536U)?4U:0U);
         if ((R >= R_MIN_Q8) && (R <= R_MAX_Q8)
             && (dcx * dcx + dcy * dcy <= lim)
             && (circle_ss(s_seed, nseed, cx, cy, R) * 100
@@ -949,6 +999,7 @@ static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_
     }
     if (!ok)
     {
+      s_path_work.partial_used=1U;
       if (fit_partial_arc(s_pts, nall, hx, hy, &cx, &cy, &R) != 0) { return -1; }
       /* Keep the longest run as the seed for tracing when it is long
        * enough; otherwise use every inlier in angle order. */
@@ -982,6 +1033,7 @@ static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_
   }
   {
     int32_t seed_cx = cx, seed_cy = cy, seed_R = R;
+    s_path_work.seed_cx=cx;s_path_work.seed_cy=cy;s_path_work.seed_R=R;s_path_work.seed_n=nseed;
     int a_end = (atan2_mdeg(s_seed[nseed - 1].y - cy, s_seed[nseed - 1].x - cx) + 500) / 1000;
     int a_beg = (atan2_mdeg(s_seed[0].y - cy, s_seed[0].x - cx) + 500) / 1000;
     memcpy(s_pts, s_seed, (size_t)nseed * sizeof(pt_t));
@@ -999,6 +1051,8 @@ static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_
       if (kasa_fit(s_pts, nn, &ncx, &ncy, &nR) != 0) { break; }
       cx = ncx; cy = ncy; R = nR; npts = nn;
     }
+    path_trace(s_pts,npts,cx,cy,R,seed_cx,seed_cy,seed_R);
+    s_path_work.shrink=(R < seed_R - 2*256)?1U:0U;
     /* A short/hidden arc may collapse during tracing: retain the seed
      * unless the smaller circle has near-full, tightly fitting support.
      * Compare both circles on the SAME traced points, not their different
@@ -1028,6 +1082,12 @@ static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_
           && (npts >= 180) && (bins >= 30) && (inliers * 10 >= npts * 9)
           && (trace_ss * 16 <= (int64_t)25 * npts * 65536)
           && (trace_ss * 4 <= seed_ss);
+      s_path_work.gate_keep=keep_trace;
+      s_path_work.gate_veto=((R<R_MIN_Q8 || R>R_MAX_Q8)?1U:0U)
+        | ((npts<180)?2U:0U) | ((bins<30)?4U:0U)
+        | ((inliers*10<npts*9)?8U:0U)
+        | ((trace_ss*16>(int64_t)25*npts*65536)?16U:0U)
+        | ((trace_ss*4>seed_ss)?32U:0U);
 #ifdef DIAL_HOST_DEBUG
       printf("  shrink gate: n=%d inliers=%d bins=%d trace_ss=%lld seed_ss=%lld keep=%d\n",
              npts, inliers, bins, (long long)trace_ss, (long long)seed_ss, keep_trace);
@@ -1047,8 +1107,10 @@ static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_
     for (i = 0; i < npts; i++) { occ[atan2_mdeg(s_pts[i].y - cy, s_pts[i].x - cx) / 10000] = 1U; }
     for (i = 0; i < 36; i++) { cov += occ[i]; }
     *pcov = cov;
+    s_path_work.final_cov=(uint32_t)cov;
   }
   *pcx = cx; *pcy = cy; *pR = R;
+  s_path_work.final_cx=cx;s_path_work.final_cy=cy;s_path_work.final_R=R;
   return 0;
 }
 
@@ -1511,13 +1573,16 @@ static int filter_tick_peaks(peak_t *pk, int n, int32_t cx, int32_t cy, int32_t 
   gmax = allow_half ? TICK_GAP_HALF : TICK_GAP_MAJOR;
   for (i = 0; i < n; i++)
   {
+    path_why(pk[i].a,8U);
     if (tick_ink_features(cx, cy, R, pk[i].a, gmax, &feats[nf]) != 0) { continue; }
+    path_why(pk[i].a,0U);
     feats[nf].a = pk[i].a;
     feats[nf].h = pk[i].h;
     feats[nf].dptr = have_pang ? iabs32(angdiff_mdeg(pk[i].a, pang_mdeg)) : 999999;
     feats[nf].rb_gap = red_black_gap(cx, cy, R, pk[i].a);
     nf++;
   }
+  s_path_work.feature_n=(uint32_t)nf;
   if (nf <= 0) { return 0; }
 #ifdef DIAL_HOST_DEBUG
   if (allow_half)
@@ -1566,6 +1631,12 @@ static int filter_tick_peaks(peak_t *pk, int n, int32_t cx, int32_t cy, int32_t 
   med_ctr = median_i(ctrs, longs_n);
 
   n1 = resolve_close_peaks(feats, nf, cx, cy, R, allow_half);
+  s_path_work.merged_n=(uint32_t)n1;
+  for(i=0;i<(int)s_path_work.raw_n && i<64;i++) if(s_path_work.why[i]==0U)s_path_work.why[i]=1U;
+  for(i=0;i<n1 && i<64;i++) {
+    s_path_work.merged_a[i]=feats[i].a;s_path_work.merged_h[i]=feats[i].h;
+    path_why(feats[i].a,0U);
+  }
   /* contrast / no-slot */
   {
     int w = 0;
@@ -1585,10 +1656,12 @@ static int filter_tick_peaks(peak_t *pk, int n, int32_t cx, int32_t cy, int32_t 
                feats[i].dptr / 1000.0);
       }
 #endif
+      if (drop) { path_why(feats[i].a,2U); }
       if (!drop) { if (w != i) { feats[w] = feats[i]; } w++; }
     }
     n1 = w;
   }
+  s_path_work.contrast_n=(uint32_t)n1;
   for (i = 0; i < n1; i++) { stage1[i] = feats[i]; }
 
   /* 0-5 pairing through the center using measured ink tips */
@@ -1604,11 +1677,12 @@ static int filter_tick_peaks(peak_t *pk, int n, int32_t cx, int32_t cy, int32_t 
       {
         int32_t da = iabs32(angdiff_mdeg(stage1[i].a + 180000, stage1[j].a));
         int32_t frac_q16 = 0;
-        if (da > PAIR_ANG_MDEG) { continue; }
-        if (!stage1[i].has_xy || !stage1[j].has_xy) { continue; }
+        if (da > PAIR_ANG_MDEG) { s_path_work.pair_ang_reject++; continue; }
+        if (!stage1[i].has_xy || !stage1[j].has_xy) { s_path_work.pair_xy_reject++; continue; }
         if (!line_center_ok(stage1[i].xin, stage1[i].yin, stage1[j].xin, stage1[j].yin,
                             cx, cy, R, &frac_q16))
         {
+          s_path_work.pair_center_reject++;
 #ifdef DIAL_HOST_DEBUG
           printf("  pair %d-%d dAng=%.1f dist/R=%.4f: not through center\n",
                  stage1[i].a / 1000, stage1[j].a / 1000, da / 1000.0, frac_q16 / 65536.0);
@@ -1623,6 +1697,7 @@ static int filter_tick_peaks(peak_t *pk, int n, int32_t cx, int32_t cy, int32_t 
         if (ne >= (int)(sizeof(edges) / sizeof(edges[0]))) { break; }
       }
     }
+    s_path_work.pair_edges=(uint32_t)ne;
     /* sort edges by (da, dist, nh) */
     for (i = 1; i < ne; i++)
     {
@@ -1651,6 +1726,7 @@ static int filter_tick_peaks(peak_t *pk, int n, int32_t cx, int32_t cy, int32_t 
 #endif
     }
   }
+  s_path_work.pairs_used=(uint32_t)(n_paired/2);
   off_g = 0; mb_g = 0;
   if (n_paired > 0) { phase_offset(paired_pk, n_paired, &off_g, &mb_g, allow_half); }
   step = allow_half ? STEP_MDEG : 36000;
@@ -1687,6 +1763,7 @@ static int filter_tick_peaks(peak_t *pk, int n, int32_t cx, int32_t cy, int32_t 
     }
     else if (rb0 && !(ink_ok && aligned))
     {
+      path_why(f->a,3U);
 #ifdef DIAL_HOST_DEBUG
       printf("  drop a=%d h=%d len=%d dptr=%.1f rb=%d: red-black shadow\n",
              f->a / 1000, (int)f->h, f->len, f->dptr / 1000.0, f->rb_gap);
@@ -1694,6 +1771,7 @@ static int filter_tick_peaks(peak_t *pk, int n, int32_t cx, int32_t cy, int32_t 
     }
     else if (near && !aligned)
     {
+      path_why(f->a,4U);
 #ifdef DIAL_HOST_DEBUG
       printf("  drop a=%d h=%d len=%d dptr=%.1f: ptr-offset shadow\n",
              f->a / 1000, (int)f->h, f->len, f->dptr / 1000.0);
@@ -1701,6 +1779,7 @@ static int filter_tick_peaks(peak_t *pk, int n, int32_t cx, int32_t cy, int32_t 
     }
     else if (near && !ink_ok)
     {
+      path_why(f->a,5U);
 #ifdef DIAL_HOST_DEBUG
       printf("  drop a=%d h=%d len=%d dptr=%.1f: ptr-cover weak ink\n",
              f->a / 1000, (int)f->h, f->len, f->dptr / 1000.0);
@@ -1723,9 +1802,14 @@ static int filter_tick_peaks(peak_t *pk, int n, int32_t cx, int32_t cy, int32_t 
       printf("  drop a=%d h=%d: no 0-5 style pair\n", f->a / 1000, (int)f->h);
     }
 #endif
-    if (keep) { kept[nk++] = *f; }
+    if (keep) { path_why(f->a,0U); kept[nk++] = *f; }
+    else if (!rb0 && !near && !is_paired[i] && !allow_half && !aligned) { path_why(f->a,6U); }
   }
-  for (i = 0; i < nk; i++) { pk[i].a = kept[i].a; pk[i].h = kept[i].h; }
+  s_path_work.accepted_n=(uint32_t)nk;
+  for (i = 0; i < nk; i++) {
+    pk[i].a = kept[i].a; pk[i].h = kept[i].h;
+    if(i<64){s_path_work.accepted_a[i]=pk[i].a;s_path_work.accepted_h[i]=pk[i].h;}
+  }
   return nk;
 }
 
@@ -3326,6 +3410,7 @@ static void dbg_note(int16_t cx, int16_t cy, int16_t hx, int16_t hy,
                      uint32_t area, uint16_t dtm, int8_t place,
                      uint8_t reason, uint8_t tip_sub, uint8_t n_vis)
 {
+  path_publish(reason,n_vis,place,hx,hy,area,dtm,tip_sub);
   uint8_t i = g_dial_dbg.n_cand;
   if (i < (uint8_t)DIAL_DBG_NCAND)
   {
@@ -3661,6 +3746,9 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
     int cov, k, k0 = 0;
     int32_t bdu = 0x7fffffff;
     dial_info_t *di;
+    memset(&s_path_work,0,sizeof(s_path_work));
+    s_path_work.run_seq=g_dial_dbg.seq;s_path_work.candidate=(uint32_t)b;
+    s_path_work.blob_x=cx0;s_path_work.blob_y=cy0;
     if (bl[b].area < CAND_MIN_AREA) {
       dbg_note((int16_t)(cx0 >> 8), (int16_t)(cy0 >> 8), -1, -1, bl[b].area, 0U,
                dbg_place_of(b, -1, -1, cx0, cy0), DIAL_FAIL_AREA, 0U, 0U);
@@ -3762,11 +3850,15 @@ int DialRead_Run(const uint16_t *raw, uint16_t *out, uint16_t w, uint16_t h,
     /* 5 ticks. Peak angles stay on the 1 px gap profile so a close
      * tadpole merge cannot slide a local max (235° -> 234°, 8.89 -> 8.90).
      * Close gaps are merged when measuring each detected tick. */
+    s_path_work.final_cx=cx;s_path_work.final_cy=cy;s_path_work.final_R=R;
+    s_path_work.final_cov=(uint32_t)cov;
     tick_len_profile(cx, cy, R, hist);
     {
       int allow_half = (di->place == 3);   /* only x0.0001; unknown -> no half ticks */
       int np, off, mb;
       np = find_peaks(hist, pk, 64, 7);
+      s_path_work.raw_n=(uint32_t)np;
+      for(int q_=0;q_<np && q_<64;q_++){s_path_work.raw_a[q_]=pk[q_].a;s_path_work.raw_h[q_]=pk[q_].h;s_path_work.why[q_]=8U;}
 #ifdef DIAL_HOST_DEBUG
       { int q_; printf("  dial@(%d,%d) place=%d allow_half=%d c=(%.2f,%.2f,%.2f)\n  raw peaks %d:", cx0 >> 8, cy0 >> 8, di->place, allow_half, cx/256.0, cy/256.0, R/256.0, np); for (q_ = 0; q_ < np; q_++) printf(" %d:%d", pk[q_].a / 1000, pk[q_].h); printf("\n"); }
 #endif

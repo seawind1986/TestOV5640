@@ -25,6 +25,7 @@
 #include "ov5640.h"
 #include "meter_locate.h"
 #include "dial_read.h"
+#include "dial_path_debug.h"
 #include "speed_track.h"
 #include "star_track.h"
 #include "net_app.h"
@@ -89,6 +90,14 @@ typedef struct
   uint32_t hold_gen0, hold_gen1, live_hud_n, used_frame0, used_frame1;
 } meter_raw_diag_t;
 volatile meter_raw_diag_t g_meter_raw_diag;
+/* Optional diagnostics only: preserve one failed RAW input in unused SDRAM.
+ * It never holds the live camera, LCD, or next recognition snapshot. */
+#define DIAL_FAILED_RAW_ADDR 0xC1E00000UL
+typedef struct {
+ uint32_t request,ready,version,seq,run_seq,gen,stamp,hash,addr,bytes,copies,epoch;
+} meter_failed_raw_t;
+volatile meter_failed_raw_t g_meter_failed_raw;
+
 /* 快门邮箱在 SDRAM 末段固定地址，该区已配成非缓存，J-Link 写入后 CPU 立刻能读到。
  * 0：连续捕获并识别。非 0：冻结当前画面，只识别这一帧，直到复位。 */
 #define SHUTTER_MAIL_ADDR      0xC1FFF000UL
@@ -3428,6 +3437,7 @@ static void StarMode_Service(void)
   static uint8_t prev_ok;
   static uint32_t entry_epoch;
   uint32_t wb;
+  uint32_t debug_raw_copied = 0U;
   if (entry_epoch != g_meter_epoch) { entry_epoch = g_meter_epoch; prev_ok = 0U; }
 
   if (g_meter_mode != METER_MODE_STAR)
@@ -3582,6 +3592,15 @@ static void DialRead_Service(void)
   g_meter_raw_diag.used_gen = g_meter_raw_diag.snap_gen;
   g_meter_raw_diag.used_stamp = g_meter_raw_diag.snap_stamp;
   g_meter_raw_diag.used_frame0 = cam_frame_count;
+  if ((g_meter_failed_raw.request != 0U) && (g_meter_failed_raw.ready == 0U)
+      && (DIAL_WORK_ADDR + wb <= DIAL_FAILED_RAW_ADDR)
+      && (DIAL_FAILED_RAW_ADDR + LCD_FB_BYTES < SHUTTER_MAIL_ADDR))
+  {
+    memcpy((void *)DIAL_FAILED_RAW_ADDR,(const void *)DIAL_SNAP_ADDR,LCD_FB_BYTES);
+    __DMB();
+    g_meter_failed_raw.copies++;
+    debug_raw_copied = 1U;
+  }
   /* Run and its cooperative yields may refresh any number of LCD frames.
    * request stays clear, so none can overwrite this private RAW snapshot. */
   (void)DialRead_Run((const uint16_t *)DIAL_SNAP_ADDR,
@@ -3591,6 +3610,19 @@ static void DialRead_Service(void)
   g_meter_raw_diag.used_frame1 = cam_frame_count;
   DialRead_FinishReport(&work_rep, &prev_ts, &have_prev);
   g_meter_raw_diag.used_seq = g_meter_volume_seq;
+  if ((debug_raw_copied != 0U) && ((g_dial_dbg.miss_place & 1U) != 0U))
+  {
+    g_meter_failed_raw.version++;
+    if (g_dial_path_failure.record.run_seq == g_dial_dbg.seq)
+    { g_dial_path_held = g_dial_path_failure; }
+    g_meter_failed_raw.seq=g_meter_volume_seq;g_meter_failed_raw.run_seq=g_dial_dbg.seq;
+    g_meter_failed_raw.gen=g_meter_raw_diag.used_gen;g_meter_failed_raw.stamp=g_meter_raw_diag.used_stamp;
+    g_meter_failed_raw.hash=g_meter_raw_diag.hash_used;g_meter_failed_raw.epoch=g_meter_epoch;
+    g_meter_failed_raw.addr=DIAL_FAILED_RAW_ADDR;g_meter_failed_raw.bytes=LCD_FB_BYTES;
+    __DMB();
+    g_meter_failed_raw.request=0U;g_meter_failed_raw.ready=1U;
+    __DMB();g_meter_failed_raw.version++;
+  }
   g_meter_raw_diag.busy = 0U;
   if (shutter_armed != 0U)
   {
@@ -3775,6 +3807,7 @@ static void MeterMode_Service(void)
   shutter_armed = 0U; shutter_done = 0U;
   g_meter_raw_diag.request = 0U; g_meter_raw_diag.ready = 0U;
   g_meter_raw_diag.busy = 0U; g_meter_raw_diag.used_seq = 0U;
+  g_meter_failed_raw.request=0U;g_meter_failed_raw.ready=0U;
   cam_arm = 0U; cam_restart = 0U; cam_ready = 0U;
   cam_scale_ready = 0U; cam_out_jpeg = 0U; cam_curline = 0U; cam_draw_full = 2U;
   meter_hold_fb = 0U; meter_want_snap = 0U; meter_frame_ready = 0U;
