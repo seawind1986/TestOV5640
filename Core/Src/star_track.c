@@ -19,6 +19,10 @@
 #define RATE_MIN_US  1000000U
 /* 测量窗（梅花轮）：单圈 <30 s 累加整圈到总时长 >30 s；单圈 >=30 s 跑 1 圈（至少一整圈）。 */
 #define MW_TOTAL_US  30000000U
+/* 测完多少行后停止出新行（白线、圆环照常实时刷新）；0 = 一直测下去，列表显示最新 10 行滚动。 */
+#ifndef STAR_MAX_MEAS
+#define STAR_MAX_MEAS 0U
+#endif
 #define LOST_US      1500000U
 #define MAX_CAND     24
 #define DARK_PCT     55        /* 暗阈值 = 亮度中位数 × 55% */
@@ -57,6 +61,7 @@ uint32_t g_star_meas_dt_us[STAR_MEAS_HIST];
 int32_t  g_star_meas_ang_mdeg[STAR_MEAS_HIST];   /* 每次测量的总转角，m° */
 int32_t  g_star_meas_dps_e3[STAR_MEAS_HIST];     /* 每次测量 °/s ×1000 */
 uint8_t  g_star_meas_laps[STAR_MEAS_HIST];
+uint32_t g_star_meas_total;     /* 上电（重新锁定）以来完成的测量行数，不回绕 */
 double   g_star_wheel_deg;      /* 展开后的轮转角（相对起点，有符号，°） */
 int32_t  g_star_ang_mdeg;       /* 白线（缺口中心参考）当前角 0~360°，m° */
 int32_t  g_star_dps_e3;         /* 约 2 s 窗口的实时 °/s ×1000 */
@@ -157,6 +162,7 @@ static void track_reset(void)
   g_star_seq = 0U;
   g_star_meas_n = 0U;
   g_star_meas_i = 0U;
+  g_star_meas_total = 0U;
   g_star_rep_e4 = 0;
   g_star_gap_n = 0U;
   g_star_lowq_n = 0U;
@@ -758,6 +764,7 @@ static void meas_record(uint32_t dt_us, double ang_deg, uint8_t laps)
   g_star_meas_dps_e3[i] = (int32_t)(((aa * 1.0e9) / (double)dt_us) + 0.5);
   g_star_meas_laps[i] = laps;
   g_star_seq++;
+  g_star_meas_total++;
   if (g_star_seq > 999U) { g_star_seq = 1U; }
   g_star_meas_seq[i] = g_star_seq;
   g_star_meas_i = (uint8_t)((i + 1U) % STAR_MEAS_HIST);
@@ -826,9 +833,11 @@ static void lap_step(uint32_t stamp)
     if (done != 0U)
     {
       meas_record(tot, s_mw_ang, g_star_mw_laps);
+      /* 下一次测量从这一帧紧接着开始，累计角不清零。 */
       s_mw_t0 = stamp;
       s_mw_ang = 0.0;
       g_star_mw_laps = 0U;
+      if ((STAR_MAX_MEAS > 0U) && (g_star_meas_total >= STAR_MAX_MEAS)) { s_meas_on = 0U; }
     }
     s_lap_t0 = stamp;
     s_lap_a0 = g_star_wheel_deg;
@@ -1417,16 +1426,13 @@ void StarTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h, int16_t ox, int
   p = l3;
   if ((phase >= 2U) && (s_have_prev != 0U))
   {
+    /* 与升针一致：满 3 次测量才显示重复性和列表 */
     if (g_star_meas_n >= 3U)
     {
       p = put_frac(p, (uint32_t)g_star_rep_e4, 10000U, 4);
       *p++ = '%';
+      *p++ = ' ';
     }
-    else
-    {
-      p = put_str(p, "---");
-    }
-    *p++ = ' ';
     p = put_frac(p, (uint32_t)(g_star_ang_mdeg / 10), 100U, 2);
     p = put_str(p, CH_DEG " ");
     p = put_frac(p, (uint32_t)g_star_dps_e3, 1000U, 3);
@@ -1460,7 +1466,7 @@ void StarTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h, int16_t ox, int
   p = put_str(p, CH_DEG);
   *p = 0;
 
-  nk = (int)g_star_meas_n;
+  nk = (g_star_meas_n >= 3U) ? (int)g_star_meas_n : 0;
   tw = measure_str(l1);
   xv = measure_str(l2); if (xv > tw) { tw = xv; }
   xv = measure_str(l3); if (xv > tw) { tw = xv; }
