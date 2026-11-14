@@ -67,6 +67,9 @@ volatile uint32_t g_meter_epoch;
 volatile uint32_t g_meter_status; /* 0启动, 1停采集, 2复位算法, 3全幅初始化, 4运行, 0xE错误 */
 volatile uint32_t g_meter_last_key; /* 1左 PC13, 2下 PH2, 3右 PH3；上 PA0 不切模式 */
 volatile uint32_t g_meter_key_n;
+volatile uint32_t g_meter_key_raw;
+volatile uint32_t g_meter_key_stable;
+volatile uint32_t g_meter_key_ticks;
 volatile uint32_t g_meter_req_source; /* 1物理键, 2调试请求 */
 volatile uint32_t g_meter_last_from;
 volatile uint32_t g_meter_last_to;
@@ -3568,13 +3571,16 @@ void MeterKeys_Tick(void)
   uint32_t now = HAL_GetTick();
   uint8_t raw = 0U, pressed;
   if (meter_keys_ready == 0U) { return; }
+  g_meter_key_ticks++;
   if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) { raw |= 1U; }
   if (HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_2) == GPIO_PIN_RESET) { raw |= 2U; }
   if (HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_3) == GPIO_PIN_RESET) { raw |= 4U; }
+  g_meter_key_raw = raw;
   if (raw != raw_last) { raw_last = raw; raw_since = now; return; }
   if ((uint32_t)(now - raw_since) < 30U) { return; }
   pressed = (uint8_t)(raw & (uint8_t)~stable);
   stable = raw;
+  g_meter_key_stable = stable;
   /* 多键同时按不选；按住不会重复触发。 */
   if ((pressed == 0U) || ((raw != 1U) && (raw != 2U) && (raw != 4U))) { return; }
   g_meter_last_key = (raw == 1U) ? 1U : ((raw == 2U) ? 2U : 3U);
