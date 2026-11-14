@@ -78,6 +78,17 @@ static volatile uint32_t meter_keys_ready;
 /* Snapshot + work sit after the JPEG photo buffer, not on CAM_BUF0. */
 #define DIAL_SNAP_ADDR         (((PHOTO_ADDR + PHOTO_MAX) + 7UL) & ~7UL)
 #define DIAL_WORK_ADDR         (DIAL_SNAP_ADDR + LCD_FB_BYTES)
+/* RAW snapshot lease. Only the completed back buffer is copied, before
+ * any HUD paint. DIAL_SNAP is private to the consumer until Run returns. */
+typedef struct
+{
+  uint32_t request, ready, busy, frame_gen, paint_gen;
+  uint32_t snap_gen, snap_stamp, source, copy_us, copy_n;
+  uint32_t bad_copy, painted_skip, before_hud_n;
+  uint32_t used_gen, used_stamp, used_seq, hash_saved, hash_used, hash_bad;
+  uint32_t hold_gen0, hold_gen1, live_hud_n, used_frame0, used_frame1;
+} meter_raw_diag_t;
+volatile meter_raw_diag_t g_meter_raw_diag;
 /* 快门邮箱在 SDRAM 末段固定地址，该区已配成非缓存，J-Link 写入后 CPU 立刻能读到。
  * 0：连续捕获并识别。非 0：冻结当前画面，只识别这一帧，直到复位。 */
 #define SHUTTER_MAIL_ADDR      0xC1FFF000UL
@@ -1214,6 +1225,59 @@ static void LCD_FillBackground(void)
   }
 }
 
+/* No yield/present inside this copy: cam_draw_full==1 leases lcd_draw
+ * to the main loop. The line ISR only writes at state 0; frame callbacks
+ * leave state 1 alone. IRQs/camera continue, but cannot recycle this buffer.
+ * SDRAM is MPU non-cacheable and D-cache is not enabled; no invalidate of
+ * CPU-produced DMA-line copies is required (and could discard real writes). */
+static uint32_t VolumeRaw_Hash(const uint32_t *p)
+{
+  uint32_t i, h = 2166136261U;
+  for (i = 0U; i < LCD_FB_BYTES / 4U; i++) { h = (h ^ p[i]) * 16777619U; }
+  return h;
+}
+
+static void VolumeRaw_Capture(void)
+{
+  uint32_t src, gen, stamp, t0, i, h = 2166136261U;
+  const uint32_t *p;
+  uint32_t *d = (uint32_t *)DIAL_SNAP_ADDR;
+  if ((g_meter_mode != METER_MODE_VOLUME) || (g_meter_switching != 0U)
+      || (g_meter_raw_diag.request == 0U) || (g_meter_raw_diag.ready != 0U)
+      || (g_meter_raw_diag.busy != 0U) || (cam_draw_full != 1U)) { return; }
+  /* Volume restores full-frame 1024x600 RGB565, one sensor row per LCD row.
+   * Never mistake an old/scaled/HUD-painted LCD surface for camera RAW. */
+  if ((cam_out_jpeg != 0U) || (cam_w != LCD_WIDTH) || (cam_h != LCD_HEIGHT)
+      || (cam_vw != cam_w) || (cam_vh != cam_h) || (cam_ox != 0U) || (cam_oy != 0U))
+  { return; }
+  gen = g_meter_raw_diag.frame_gen;
+  if ((gen == 0U) || (g_meter_raw_diag.paint_gen == gen))
+  { g_meter_raw_diag.painted_skip++; return; }
+  src = lcd_draw; stamp = cam_stamp_us; t0 = TIM2->CNT;
+  p = (const uint32_t *)src;
+  __DMB();
+  for (i = 0U; i < LCD_FB_BYTES / 4U; i++)
+  {
+    uint32_t v = p[i]; d[i] = v; h = (h ^ v) * 16777619U;
+  }
+  __DMB();
+  g_meter_raw_diag.hold_gen0 = gen;
+  g_meter_raw_diag.hold_gen1 = g_meter_raw_diag.frame_gen;
+  if ((cam_draw_full != 1U) || (lcd_draw != src) || (cam_stamp_us != stamp)
+      || (g_meter_raw_diag.frame_gen != gen) || (g_meter_raw_diag.paint_gen == gen))
+  { g_meter_raw_diag.bad_copy++; return; }
+  g_meter_raw_diag.source = src;
+  g_meter_raw_diag.snap_gen = gen;
+  g_meter_raw_diag.snap_stamp = stamp;
+  g_meter_raw_diag.hash_saved = h;
+  g_meter_raw_diag.copy_us = TIM2->CNT - t0;
+  g_meter_raw_diag.copy_n++;
+  g_meter_raw_diag.before_hud_n++;
+  g_meter_raw_diag.request = 0U;
+  __DMB();
+  g_meter_raw_diag.ready = 1U; /* publish only after the complete copy */
+}
+
 /* 返回 0 表示已经在场消隐里切到 shown，可以开始往另一块缓冲写。 */
 static int LCD_Present(void)
 {
@@ -1258,7 +1322,9 @@ static void Shutter_Init(void)
 /* 快门或定位冻结时，不再把新的镜头画面写到液晶或换屏。 */
 static int CamLcdFrozen(void)
 {
-  return ((meter_hold_fb != 0U) || (shutter_armed != 0U) || (shutter_flag != 0U)) ? 1 : 0;
+  /* Volume must acquire a fresh RAW frame before honoring a shutter hold. */
+  return ((meter_hold_fb != 0U) || (shutter_armed != 0U)
+      || ((g_meter_mode != METER_MODE_VOLUME) && (shutter_flag != 0U))) ? 1 : 0;
 }
 
 static void Shutter_Service(uint8_t allow_present)
@@ -1267,6 +1333,16 @@ static void Shutter_Service(uint8_t allow_present)
   {
     if (shutter_armed == 0U)
     {
+      if (g_meter_mode == METER_MODE_VOLUME)
+      {
+        /* A trigger during sliced Run waits for its private buffer lease to
+         * end. Never overwrite Run's input or freeze a painted front frame
+         * and then use it as recognition input. */
+        if (g_meter_raw_diag.busy != 0U) { return; }
+        if (g_meter_raw_diag.ready == 0U) { g_meter_raw_diag.request = 1U; }
+        VolumeRaw_Capture();
+        if (g_meter_raw_diag.ready == 0U) { return; }
+      }
       /* 若后缓冲已经写满，先换上这一帧再冻结，更接近按下快门的那一瞬。
        * 正在拷贝识别帧时不允许换屏，避免把正在复制的画面撕开。 */
       if ((allow_present != 0U) && (cam_draw_full == 1U) &&
@@ -1305,10 +1381,13 @@ static void LCD_PresentLive(void)
   }
   if (g_meter_mode == METER_MODE_VOLUME)
   {
+    VolumeRaw_Capture(); /* MUST precede all green/blue/text overlays */
     if (dial_hud_ready != 0U)
     {
       DialRead_PaintHud((uint16_t *)lcd_draw, (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
                         &dial_hud_rep);
+      g_meter_raw_diag.paint_gen = g_meter_raw_diag.frame_gen;
+      g_meter_raw_diag.live_hud_n++;
     }
   }
   else if (g_meter_mode == METER_MODE_STAR)
@@ -2394,6 +2473,12 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *dcmi)
     else if ((cam_draw_full == 0U) && (cam_curline >= cam_h) && (cam_h != 0U))
     {
       cam_stamp_us = TIM2->CNT;
+      if (g_meter_mode == METER_MODE_VOLUME)
+      {
+        g_meter_raw_diag.frame_gen++;
+        if (g_meter_raw_diag.frame_gen == 0U) { g_meter_raw_diag.frame_gen++; }
+      }
+      __DMB();
       cam_draw_full = 1U;
     }
     CAM_ResyncRgbDma();
@@ -2847,24 +2932,6 @@ void dial_yield(void)
   CAM_ScaleToLcd();
   LCD_PresentLive();
   dial_yield_lock = 0U;
-}
-
-static void DialRead_CopyShown(uint16_t *dst)
-{
-  const uint16_t *src = (const uint16_t *)lcd_frame_addr;
-  uint32_t y;
-  uint32_t x;
-
-  for (y = 0U; y < LCD_HEIGHT; y++)
-  {
-    const uint32_t *s = (const uint32_t *)(src + (y * LCD_WIDTH));
-    uint32_t *d = (uint32_t *)(dst + (y * LCD_WIDTH));
-    for (x = 0U; x < (LCD_WIDTH / 2U); x++)
-    {
-      d[x] = s[x];
-    }
-    dial_yield();
-  }
 }
 
 static void DialRead_FinishReport(dial_report_t *work_rep, dial_time_t *prev_ts, uint8_t *have_prev)
@@ -3492,36 +3559,49 @@ static void DialRead_Service(void)
   {
     return;
   }
-  /* 快门置位后只识别冻结的那一帧，结果直接画在正在显示的显存上。 */
-  if (shutter_armed != 0U)
+  if ((shutter_flag != 0U) && (shutter_armed == 0U)) { return; }
+  if ((shutter_armed != 0U) && (shutter_done != 0U)) { return; }
+  if (g_meter_raw_diag.ready == 0U)
   {
-    if (shutter_done != 0U)
-    {
-      return;
-    }
-    DialRead_CopyShown((uint16_t *)DIAL_SNAP_ADDR);
-    (void)DialRead_Run((const uint16_t *)DIAL_SNAP_ADDR,
-                       (uint16_t *)DIAL_SNAP_ADDR,
-                       (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
-                       (uint8_t *)DIAL_WORK_ADDR, wb, &work_rep);
-    DialRead_FinishReport(&work_rep, &prev_ts, &have_prev);
-    DialRead_PaintHud((uint16_t *)lcd_frame_addr, (uint16_t)LCD_WIDTH,
-                      (uint16_t)LCD_HEIGHT, &dial_hud_rep);
-    shutter_done = 1U;
+    g_meter_raw_diag.request = 1U;
+    return; /* next complete frame is copied by the pre-HUD handoff */
+  }
+  __DMB();
+  g_meter_raw_diag.hash_used = VolumeRaw_Hash((const uint32_t *)DIAL_SNAP_ADDR);
+  if (g_meter_raw_diag.hash_used != g_meter_raw_diag.hash_saved)
+  {
+    g_meter_raw_diag.hash_bad++;
+    g_meter_raw_diag.ready = 0U;
+    g_meter_raw_diag.request = 1U;
     return;
   }
-  shutter_done = 0U;
-  DialRead_CopyShown((uint16_t *)DIAL_SNAP_ADDR);
-  /* Run memsets the report at start; keep the displayed HUD on the last
-   * finished result so the top-left text does not blink or get cleared. */
+  g_meter_raw_diag.busy = 1U;
+  g_meter_raw_diag.ready = 0U;
+  g_meter_raw_diag.used_gen = g_meter_raw_diag.snap_gen;
+  g_meter_raw_diag.used_stamp = g_meter_raw_diag.snap_stamp;
+  g_meter_raw_diag.used_frame0 = cam_frame_count;
+  /* Run and its cooperative yields may refresh any number of LCD frames.
+   * request stays clear, so none can overwrite this private RAW snapshot. */
   (void)DialRead_Run((const uint16_t *)DIAL_SNAP_ADDR,
                      (uint16_t *)DIAL_SNAP_ADDR,
                      (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
                      (uint8_t *)DIAL_WORK_ADDR, wb, &work_rep);
-  /* Interval uses the same RTC sample as line1, so the milliseconds
-   * match the change in the date/time stamp. TIM2 was running fast
-   * (about 23 s shown for a real 4 s gap). */
+  g_meter_raw_diag.used_frame1 = cam_frame_count;
   DialRead_FinishReport(&work_rep, &prev_ts, &have_prev);
+  g_meter_raw_diag.used_seq = g_meter_volume_seq;
+  g_meter_raw_diag.busy = 0U;
+  if (shutter_armed != 0U)
+  {
+    /* Display-only paint; never recycled as input after shutter release. */
+    DialRead_PaintHud((uint16_t *)lcd_frame_addr, (uint16_t)LCD_WIDTH,
+                     (uint16_t)LCD_HEIGHT, &dial_hud_rep);
+    shutter_done = 1U;
+  }
+  else
+  {
+    shutter_done = 0U;
+    g_meter_raw_diag.request = 1U;
+  }
 }
 
 static void MeterLocate_Service(void)
@@ -3691,6 +3771,8 @@ static void MeterMode_Service(void)
   memset((void *)&g_meter_volume_diag, 0, sizeof(g_meter_volume_diag));
   speed_phase = 0U; g_star_phase = 0U; g_star_loc_fail = 0U;
   shutter_armed = 0U; shutter_done = 0U;
+  g_meter_raw_diag.request = 0U; g_meter_raw_diag.ready = 0U;
+  g_meter_raw_diag.busy = 0U; g_meter_raw_diag.used_seq = 0U;
   cam_arm = 0U; cam_restart = 0U; cam_ready = 0U;
   cam_scale_ready = 0U; cam_out_jpeg = 0U; cam_curline = 0U; cam_draw_full = 2U;
   meter_hold_fb = 0U; meter_want_snap = 0U; meter_frame_ready = 0U;
