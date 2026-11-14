@@ -3159,7 +3159,11 @@ static void SpeedTrack_Service(void)
 
 
 /* ===== 梅花轮齿频模式（METER_MODE_STAR）。升针模式的函数不动，这里另写一份。 ===== */
-#define STAR_CROP_MARGIN  40   /* 裁窗在齿顶圆外再留 40 像素 */
+#define STAR_CROP_MARGIN  24   /* 裁窗在齿顶圆外再留 24 像素（小窗里会再定位一次） */
+/* 实测：HTS 2303 × VTS 1023 时帧完成中断约 9.59 帧/s，传感器行场时钟约 22.6 MHz，
+ * 不是 ov5640.c 默认假设的 109 MHz。梅花轮小窗按实测值算 50Hz 消纹步长，VTS 取最小，帧率约 45 帧/s。 */
+#define STAR_PCLK_HZ      22585000UL
+#define STAR_NATIVE_FPS   120U
 
 static void StarMode_OpenFull(void)
 {
@@ -3171,6 +3175,8 @@ static void StarMode_OpenFull(void)
     __enable_irq();
   }
   StarTrack_Reset();
+  ov5640_pclk_hz = 2625000000UL / (6U * 4U);
+  ov5640_native_fps = 50U;
   (void)HAL_DCMI_Stop(&hdcmi);
   cam_arm = 0U;
   cam_curline = 0U;
@@ -3254,6 +3260,8 @@ static void StarMode_ApplyCrop(uint16_t lx, uint16_t ly, uint16_t lw, uint16_t l
   LCD_FillBothBlack();
   OV5640_PowerCycle();
   CamDbg_Mark(2U);
+  ov5640_pclk_hz = STAR_PCLK_HZ;
+  ov5640_native_fps = STAR_NATIVE_FPS;
   OV5640_RgbLcdNativeWindow(g_cam_dbg.crop_sx, g_cam_dbg.crop_sy,
                             g_cam_dbg.crop_sw, g_cam_dbg.crop_sh);
   CamDbg_Mark(3U);

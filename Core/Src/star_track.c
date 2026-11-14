@@ -41,6 +41,9 @@ uint8_t  g_star_meas_i;
 uint32_t g_star_gap_n;
 uint32_t g_star_lowq_n;
 uint32_t g_star_good_n;
+uint32_t g_star_lost_n;          /* 1.5 s 无有效帧、回小窗重定位的次数 */
+uint32_t g_star_arm_n;           /* 建表次数 */
+uint16_t g_star_bad_lines;       /* 最近一次行数不对的帧的行数 */
 int32_t  g_star_rep_e4;
 int32_t  g_star_dir;            /* +1/-1，相位增加方向 */
 float    g_star_last_q;
@@ -542,6 +545,7 @@ int StarTrack_Arm(uint16_t cap_w, uint16_t cap_h)
   s_row1 = (uint16_t)y1;
   s_ring_tail = s_ring_head;
   s_gen = (uint8_t)(s_gen + 1U);
+  g_star_arm_n++;
   s_tab_on = 1U;
   g_star.armed = 1U;
   return 0;
@@ -607,6 +611,7 @@ void StarTrack_IsrFrame(uint32_t stamp_us, uint16_t lines_expect)
   else if (s_tab_on != 0U)
   {
     g_star_isr_bad++;
+    if (nl != lines_expect) { g_star_bad_lines = nl; }
   }
   for (k = 0U; k < STAR_BINS; k++) { s_acc[k] = 0U; }
   s_frame_tab = s_tab_on;
@@ -738,8 +743,10 @@ int StarTrack_Tick(uint32_t now_us)
       g_star_tps_e3 = (int32_t)(((d * 1.0e9) / dt) + 0.5);
     }
   }
-  if ((s_tab_on != 0U) && (s_have_prev != 0U) && ((now_us - s_last_good) > LOST_US))
+  /* 有符号比较：本次刚消化的帧可能比 now_us 晚一点打戳。 */
+  if ((s_tab_on != 0U) && (s_have_prev != 0U) && ((int32_t)(now_us - s_last_good) > (int32_t)LOST_US))
   {
+    g_star_lost_n++;
     return 1;
   }
   return 0;

@@ -11,6 +11,9 @@ void OV5640_ApplyView(void);
 void OV5640_RgbLcdPreview(uint16_t width, uint16_t height);
 /* 0：不写传感器。非 0：把起点和范围写进传感器。 */
 extern volatile uint8_t ov5640_win_write;
+/* 行场定时用的像素时钟估值和小窗目标帧率。默认 109375000 / 50，与原来一致。 */
+extern uint32_t ov5640_pclk_hz;
+extern uint8_t  ov5640_native_fps;
 /* x、y 是阵列上的起点，宽高是开窗范围。坐标会收进阵列并按偶数对齐。 */
 void OV5640_SetWindowPos(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
 /* x、y 以摄像头画面中心为原点，向右、向下为正。开窗中心放在这个点上，再按同一比例缩进 LCD。 */

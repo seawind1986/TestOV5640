@@ -641,6 +641,9 @@ static uint16_t ov5640_gain = 0x00F0U;
 static uint16_t ov5640_hts = 2308U;
 static uint16_t ov5640_vts_min = 900U;
 static uint8_t ov5640_native;
+/* 小窗定时：默认值与原先写死的常数相同（升针模式不变）。梅花轮模式按实测时钟改写。 */
+uint32_t ov5640_pclk_hz = 2625000000UL / (6U * 4U);
+uint8_t  ov5640_native_fps = 50U;
 
 void OV5640_SetWindowPos(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
 {
@@ -790,7 +793,7 @@ void OV5640_SetGain(uint16_t gain)
 /* 50Hz 灯光一个明暗周期是 10ms。步长（行）= PCLK / HTS / 100，自动曝光按这个整数倍取快门。 */
 static void OV5640_ApplyBand50(uint16_t hts, uint16_t vts)
 {
-  uint32_t pclk_hz = 2625000000UL / (6U * 4U);
+  uint32_t pclk_hz = ov5640_pclk_hz;
   uint32_t line_hz;
   uint32_t step50;
   uint32_t step60;
@@ -1070,8 +1073,8 @@ static void OV5640_FitOutput(void)
      * PCLK ≈ 109.375 MHz，把 HTS*VTS 拉到约 50 fps，既高于 10 齿/s 所需，又跑得稳。 */
     if (ov5640_native != 0U)
     {
-      uint32_t pclk_hz = 2625000000UL / (6U * 4U);
-      uint32_t target = pclk_hz / 50U;
+      uint32_t pclk_hz = ov5640_pclk_hz;
+      uint32_t target = pclk_hz / (uint32_t)((ov5640_native_fps != 0U) ? ov5640_native_fps : 50U);
       uint32_t prod = (uint32_t)hts * (uint32_t)vts;
       if (prod < target)
       {
