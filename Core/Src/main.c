@@ -26,6 +26,7 @@
 #include "meter_locate.h"
 #include "dial_read.h"
 #include "speed_track.h"
+#include "star_track.h"
 #include "net_app.h"
 /* USER CODE END Includes */
 
@@ -51,10 +52,12 @@
 #define METER_LOCATE_ON       1U
 /* 1: run the new dial-read pipeline (seam + rectify + 4-dial reading) on each LCD frame. */
 #define DIAL_READ_ON           1U
-/* 功能模式：0 四指针读体积（源文件不改，只作为可切换模式保留），1 升针/梅花轮转速跟踪。 */
+/* 功能模式：0 四指针读体积（源文件不改，只作为可切换模式保留），1 升针转速跟踪，
+ * 2 梅花轮齿频（star_track.c）。切回升针测速只改下面一行为 METER_MODE_SPEED。 */
 #define METER_MODE_VOLUME      0U
 #define METER_MODE_SPEED       1U
-#define METER_MODE             METER_MODE_SPEED
+#define METER_MODE_STAR        2U
+#define METER_MODE             METER_MODE_STAR
 /* Snapshot + work sit after the JPEG photo buffer, not on CAM_BUF0. */
 #define DIAL_SNAP_ADDR         (((PHOTO_ADDR + PHOTO_MAX) + 7UL) & ~7UL)
 #define DIAL_WORK_ADDR         (DIAL_SNAP_ADDR + LCD_FB_BYTES)
@@ -127,6 +130,7 @@ static void Shutter_Service(uint8_t allow_present);
 static int CamLcdFrozen(void);
 static void DialRead_Service(void);
 static void SpeedTrack_Service(void);
+static void StarMode_Service(void);
 static void CAM_Init(void);
 static void CAM_Start(void);
 static int CAM_Kick(void);
@@ -247,6 +251,10 @@ int main(void)
     if (METER_MODE == METER_MODE_VOLUME)
     {
       DialRead_Service();
+    }
+    else if (METER_MODE == METER_MODE_STAR)
+    {
+      StarMode_Service();
     }
     else
     {
@@ -813,6 +821,8 @@ static void CamDbg_SnapSensor(void)
   CamDbg_SnapLive();
 }
 static uint8_t speed_phase;
+uint8_t  g_star_phase;      /* 梅花轮模式：0 全幅找轮，1 裁窗后在小窗里再定位，2 测齿频 */
+uint16_t g_star_loc_fail;
 #define CROP_SETTLE_US  1000000U  /* 裁窗后等自动曝光约 1 s 再开始认针 */
 #define FULL_SETTLE_US  2000000U  /* 全幅找针前等自动曝光约 2 s */
 uint8_t  g_crop_settling;
@@ -1263,6 +1273,13 @@ static void LCD_PresentLive(void)
       DialRead_PaintHud((uint16_t *)lcd_draw, (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
                         &dial_hud_rep);
     }
+  }
+  else if (METER_MODE == METER_MODE_STAR)
+  {
+    dial_time_t now;
+    dial_get_time(&now);
+    StarTrack_Paint((uint16_t *)lcd_draw, (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
+                    (int16_t)cam_ox, (int16_t)cam_oy, cam_stamp_us, &now, g_star_phase);
   }
   else
   {
@@ -1861,7 +1878,7 @@ static void CAM_LoadView(void)
   cam_w = cw;
   cam_h = ch;
   /* 速度模式裁窗后，1:1 实时画面固定放在屏幕右上角，左侧给测量列表。 */
-  if ((METER_MODE == METER_MODE_SPEED) &&
+  if (((METER_MODE == METER_MODE_SPEED) || (METER_MODE == METER_MODE_STAR)) &&
       (cam_w == cam_vw) && (cam_h == cam_vh) &&
       (cam_w < LCD_WIDTH) && (cam_h < LCD_HEIGHT) &&
       (cam_w >= 80U) && (cam_h >= 80U))
@@ -1950,6 +1967,11 @@ static void CAM_RgbLineIsr(void)
   DMA1->LIFCR = DMA_LIFCR_CTCIF1 | DMA_LIFCR_CHTIF1 | DMA_LIFCR_CTEIF1 |
                 DMA_LIFCR_CDMEIF1 | DMA_LIFCR_CFEIF1;
   src = ((dma->CR & DMA_SxCR_CT) != 0U) ? cam_line_buf[0] : cam_line_buf[1];
+  if (METER_MODE == METER_MODE_STAR)
+  {
+    /* 梅花轮：每一行都按圆环采样，不管这一帧是否上屏，帧率按传感器算。 */
+    StarTrack_IsrLine(src);
+  }
   line = cam_curline;
   if ((cam_w == cam_vw) && (cam_h == cam_vh))
   {
@@ -2322,6 +2344,10 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *dcmi)
   cam_frame_count++;
   if (hdcmi.Init.JPEGMode != DCMI_JPEG_ENABLE)
   {
+    if (METER_MODE == METER_MODE_STAR)
+    {
+      StarTrack_IsrFrame(TIM2->CNT, cam_h);
+    }
     /* 2：上一场已经上屏，这一场开始再写后缓冲。1：后缓冲写满，等主循环换屏。 */
     if ((cam_draw_full == 2U) && (CamLcdFrozen() == 0))
     {
@@ -3131,6 +3157,236 @@ static void SpeedTrack_Service(void)
   SpeedTrack_ApplyCrop();
 }
 
+
+/* ===== 梅花轮齿频模式（METER_MODE_STAR）。升针模式的函数不动，这里另写一份。 ===== */
+#define STAR_CROP_MARGIN  40   /* 裁窗在齿顶圆外再留 40 像素 */
+
+static void StarMode_OpenFull(void)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  cam_hold = 1U;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+  StarTrack_Reset();
+  (void)HAL_DCMI_Stop(&hdcmi);
+  cam_arm = 0U;
+  cam_curline = 0U;
+  cam_draw_full = 2U;
+  LCD_FillBothBlack();
+  OV5640_PowerCycle();
+  if (OV5640_SensorInit() != 0)
+  {
+    cam_ok = 0U;
+    cam_hold = 0U;
+    g_star_phase = 0U;
+    g_crop_settling = 0U;
+    return;
+  }
+  OV5640_RgbLcdPreview(LCD_WIDTH, LCD_HEIGHT);
+  SpeedTrack_PreviewLeft();
+  CAM_LoadView();
+  HAL_Delay(20);
+  CAM_Start();
+  HAL_Delay(20);
+  CamDbg_SnapSensor();
+  HAL_Delay(80);
+  CamDbg_SnapLive();
+  cam_hold = 0U;
+  g_star_phase = 0U;
+  g_star_loc_fail = 0U;
+  g_crop_settling = 1U;
+  g_crop_settle_t0 = TIM2->CNT;
+  g_cam_settle_us = FULL_SETTLE_US;
+}
+
+/* 按全幅 LCD 坐标里的矩形裁传感器窗口，1:1 输出到屏幕右上角。换算同升针模式。 */
+static void StarMode_ApplyCrop(uint16_t lx, uint16_t ly, uint16_t lw, uint16_t lh)
+{
+  OV5640_GetWindow((uint16_t *)&g_cam_dbg.win_x, (uint16_t *)&g_cam_dbg.win_y,
+                   (uint16_t *)&g_cam_dbg.win_w, (uint16_t *)&g_cam_dbg.win_h);
+  OV5640_GetView((uint16_t *)&g_cam_dbg.view_x, (uint16_t *)&g_cam_dbg.view_y,
+                 (uint16_t *)&g_cam_dbg.view_w, (uint16_t *)&g_cam_dbg.view_h);
+  OV5640_GetCapture((uint16_t *)&g_cam_dbg.cap_w, (uint16_t *)&g_cam_dbg.cap_h);
+  g_cam_dbg.lcd_x0 = (int32_t)lx;
+  g_cam_dbg.lcd_y0 = (int32_t)ly;
+  if (g_cam_dbg.cap_w == 0U) { g_cam_dbg.cap_w = 1U; }
+  if (g_cam_dbg.cap_h == 0U) { g_cam_dbg.cap_h = 1U; }
+  g_cam_dbg.crop_sw = (uint16_t)(((uint32_t)lw * (uint32_t)g_cam_dbg.win_w) / (uint32_t)g_cam_dbg.cap_w);
+  g_cam_dbg.crop_sh = (uint16_t)(((uint32_t)lh * (uint32_t)g_cam_dbg.win_h) / (uint32_t)g_cam_dbg.cap_h);
+  g_cam_dbg.crop_sw = (uint16_t)(g_cam_dbg.crop_sw & (uint16_t)~1U);
+  g_cam_dbg.crop_sh = (uint16_t)(g_cam_dbg.crop_sh & (uint16_t)~1U);
+  {
+    int32_t sx;
+    sx = (int32_t)g_cam_dbg.win_x + (int32_t)g_cam_dbg.win_w
+         - (((g_cam_dbg.lcd_x0 - (int32_t)g_cam_dbg.view_x) * (int32_t)g_cam_dbg.win_w)
+            / (int32_t)g_cam_dbg.cap_w)
+         - (int32_t)g_cam_dbg.crop_sw;
+    if (sx < 0) { sx = 0; }
+    g_cam_dbg.crop_sx = (uint16_t)sx;
+  }
+  g_cam_dbg.crop_sy = (uint16_t)((int32_t)g_cam_dbg.win_y
+      + (((g_cam_dbg.lcd_y0 - (int32_t)g_cam_dbg.view_y) * (int32_t)g_cam_dbg.win_h)
+         / (int32_t)g_cam_dbg.cap_h));
+  if (g_cam_dbg.crop_sw < 80U) { g_cam_dbg.crop_sw = 80U; }
+  if (g_cam_dbg.crop_sh < 80U) { g_cam_dbg.crop_sh = 80U; }
+  if (g_cam_dbg.crop_sw > LCD_WIDTH) { g_cam_dbg.crop_sw = (uint16_t)LCD_WIDTH; }
+  if (g_cam_dbg.crop_sh > LCD_HEIGHT) { g_cam_dbg.crop_sh = (uint16_t)LCD_HEIGHT; }
+  {
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    cam_hold = 1U;
+    if (primask == 0U)
+    {
+      __enable_irq();
+    }
+  }
+  StarTrack_Disarm();
+  g_cam_dbg.frames_pre = cam_frame_count;
+  g_cam_dbg.stamp_pre = cam_stamp_us;
+  CamDbg_Mark(1U);
+  (void)HAL_DCMI_Stop(&hdcmi);
+  cam_arm = 0U;
+  cam_curline = 0U;
+  cam_draw_full = 2U;
+  LCD_FillBothBlack();
+  OV5640_PowerCycle();
+  CamDbg_Mark(2U);
+  OV5640_RgbLcdNativeWindow(g_cam_dbg.crop_sx, g_cam_dbg.crop_sy,
+                            g_cam_dbg.crop_sw, g_cam_dbg.crop_sh);
+  CamDbg_Mark(3U);
+  CAM_LoadView();
+  HAL_Delay(20);
+  CamDbg_Mark(4U);
+  CAM_Start();
+  HAL_Delay(20);
+  CamDbg_Mark(5U);
+  CamDbg_SnapSensor();
+  HAL_Delay(80);
+  CamDbg_Mark(6U);
+  CamDbg_SnapLive();
+  cam_hold = 0U;
+  /* 裁完先让自动曝光走约 1 s，再在小窗里重新定位梅花轮。 */
+  g_crop_settling = 1U;
+  g_crop_settle_t0 = TIM2->CNT;
+  g_cam_settle_us = CROP_SETTLE_US;
+  g_star_phase = 1U;
+  g_star_loc_fail = 0U;
+  CamDbg_Mark(7U);
+}
+
+static void StarMode_Service(void)
+{
+  static int16_t prev_cx;
+  static int16_t prev_cy;
+  static uint8_t prev_n;
+  static uint8_t prev_ok;
+  uint32_t wb;
+
+  if (METER_MODE != METER_MODE_STAR)
+  {
+    return;
+  }
+  if ((cam_ok == 0U) || (cam_out_jpeg != 0U))
+  {
+    return;
+  }
+  if (g_crop_settling != 0U)
+  {
+    uint32_t need = g_cam_settle_us;
+    if (need == 0U)
+    {
+      need = FULL_SETTLE_US;
+    }
+    if ((TIM2->CNT - g_crop_settle_t0) < need)
+    {
+      return;
+    }
+    g_crop_settling = 0U;
+  }
+  wb = DialRead_WorkBytes((uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT);
+  if ((DIAL_WORK_ADDR + wb) > (SDRAM_BASE + 0x2000000UL))
+  {
+    return;
+  }
+  if (g_star_phase == 0U)
+  {
+    uint16_t sx1 = 0U, sy1 = 0U;
+    int32_t half, x0, y0, x1, y1;
+    StarTrack_HudRect(&sx1, &sy1);
+    if (StarTrack_Locate((const uint16_t *)lcd_frame_addr, (uint16_t)LCD_WIDTH,
+                         (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT, 2U,
+                         (uint8_t *)DIAL_WORK_ADDR, wb, sx1, sy1) != 0)
+    {
+      g_star_loc_fail++;
+      prev_ok = 0U;
+      return;
+    }
+    /* 连续两帧位置一致才裁窗，避免半帧或曝光未稳。 */
+    if ((prev_ok == 0U) || (prev_n != g_star.n_teeth) ||
+        ((g_star.cx - prev_cx) > 6) || ((prev_cx - g_star.cx) > 6) ||
+        ((g_star.cy - prev_cy) > 6) || ((prev_cy - g_star.cy) > 6))
+    {
+      prev_ok = 1U;
+      prev_cx = g_star.cx;
+      prev_cy = g_star.cy;
+      prev_n = g_star.n_teeth;
+      return;
+    }
+    prev_ok = 0U;
+    g_star.full_cx = g_star.cx;
+    g_star.full_cy = g_star.cy;
+    g_star.full_r = g_star.r_out;
+    half = (int32_t)g_star.r_out + STAR_CROP_MARGIN;
+    x0 = (int32_t)g_star.cx - half;
+    y0 = (int32_t)g_star.cy - half;
+    x1 = (int32_t)g_star.cx + half;
+    y1 = (int32_t)g_star.cy + half;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > (int32_t)LCD_WIDTH) { x1 = (int32_t)LCD_WIDTH; }
+    if (y1 > (int32_t)LCD_HEIGHT) { y1 = (int32_t)LCD_HEIGHT; }
+    x0 &= ~1;
+    y0 &= ~1;
+    /* 小窗坐标里的位置要在裁完后重新找，先清掉全幅的标记。 */
+    g_star.found = 0U;
+    StarMode_ApplyCrop((uint16_t)x0, (uint16_t)y0,
+                       (uint16_t)((x1 - x0) & ~1), (uint16_t)((y1 - y0) & ~1));
+    return;
+  }
+  if (g_star_phase == 1U)
+  {
+    const uint16_t *rgb = (const uint16_t *)lcd_frame_addr;
+    rgb = rgb + (((uint32_t)cam_oy * LCD_WIDTH) + (uint32_t)cam_ox);
+    if ((cam_w >= 80U) && (cam_h >= 80U) &&
+        (StarTrack_Locate(rgb, (uint16_t)LCD_WIDTH, cam_w, cam_h, 1U,
+                          (uint8_t *)DIAL_WORK_ADDR, wb, 0U, 0U) == 0) &&
+        (StarTrack_Arm(cam_w, cam_h) == 0))
+    {
+      g_star_phase = 2U;
+      g_star_loc_fail = 0U;
+      return;
+    }
+    g_star.found = 0U;
+    g_star_loc_fail++;
+    if (g_star_loc_fail > 150U)
+    {
+      StarMode_OpenFull();
+    }
+    return;
+  }
+  if (StarTrack_Tick(TIM2->CNT) != 0)
+  {
+    /* 1.5 s 没有有效帧：回到小窗重新定位。 */
+    StarTrack_Disarm();
+    g_star.found = 0U;
+    g_star_phase = 1U;
+    g_star_loc_fail = 0U;
+  }
+}
+
 static void DialRead_Service(void)
 {
   static dial_time_t prev_ts;
@@ -3394,7 +3650,7 @@ static void CAM_Init(void)
     return;
   }
   OV5640_RgbLcdPreview(LCD_WIDTH, LCD_HEIGHT);
-  if (METER_MODE == METER_MODE_SPEED)
+  if ((METER_MODE == METER_MODE_SPEED) || (METER_MODE == METER_MODE_STAR))
   {
     SpeedTrack_PreviewLeft();
   }
@@ -3422,7 +3678,7 @@ static void CAM_Init(void)
   CAM_Start();
   cam_hold = 0U;
   meter_next_ms = HAL_GetTick() + 1500U;
-  if (METER_MODE == METER_MODE_SPEED)
+  if ((METER_MODE == METER_MODE_SPEED) || (METER_MODE == METER_MODE_STAR))
   {
     /* 上电后摄像头同样要先自动曝光，再开始全幅找针。 */
     g_crop_settling = 1U;
