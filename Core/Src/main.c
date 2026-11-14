@@ -57,7 +57,21 @@
 #define METER_MODE_VOLUME      0U
 #define METER_MODE_SPEED       1U
 #define METER_MODE_STAR        2U
-#define METER_MODE             METER_MODE_STAR
+#define METER_MODE_DEFAULT     METER_MODE_STAR
+#define MODE_REQUEST_NONE      0xFFFFFFFFUL
+volatile uint32_t g_meter_mode = METER_MODE_DEFAULT;
+volatile uint32_t g_meter_request = MODE_REQUEST_NONE; /* 0/1/2；调试写此值与按键走同一路径 */
+volatile uint32_t g_meter_switching;
+volatile uint32_t g_meter_switch_n;
+volatile uint32_t g_meter_epoch;
+volatile uint32_t g_meter_status; /* 0启动, 1停采集, 2复位算法, 3全幅初始化, 4运行, 0xE错误 */
+volatile uint32_t g_meter_last_key; /* 1左 PC13, 2下 PH2, 3右 PH3；上 PA0 不切模式 */
+volatile uint32_t g_meter_key_n;
+volatile uint32_t g_meter_req_source; /* 1物理键, 2调试请求 */
+volatile uint32_t g_meter_last_from;
+volatile uint32_t g_meter_last_to;
+volatile uint32_t g_meter_last_source;
+static volatile uint32_t meter_keys_ready;
 /* Snapshot + work sit after the JPEG photo buffer, not on CAM_BUF0. */
 #define DIAL_SNAP_ADDR         (((PHOTO_ADDR + PHOTO_MAX) + 7UL) & ~7UL)
 #define DIAL_WORK_ADDR         (DIAL_SNAP_ADDR + LCD_FB_BYTES)
@@ -140,7 +154,8 @@ static void CamDbg_SnapLive(void);
 static void CamDbg_SnapSensor(void);
 static void CAM_Apply(void);
 static void CAM_ScaleToLcd(void);
-static void Keys_Poll(void);
+void MeterKeys_Tick(void); /* SysTick 采样去抖，IRQ 只发请求不切相机 */
+static void MeterMode_Service(void);
 static void CAM_TakeShot(void);
 static int LCD_BlitFit(void);
 static int LCD_BlitCamera(void);
@@ -230,6 +245,7 @@ int main(void)
   MX_TIM2_Init();
   CAM_Init();
   Shutter_Init();
+  meter_keys_ready = 1U;
   if (NET_APP_ON != 0U)
   {
     NET_Init();
@@ -243,16 +259,17 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    MeterMode_Service();
     Shutter_Service(1U);
     CAM_ScaleToLcd();
     CAM_Service();
     OV5640_FocusSweep();
     LCD_DemoFrame();
-    if (METER_MODE == METER_MODE_VOLUME)
+    if (g_meter_mode == METER_MODE_VOLUME)
     {
       DialRead_Service();
     }
-    else if (METER_MODE == METER_MODE_STAR)
+    else if (g_meter_mode == METER_MODE_STAR)
     {
       StarMode_Service();
     }
@@ -658,6 +675,12 @@ static volatile uint32_t cam_cap_len[2];
 
 static void CAM_Service(void)
 {
+  if (cam_restart != 0U)
+  {
+    cam_restart = 0U;
+    CAM_Apply();
+    return;
+  }
   if (cam_arm != 0U)
   {
     cam_arm = 0U;
@@ -1266,7 +1289,7 @@ static void LCD_PresentLive(void)
   {
     return;
   }
-  if (METER_MODE == METER_MODE_VOLUME)
+  if (g_meter_mode == METER_MODE_VOLUME)
   {
     if (dial_hud_ready != 0U)
     {
@@ -1274,7 +1297,7 @@ static void LCD_PresentLive(void)
                         &dial_hud_rep);
     }
   }
-  else if (METER_MODE == METER_MODE_STAR)
+  else if (g_meter_mode == METER_MODE_STAR)
   {
     dial_time_t now;
     dial_get_time(&now);
@@ -1461,7 +1484,6 @@ static void LCD_DemoFrame(void)
     }
     draw = 1U;
   }
-  Keys_Poll();
   CAM_TakeShot();
   if (LCD_PANEL_ON == 0U)
   {
@@ -1878,7 +1900,7 @@ static void CAM_LoadView(void)
   cam_w = cw;
   cam_h = ch;
   /* 速度模式裁窗后，1:1 实时画面固定放在屏幕右上角，左侧给测量列表。 */
-  if (((METER_MODE == METER_MODE_SPEED) || (METER_MODE == METER_MODE_STAR)) &&
+  if (((g_meter_mode == METER_MODE_SPEED) || (g_meter_mode == METER_MODE_STAR)) &&
       (cam_w == cam_vw) && (cam_h == cam_vh) &&
       (cam_w < LCD_WIDTH) && (cam_h < LCD_HEIGHT) &&
       (cam_w >= 80U) && (cam_h >= 80U))
@@ -1966,8 +1988,9 @@ static void CAM_RgbLineIsr(void)
   }
   DMA1->LIFCR = DMA_LIFCR_CTCIF1 | DMA_LIFCR_CHTIF1 | DMA_LIFCR_CTEIF1 |
                 DMA_LIFCR_CDMEIF1 | DMA_LIFCR_CFEIF1;
+  if (g_meter_switching != 0U) { return; }
   src = ((dma->CR & DMA_SxCR_CT) != 0U) ? cam_line_buf[0] : cam_line_buf[1];
-  if (METER_MODE == METER_MODE_STAR)
+  if (g_meter_mode == METER_MODE_STAR)
   {
     /* 梅花轮：每一行都按圆环采样，不管这一帧是否上屏，帧率按传感器算。 */
     StarTrack_IsrLine(src);
@@ -2341,10 +2364,11 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *dcmi)
   uint8_t idx;
 
   (void)dcmi;
+  if (g_meter_switching != 0U) { return; }
   cam_frame_count++;
   if (hdcmi.Init.JPEGMode != DCMI_JPEG_ENABLE)
   {
-    if (METER_MODE == METER_MODE_STAR)
+    if (g_meter_mode == METER_MODE_STAR)
     {
       StarTrack_IsrFrame(TIM2->CNT, cam_h);
     }
@@ -2889,6 +2913,8 @@ static void SpeedTrack_OpenFull(void)
   cam_curline = 0U;
   cam_draw_full = 2U;
   LCD_FillBothBlack();
+  ov5640_pclk_hz = 2625000000UL / (6U * 4U);
+  ov5640_native_fps = 50U;
   OV5640_PowerCycle();
   if (OV5640_SensorInit() != 0)
   {
@@ -3084,7 +3110,7 @@ static void SpeedTrack_Service(void)
 {
   uint32_t wb;
 
-  if (METER_MODE != METER_MODE_SPEED)
+  if (g_meter_mode != METER_MODE_SPEED)
   {
     return;
   }
@@ -3291,9 +3317,11 @@ static void StarMode_Service(void)
   static int16_t prev_cy;
   static uint8_t prev_n;
   static uint8_t prev_ok;
+  static uint32_t entry_epoch;
   uint32_t wb;
+  if (entry_epoch != g_meter_epoch) { entry_epoch = g_meter_epoch; prev_ok = 0U; }
 
-  if (METER_MODE != METER_MODE_STAR)
+  if (g_meter_mode != METER_MODE_STAR)
   {
     return;
   }
@@ -3400,7 +3428,20 @@ static void DialRead_Service(void)
   static dial_time_t prev_ts;
   static uint8_t have_prev;
   static dial_report_t work_rep;
+  static uint32_t entry_epoch;
   uint32_t wb;
+  if (entry_epoch != g_meter_epoch)
+  {
+    entry_epoch = g_meter_epoch;
+    have_prev = 0U;
+    memset(&prev_ts, 0, sizeof(prev_ts));
+    memset(&work_rep, 0, sizeof(work_rep));
+  }
+  if (g_crop_settling != 0U)
+  {
+    if ((TIM2->CNT - g_crop_settle_t0) < g_cam_settle_us) { return; }
+    g_crop_settling = 0U;
+  }
 
   if ((DIAL_READ_ON == 0U) || (cam_ok == 0U) || (cam_out_jpeg != 0U))
   {
@@ -3518,74 +3559,118 @@ static void MeterLocate_Service(void)
   }
 }
 
-static void Keys_Poll(void)
+/* 正式按键定义沿用板上原程序 GPIO：左 PC13 / 下 PH2 / 右 PH3 均低有效。
+ * 上键 PA0 高有效，不参与三个模式，也不再改相机的缩放。每次释放后重按（含同模式）重开测试。 */
+void MeterKeys_Tick(void)
 {
-  static uint8_t up_last;
-  static uint8_t down_last;
-  static uint8_t left_last;
-  static uint8_t right_last;
-  static uint32_t lock_until;
-  uint32_t now;
-  uint8_t up;
-  uint8_t down;
-  uint8_t right;
-  uint8_t left;
-  int changed = 0;
+  static uint8_t raw_last, stable;
+  static uint32_t raw_since;
+  uint32_t now = HAL_GetTick();
+  uint8_t raw = 0U, pressed;
+  if (meter_keys_ready == 0U) { return; }
+  if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) { raw |= 1U; }
+  if (HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_2) == GPIO_PIN_RESET) { raw |= 2U; }
+  if (HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_3) == GPIO_PIN_RESET) { raw |= 4U; }
+  if (raw != raw_last) { raw_last = raw; raw_since = now; return; }
+  if ((uint32_t)(now - raw_since) < 30U) { return; }
+  pressed = (uint8_t)(raw & (uint8_t)~stable);
+  stable = raw;
+  /* 多键同时按不选；按住不会重复触发。 */
+  if ((pressed == 0U) || ((raw != 1U) && (raw != 2U) && (raw != 4U))) { return; }
+  g_meter_last_key = (raw == 1U) ? 1U : ((raw == 2U) ? 2U : 3U);
+  g_meter_key_n++;
+  g_meter_req_source = 1U;
+  __DMB();
+  g_meter_request = (raw == 1U) ? METER_MODE_VOLUME : ((raw == 2U) ? METER_MODE_SPEED : METER_MODE_STAR);
+}
 
-  if (cam_ok == 0U)
-  {
-    return;
-  }
-  if (cam_restart != 0U)
-  {
-    cam_restart = 0U;
-    CAM_Apply();
-    return;
-  }
+/* SpeedTrack_Reset 保留的旧列表由运行时“新测试”入口清除；算法本身不改。 */
+extern uint8_t g_meas_i;
+extern int32_t g_meas_flow_e2[10], g_meas_accum[10];
+extern uint32_t g_meas_dt_us[10];
+extern uint16_t g_meas_seq[10];
+extern uint8_t g_mw_target;
+extern uint32_t g_mw_lap_us;
 
-  now = HAL_GetTick();
-  up = (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET) ? 1U : 0U;
-  down = (HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_2) == GPIO_PIN_RESET) ? 1U : 0U;
-  right = (HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_3) == GPIO_PIN_RESET) ? 1U : 0U;
-  left = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) ? 1U : 0U;
-  if (now < lock_until)
+static void MeterMode_Service(void)
+{
+  uint32_t want;
+  uint32_t primask = __get_PRIMASK();
+  /* 原子取出请求，SysTick 只负责投递，主循环负责相机重启。 */
+  __disable_irq();
+  want = g_meter_request;
+  g_meter_request = MODE_REQUEST_NONE;
+  if (want != MODE_REQUEST_NONE)
   {
-    up_last = up;
-    down_last = down;
-    left_last = left;
-    right_last = right;
-    return;
+    g_meter_last_source = (g_meter_req_source == 1U) ? 1U : 2U;
+    g_meter_req_source = 0U;
   }
-  if ((up != 0U) && (up_last == 0U))
-  {
-    changed = OV5640_Zoom(1);
-  }
-  else if ((down != 0U) && (down_last == 0U))
-  {
-    changed = OV5640_Zoom(-1);
-  }
-  else if ((left != 0U) && (left_last == 0U))
-  {
-    changed = OV5640_Pan(-1);
-  }
-  else if ((right != 0U) && (right_last == 0U))
-  {
-    changed = OV5640_Pan(1);
-  }
-  up_last = up;
-  down_last = down;
-  left_last = left;
-  right_last = right;
-  if (changed != 0)
-  {
-    lock_until = now + 250U;
-    CAM_Apply();
-  }
+  if (primask == 0U) { __enable_irq(); }
+  if (want == MODE_REQUEST_NONE) { return; }
+  if (want > METER_MODE_STAR) { g_meter_status = 0xEU; return; }
+  g_meter_last_from = g_meter_mode;
+  g_meter_last_to = want;
+  g_meter_status = 1U;
+  /* 切换仅在主循环执行。先封住高优先级行 DMA 与帧回调，再停止 DMA/DCMI。
+   * 中断保持可用以让 HAL 超时/传感器延时工作，但旧回调不再写显存/采样表。 */
+  primask = __get_PRIMASK();
+  __disable_irq();
+  g_meter_switching = 1U;
+  cam_hold = 1U;
+  __DMB();
+  if (primask == 0U) { __enable_irq(); }
+  StarTrack_Disarm();
+  (void)HAL_DCMI_Stop(&hdcmi);
+  __HAL_DCMI_DISABLE_IT(&hdcmi, DCMI_IT_FRAME | DCMI_IT_OVR | DCMI_IT_ERR);
+  DMA1->LIFCR = DMA_LIFCR_CTCIF1 | DMA_LIFCR_CHTIF1 | DMA_LIFCR_CTEIF1 |
+                DMA_LIFCR_CDMEIF1 | DMA_LIFCR_CFEIF1;
+  __HAL_DCMI_CLEAR_FLAG(&hdcmi, DCMI_FLAG_FRAMERI | DCMI_FLAG_OVRRI | DCMI_FLAG_ERRRI);
+  HAL_NVIC_ClearPendingIRQ(DCMI_IRQn);
+  HAL_NVIC_ClearPendingIRQ(DMA1_Stream1_IRQn);
+  g_meter_mode = want;
+  g_meter_status = 2U;
+  g_meter_epoch++;
+  g_meter_switch_n++;
+  /* 显式重开测试不同于普通丢失重定位：本次序号、列表与上一时间戳全清。 */
+  StarTrack_NewTest();
+  SpeedTrack_Reset(&g_speed);
+  g_rev_seq = 0U; g_meas_n = 0U; g_meas_i = 0U;
+  g_flow_avg_e2 = 0; g_flow_rep_e4 = 0; g_frame_dt_us = 0U;
+  g_mw_target = 0U; g_mw_lap_us = 0U;
+  memset(g_meas_flow_e2, 0, sizeof(g_meas_flow_e2));
+  memset(g_meas_accum, 0, sizeof(g_meas_accum));
+  memset(g_meas_dt_us, 0, sizeof(g_meas_dt_us));
+  memset(g_meas_seq, 0, sizeof(g_meas_seq));
+  DialRead_ResetTrack();
+  memset(&dial_hud_rep, 0, sizeof(dial_hud_rep));
+  dial_hud_ready = 0U;
+  speed_phase = 0U; g_star_phase = 0U; g_star_loc_fail = 0U;
+  shutter_armed = 0U; shutter_done = 0U;
+  cam_arm = 0U; cam_restart = 0U; cam_ready = 0U;
+  cam_scale_ready = 0U; cam_out_jpeg = 0U; cam_curline = 0U; cam_draw_full = 2U;
+  meter_hold_fb = 0U; meter_want_snap = 0U; meter_frame_ready = 0U;
+  shot_request = 0U; f_send = 0U;
+  ov5640_pclk_hz = 2625000000UL / (6U * 4U);
+  ov5640_native_fps = 50U;
+  g_meter_status = 3U;
+  LCD_FillBothBlack();
+  OV5640_PowerCycle();
+  cam_ok = 0U;
+  CAM_Init(); /* 全幅、默认自动曝光：volume 居中；speed/star 左移，随后各自原裁窗流程 */
+  g_crop_settling = 1U;
+  g_cam_settle_us = FULL_SETTLE_US;
+  g_crop_settle_t0 = TIM2->CNT;
+  cam_draw_full = 2U;
+  cam_hold = 0U;
+  __DMB();
+  g_meter_switching = 0U;
+  g_meter_status = (cam_ok != 0U) ? 4U : 0xEU;
 }
 
 void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *dcmi)
 {
   (void)dcmi;
+  if (g_meter_switching != 0U) { return; }
   /* 预览是连续 RGB565。溢出只重开 DMA，不要重写传感器，否则画面会停在上一帧。 */
   if (hdcmi.Init.JPEGMode != DCMI_JPEG_ENABLE)
   {
@@ -3657,8 +3742,11 @@ static void CAM_Init(void)
     cam_ok = 0U;
     return;
   }
+  /* NativeWindow 会保留驱动的软件窗口，切模式必须还原它，而非只复位传感器。 */
+  OV5640_SetNativeOutput(0U);
+  OV5640_ShowOnLcd(0, 0, LCD_WIDTH, LCD_HEIGHT);
   OV5640_RgbLcdPreview(LCD_WIDTH, LCD_HEIGHT);
-  if ((METER_MODE == METER_MODE_SPEED) || (METER_MODE == METER_MODE_STAR))
+  if ((g_meter_mode == METER_MODE_SPEED) || (g_meter_mode == METER_MODE_STAR))
   {
     SpeedTrack_PreviewLeft();
   }
@@ -3682,11 +3770,12 @@ static void CAM_Init(void)
     return;
   }
   cam_ok = 1U;
+  if (g_meter_switching == 0U) { g_meter_status = 4U; }
   cam_hold = 1U;
   CAM_Start();
   cam_hold = 0U;
   meter_next_ms = HAL_GetTick() + 1500U;
-  if ((METER_MODE == METER_MODE_SPEED) || (METER_MODE == METER_MODE_STAR))
+  if ((g_meter_mode == METER_MODE_SPEED) || (g_meter_mode == METER_MODE_STAR))
   {
     /* 上电后摄像头同样要先自动曝光，再开始全幅找针。 */
     g_crop_settling = 1U;

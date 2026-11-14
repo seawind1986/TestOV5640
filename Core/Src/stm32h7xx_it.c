@@ -188,6 +188,9 @@ void SysTick_Handler(void)
 
   /* USER CODE END SysTick_IRQn 0 */
   HAL_IncTick();
+  /* IRQ 只做 30 ms 去抖和请求投递；实际切模式在主循环。 */
+  extern void MeterKeys_Tick(void);
+  MeterKeys_Tick();
   /* USER CODE BEGIN SysTick_IRQn 1 */
 
   /* USER CODE END SysTick_IRQn 1 */

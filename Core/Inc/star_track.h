@@ -65,6 +65,7 @@ extern uint32_t g_star_gap_n;                 /* 帧间隔过大、重新起算�
 extern uint32_t g_star_lowq_n;                /* 谐波幅度过低被丢弃的帧数 */
 
 void StarTrack_Reset(void);
+void StarTrack_NewTest(void); /* 用户重新开始：含序号/历史；停采集后调用 */
 
 /* 在 rgb（stride 像素一行）里找梅花轮。ds=降采样倍数（全幅 2，小窗 1）。
  * skip_x1/skip_y1：左上角 HUD 区域不参与。成功返回 0，结果在 g_star（rgb 坐标）。 */

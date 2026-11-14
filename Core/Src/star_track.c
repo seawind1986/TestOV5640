@@ -179,6 +179,25 @@ void StarTrack_Reset(void)
   track_reset();
 }
 
+/* 仅上电/用户选择新测试时清历史；普通 Reset/Arm（丢失重定位）仍保留列表。调用前须停采集。 */
+void StarTrack_NewTest(void)
+{
+  StarTrack_Reset();
+  g_star_seq = 0U; g_star_meas_n = 0U; g_star_meas_i = 0U;
+  g_star_meas_total = 0U; g_star_rep_e4 = 0;
+  memset(g_star_meas_dt_us, 0, sizeof(g_star_meas_dt_us));
+  memset(g_star_meas_ang_mdeg, 0, sizeof(g_star_meas_ang_mdeg));
+  memset(g_star_meas_dps_e3, 0, sizeof(g_star_meas_dps_e3));
+  memset(g_star_meas_laps, 0, sizeof(g_star_meas_laps));
+  memset(g_star_meas_seq, 0, sizeof(g_star_meas_seq));
+  s_ring_head = 0U; s_ring_tail = 0U;
+  s_line = 0U; s_frame_tab = 0U;
+  memset(s_acc, 0, sizeof(s_acc));
+  g_star_isr_frames = 0U; g_star_isr_bad = 0U; g_star_ring_drop = 0U;
+  g_star_lost_n = 0U; g_star_arm_n = 0U;
+  g_star_frame_dt_us = 0U; s_last_lcd_stamp = 0U;
+}
+
 void StarTrack_HudRect(uint16_t *x1, uint16_t *y1)
 {
   if (x1 != 0) { *x1 = s_hud_x1; }
