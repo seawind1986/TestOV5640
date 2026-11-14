@@ -17,8 +17,9 @@
 #define GAP_US       120000U   /* 相邻有效帧超过 120 ms 不再展开，重新起算 */
 #define RATE_WIN_US  2000000U  /* 实时齿/s 按约 2 s 窗口 */
 #define RATE_MIN_US  1000000U
-/* 测量窗（梅花轮）：单圈 <30 s 累加整圈到总时长 >30 s；单圈 >=30 s 跑 1 圈（至少一整圈）。 */
-#define MW_TOTAL_US  30000000U
+/* 测量窗（梅花轮）：见 pick_laps()。 */
+#define MW_TARGET_S  30U      /* 多圈总时长尽量靠近 30 s */
+#define MW_MAX_S     50U      /* 且不超过 50 s（单圈超过 50 s 时跑 1 圈） */
 /* 测完多少行后停止出新行（白线、圆环照常实时刷新）；0 = 一直测下去，列表显示最新 10 行滚动。 */
 #ifndef STAR_MAX_MEAS
 #define STAR_MAX_MEAS 0U
@@ -67,7 +68,7 @@ int32_t  g_star_ang_mdeg;       /* 白线（缺口中心参考）当前角 0~360
 int32_t  g_star_dps_e3;         /* 约 2 s 窗口的实时 °/s ×1000 */
 uint32_t g_star_lap_us;         /* 最近一整圈用时 */
 uint8_t  g_star_mw_laps;        /* 当前测量窗已走整圈数 */
-uint8_t  g_star_mw_target;      /* 本窗需要的圈数（0 = 按总时长 >30 s） */
+uint8_t  g_star_mw_target;      /* 本窗需要的圈数（0 = 尚无单圈时间，走完第一圈再定） */
 double   g_star_lap_deg;        /* 当前这一圈已转角度（绝对值） */
 uint16_t g_star_meas_seq[STAR_MEAS_HIST];
 uint16_t g_star_prof[STAR_BINS];   /* 最近一帧圆环各格平均亮度 ×16，J-Link 查看 */
@@ -797,12 +798,37 @@ static void restart_windows(uint32_t stamp)
   s_mw_t0 = stamp;
   s_mw_ang = 0.0;
   g_star_mw_laps = 0U;
+  g_star_mw_target = 0U;
   g_star_lap_deg = 0.0;
   s_meas_on = 1U;
 }
 
 /* 每个有效帧调用：满一整圈（360°）按升针同样的规则决定是否出一行。
  * 圈的终点取第一帧转过 >=360° 的那一帧，角度与时间都按这一帧的实测值。 */
+/* 圈数规则（梅花轮）：T = 单圈用时取整秒（至少 1 s）；取整圈数 n>=1 使 n*T 最接近 30 s，
+ * 一样近取多一圈；n*T 不超过 50 s（n>1 时往下减），单圈就超过 50 s 则跑 1 圈。 */
+static uint8_t pick_laps(uint32_t lap_us)
+{
+  uint32_t T = (lap_us + 500000U) / 1000000U;
+  uint32_t n, best;
+  int32_t d0, d1;
+  if (T < 1U) { T = 1U; }
+  n = MW_TARGET_S / T;
+  if (n < 1U)
+  {
+    best = 1U;
+  }
+  else
+  {
+    d0 = (int32_t)(n * T) - (int32_t)MW_TARGET_S; if (d0 < 0) { d0 = -d0; }
+    d1 = (int32_t)((n + 1U) * T) - (int32_t)MW_TARGET_S; if (d1 < 0) { d1 = -d1; }
+    best = (d1 <= d0) ? (n + 1U) : n;
+  }
+  while ((best > 1U) && ((best * T) > MW_MAX_S)) { best--; }
+  if (best > 200U) { best = 200U; }
+  return (uint8_t)best;
+}
+
 static void lap_step(uint32_t stamp)
 {
   double d;
@@ -819,17 +845,9 @@ static void lap_step(uint32_t stamp)
     if (g_star_mw_laps < 255U) { g_star_mw_laps++; }
     g_star_lap_us = lap_dt;
     tot = stamp - s_mw_t0;
-    /* 梅花轮专用：单圈 >=30 s 跑 1 圈；单圈 <30 s 累加整圈到总时长 >30 s。 */
-    if (lap_dt >= MW_TOTAL_US)
-    {
-      g_star_mw_target = 1U;
-      done = 1U;
-    }
-    else
-    {
-      g_star_mw_target = 0U;
-      if (tot > MW_TOTAL_US) { done = 1U; }
-    }
+    /* 首个测量窗还不知道单圈时间：用刚走完的第一圈定圈数。 */
+    if (g_star_mw_target == 0U) { g_star_mw_target = pick_laps(lap_dt); }
+    if (g_star_mw_laps >= g_star_mw_target) { done = 1U; }
     if (done != 0U)
     {
       meas_record(tot, s_mw_ang, g_star_mw_laps);
@@ -837,6 +855,8 @@ static void lap_step(uint32_t stamp)
       s_mw_t0 = stamp;
       s_mw_ang = 0.0;
       g_star_mw_laps = 0U;
+      /* 下一窗的圈数按最近一圈的用时定 */
+      g_star_mw_target = pick_laps(lap_dt);
       if ((STAR_MAX_MEAS > 0U) && (g_star_meas_total >= STAR_MAX_MEAS)) { s_meas_on = 0U; }
     }
     s_lap_t0 = stamp;
@@ -1469,8 +1489,9 @@ void StarTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h, int16_t ox, int
   *p++ = ' ';
   p = put_uv(p, (uint32_t)g_star_mw_laps);
   *p++ = '/';
-  if (g_star_mw_target == 0U) { p = put_str(p, ">30s"); }
-  else { p = put_uv(p, (uint32_t)g_star_mw_target); p = put_str(p, CH_QUAN); }
+  if (g_star_mw_target == 0U) { *p++ = '?'; }
+  else { p = put_uv(p, (uint32_t)g_star_mw_target); }
+  p = put_str(p, CH_QUAN);
   *p++ = ' ';
   p = put_frac(p, (uint32_t)(g_star_lap_deg * 10.0), 10U, 1);
   p = put_str(p, CH_DEG);
