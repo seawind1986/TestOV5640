@@ -999,12 +999,45 @@ static int arc_circle(int32_t hx, int32_t hy, int32_t *pcx, int32_t *pcy, int32_
       if (kasa_fit(s_pts, nn, &ncx, &ncy, &nR) != 0) { break; }
       cx = ncx; cy = ncy; R = nR; npts = nn;
     }
-    /* If tracing shrinks the circle (short / hidden rim), keep the seed. */
+    /* A short/hidden arc may collapse during tracing: retain the seed
+     * unless the smaller circle has near-full, tightly fitting support.
+     * Compare both circles on the SAME traced points, not their different
+     * seed/trace subsets. A radius decrease alone is not evidence of failure. */
     if (R < seed_R - 2 * 256)
     {
-      cx = seed_cx; cy = seed_cy; R = seed_R;
-      memcpy(s_pts, s_seed, (size_t)nseed * sizeof(pt_t));
-      npts = nseed;
+      uint8_t inlier_bins[36];
+      int inliers = 0, bins = 0, keep_trace = 0;
+      int64_t trace_ss = circle_ss(s_pts, npts, cx, cy, R);
+      int64_t seed_ss = circle_ss(s_pts, npts, seed_cx, seed_cy, seed_R);
+      memset(inlier_bins, 0, sizeof(inlier_bins));
+      for (i = 0; i < npts; i++)
+      {
+        int64_t dx = (int64_t)s_pts[i].x - cx;
+        int64_t dy = (int64_t)s_pts[i].y - cy;
+        int32_t dr = (int32_t)isqrt64((uint64_t)(dx * dx + dy * dy)) - R;
+        if (iabs32(dr) <= 2 * 256)
+        {
+          inliers++;
+          inlier_bins[atan2_mdeg(dy, dx) / 10000] = 1U;
+        }
+      }
+      for (i = 0; i < 36; i++) { bins += inlier_bins[i]; }
+      /* >=180 points, >=300deg inlier coverage, >=90% within 2px,
+       * RMS <=1.25px, and <=1/4 seed SSE (>=2x RMS improvement). */
+      keep_trace = (R >= R_MIN_Q8) && (R <= R_MAX_Q8)
+          && (npts >= 180) && (bins >= 30) && (inliers * 10 >= npts * 9)
+          && (trace_ss * 16 <= (int64_t)25 * npts * 65536)
+          && (trace_ss * 4 <= seed_ss);
+#ifdef DIAL_HOST_DEBUG
+      printf("  shrink gate: n=%d inliers=%d bins=%d trace_ss=%lld seed_ss=%lld keep=%d\n",
+             npts, inliers, bins, (long long)trace_ss, (long long)seed_ss, keep_trace);
+#endif
+      if (!keep_trace)
+      {
+        cx = seed_cx; cy = seed_cy; R = seed_R;
+        memcpy(s_pts, s_seed, (size_t)nseed * sizeof(pt_t));
+        npts = nseed;
+      }
     }
   }
   {
