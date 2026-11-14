@@ -46,6 +46,16 @@ extern volatile uint32_t g_star_isr_frames;   /* 行中断统计到的完整帧 
 extern volatile uint32_t g_star_isr_bad;      /* 行数不对、未建表的帧 */
 extern volatile uint16_t g_star_isr_lines;    /* 最近一帧行数 */
 extern double   g_star_accum;                 /* 展开后的累计齿数（有符号） */
+extern double   g_star_wheel_deg;             /* 展开后的轮转角（°，有符号） */
+extern int32_t  g_star_ang_mdeg;              /* 白线当前角 0~360° ×1000 */
+extern int32_t  g_star_dps_e3;                /* 约 2 s 窗口 °/s ×1000 */
+extern uint32_t g_star_lap_us;                /* 最近一整圈用时 */
+extern uint8_t  g_star_mw_laps;
+extern uint8_t  g_star_mw_target;
+extern uint32_t g_star_meas_dt_us[STAR_MEAS_HIST];
+extern int32_t  g_star_meas_ang_mdeg[STAR_MEAS_HIST];
+extern int32_t  g_star_meas_dps_e3[STAR_MEAS_HIST];
+extern uint8_t  g_star_meas_laps[STAR_MEAS_HIST];
 extern int32_t  g_star_tps_e3;                /* 最近约 2 s 齿/s ×1000（绝对值） */
 extern int32_t  g_star_fps_e1;                /* 实测采样帧率 ×10 */
 extern uint32_t g_star_frame_dt_us;           /* 液晶相邻两帧时间差 */

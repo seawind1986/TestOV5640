@@ -17,7 +17,10 @@
 #define GAP_US       120000U   /* 相邻有效帧超过 120 ms 不再展开，重新起算 */
 #define RATE_WIN_US  2000000U  /* 实时齿/s 按约 2 s 窗口 */
 #define RATE_MIN_US  1000000U
-#define MEAS_US      10000000U /* 列表：每 10 s 一行 */
+/* 测量窗与升针一致：单圈 <10 s 累加整圈到总时长 >30 s；10~20 s（含）跑 2 圈；>20 s 跑 1 圈。 */
+#define MW_FAST_US   10000000U
+#define MW_SLOW_US   20000000U
+#define MW_TOTAL_US  30000000U
 #define LOST_US      1500000U
 #define MAX_CAND     24
 #define DARK_PCT     55        /* 暗阈值 = 亮度中位数 × 55% */
@@ -53,8 +56,16 @@ float    g_star_last_q;
 float    g_star_last_phase;
 uint32_t g_star_last_stamp;
 uint32_t g_star_meas_dt_us[STAR_MEAS_HIST];
-int32_t  g_star_meas_teeth_e3[STAR_MEAS_HIST];
-int32_t  g_star_meas_tps_e3[STAR_MEAS_HIST];
+int32_t  g_star_meas_ang_mdeg[STAR_MEAS_HIST];   /* 每次测量的总转角，m° */
+int32_t  g_star_meas_dps_e3[STAR_MEAS_HIST];     /* 每次测量 °/s ×1000 */
+uint8_t  g_star_meas_laps[STAR_MEAS_HIST];
+double   g_star_wheel_deg;      /* 展开后的轮转角（相对起点，有符号，°） */
+int32_t  g_star_ang_mdeg;       /* 白线（缺口中心参考）当前角 0~360°，m° */
+int32_t  g_star_dps_e3;         /* 约 2 s 窗口的实时 °/s ×1000 */
+uint32_t g_star_lap_us;         /* 最近一整圈用时 */
+uint8_t  g_star_mw_laps;        /* 当前测量窗已走整圈数 */
+uint8_t  g_star_mw_target;      /* 本窗需要的圈数（0 = 按总时长 >30 s） */
+double   g_star_lap_deg;        /* 当前这一圈已转角度（绝对值） */
 uint16_t g_star_meas_seq[STAR_MEAS_HIST];
 uint16_t g_star_prof[STAR_BINS];   /* 最近一帧圆环各格平均亮度 ×16，J-Link 查看 */
 uint16_t g_star_rmax[180];         /* 最近一次定位的每 2° 外缘半径（降采样像素） */
@@ -88,9 +99,11 @@ static uint32_t s_hist_t[STAR_HIST];
 static double   s_hist_a[STAR_HIST];
 static uint16_t s_hist_n;
 static uint16_t s_hist_i;
-static uint32_t s_meas_t0;
-static double   s_meas_a0;
 static uint8_t  s_meas_on;
+static uint32_t s_lap_t0;
+static double   s_lap_a0;
+static uint32_t s_mw_t0;
+static double   s_mw_ang;
 static uint32_t s_fps_t0;
 static uint32_t s_fps_n;
 static uint32_t s_last_good;
@@ -135,6 +148,12 @@ static void track_reset(void)
   s_prev_stamp = 0U;
   s_phase0 = 0.0f;
   g_star_accum = 0.0;
+  g_star_wheel_deg = 0.0;
+  g_star_dps_e3 = 0;
+  g_star_lap_us = 0U;
+  g_star_mw_laps = 0U;
+  g_star_mw_target = 0U;
+  g_star_lap_deg = 0.0;
   g_star_tps_e3 = 0;
   g_star_fps_e1 = 0;
   g_star_seq = 0U;
@@ -732,14 +751,16 @@ void StarTrack_IsrFrame(uint32_t stamp_us, uint16_t lines_expect)
 
 static int32_t iabs32(int32_t v) { return (v < 0) ? -v : v; }
 
-static void meas_record(uint32_t dt_us, double teeth)
+static void meas_record(uint32_t dt_us, double ang_deg, uint8_t laps)
 {
   uint8_t i = g_star_meas_i;
-  double at = (teeth < 0.0) ? -teeth : teeth;
+  double aa = (ang_deg < 0.0) ? -ang_deg : ang_deg;
   g_star_meas_dt_us[i] = dt_us;
-  g_star_meas_teeth_e3[i] = (int32_t)((at * 1000.0) + 0.5);
-  g_star_meas_tps_e3[i] = (int32_t)(((at * 1.0e9) / (double)dt_us) + 0.5);
+  g_star_meas_ang_mdeg[i] = (int32_t)((aa * 1000.0) + 0.5);
+  g_star_meas_dps_e3[i] = (int32_t)(((aa * 1.0e9) / (double)dt_us) + 0.5);
+  g_star_meas_laps[i] = laps;
   g_star_seq++;
+  if (g_star_seq > 999U) { g_star_seq = 1U; }
   g_star_meas_seq[i] = g_star_seq;
   g_star_meas_i = (uint8_t)((i + 1U) % STAR_MEAS_HIST);
   if (g_star_meas_n < STAR_MEAS_HIST) { g_star_meas_n++; }
@@ -747,11 +768,11 @@ static void meas_record(uint32_t dt_us, double teeth)
   {
     double sum = 0.0, ss = 0.0, mean;
     uint8_t k;
-    for (k = 0U; k < g_star_meas_n; k++) { sum += (double)g_star_meas_tps_e3[k]; }
+    for (k = 0U; k < g_star_meas_n; k++) { sum += (double)g_star_meas_dps_e3[k]; }
     mean = sum / (double)g_star_meas_n;
     for (k = 0U; k < g_star_meas_n; k++)
     {
-      double d = (double)g_star_meas_tps_e3[k] - mean;
+      double d = (double)g_star_meas_dps_e3[k] - mean;
       ss += d * d;
     }
     if (mean > 0.0)
@@ -762,12 +783,63 @@ static void meas_record(uint32_t dt_us, double teeth)
   }
 }
 
+/* 测量窗从这一帧重新起算（首帧或断帧后） */
 static void restart_windows(uint32_t stamp)
 {
   hist_reset();
-  s_meas_t0 = stamp;
-  s_meas_a0 = g_star_accum;
+  s_lap_t0 = stamp;
+  s_lap_a0 = g_star_wheel_deg;
+  s_mw_t0 = stamp;
+  s_mw_ang = 0.0;
+  g_star_mw_laps = 0U;
+  g_star_lap_deg = 0.0;
   s_meas_on = 1U;
+}
+
+/* 每个有效帧调用：满一整圈（360°）按升针同样的规则决定是否出一行。
+ * 圈的终点取第一帧转过 >=360° 的那一帧，角度与时间都按这一帧的实测值。 */
+static void lap_step(uint32_t stamp)
+{
+  double d;
+  if (s_meas_on == 0U) { return; }
+  d = g_star_wheel_deg - s_lap_a0;
+  if (d < 0.0) { d = -d; }
+  g_star_lap_deg = d;
+  if (d < 360.0) { return; }
+  {
+    uint32_t lap_dt = stamp - s_lap_t0;
+    uint32_t tot;
+    uint8_t done = 0U;
+    s_mw_ang += d;
+    if (g_star_mw_laps < 255U) { g_star_mw_laps++; }
+    g_star_lap_us = lap_dt;
+    tot = stamp - s_mw_t0;
+    if (lap_dt > MW_SLOW_US)
+    {
+      g_star_mw_target = 1U;
+      done = 1U;
+    }
+    else if (lap_dt >= MW_FAST_US)
+    {
+      g_star_mw_target = 2U;
+      if (g_star_mw_laps >= 2U) { done = 1U; }
+    }
+    else
+    {
+      g_star_mw_target = 0U;
+      if (tot > MW_TOTAL_US) { done = 1U; }
+    }
+    if (done != 0U)
+    {
+      meas_record(tot, s_mw_ang, g_star_mw_laps);
+      s_mw_t0 = stamp;
+      s_mw_ang = 0.0;
+      g_star_mw_laps = 0U;
+    }
+    s_lap_t0 = stamp;
+    s_lap_a0 = g_star_wheel_deg;
+    g_star_lap_deg = 0.0;
+  }
 }
 
 int StarTrack_Tick(uint32_t now_us)
@@ -808,6 +880,8 @@ int StarTrack_Tick(uint32_t now_us)
         while (d > ST_PI) { d -= ST_TWO_PI; }
         while (d <= -ST_PI) { d += ST_TWO_PI; }
         g_star_accum += (double)d / (double)ST_TWO_PI;
+        g_star_wheel_deg = (g_star_accum * 360.0) / (double)g_star.n_teeth;
+        lap_step(e.stamp);
       }
       s_prev_phase = e.phase;
       s_prev_stamp = e.stamp;
@@ -826,11 +900,12 @@ int StarTrack_Tick(uint32_t now_us)
       s_fps_t0 = e.stamp;
       s_fps_n = 0U;
     }
-    if ((s_meas_on != 0U) && ((e.stamp - s_meas_t0) >= MEAS_US))
     {
-      meas_record(e.stamp - s_meas_t0, g_star_accum - s_meas_a0);
-      s_meas_t0 = e.stamp;
-      s_meas_a0 = g_star_accum;
+      /* 白线（缺口中心参考）的当前角度，画面坐标，0~360° */
+      double a = (((double)s_phase0 / (double)ST_TWO_PI) + g_star_accum) * 360.0 / (double)g_star.n_teeth;
+      a = fmod(a, 360.0);
+      if (a < 0.0) { a += 360.0; }
+      g_star_ang_mdeg = (int32_t)(a * 1000.0);
     }
   }
   /* 约 2 s 窗口的实时齿/s */
@@ -851,6 +926,7 @@ int StarTrack_Tick(uint32_t now_us)
       g_star_dir = (d < 0.0) ? -1 : 1;
       if (d < 0.0) { d = -d; }
       g_star_tps_e3 = (int32_t)(((d * 1.0e9) / dt) + 0.5);
+      g_star_dps_e3 = (int32_t)(((d * 360.0 * 1.0e9) / (dt * (double)g_star.n_teeth)) + 0.5);
     }
   }
   /* 有符号比较：本次刚消化的帧可能比 now_us 晚一点打戳。 */
@@ -995,7 +1071,7 @@ static const dial_glyph_t star_extra_glyphs[6] = {
   {0x25, 1, 11, 14, 22, 1024, &star_extra_bits[860]},  /* % */
 };
 
-static const uint8_t star_cjk_bits[1248] = {
+static const uint8_t star_cjk_bits[1856] = {
   0x00,0x00,0x74,0x01,0x00,0x00,0x62,0x02,0x00,0x00,0x00,0x00,0x00,0x00,0x90,0x3F,
   0x00,0x00,0x80,0x6F,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xF9,0x03,0x00,0x00,0xFE,
   0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x90,0x3F,0x00,0x00,0xF4,0xBE,0xBB,0xBB,0xBB,
@@ -1074,13 +1150,54 @@ static const uint8_t star_cjk_bits[1248] = {
   0x05,0x00,0x00,0x70,0x3F,0x00,0x00,0xB2,0xEF,0x04,0x60,0xFE,0x1B,0x00,0x00,0xF7,
   0x03,0x40,0xFA,0xCF,0x02,0x00,0x20,0xFB,0x4E,0x00,0x70,0x3F,0x00,0xF5,0x6D,0x00,
   0x00,0x00,0x00,0xF7,0x07,0x00,0x73,0x01,0x00,0x04,0x00,0x00,0x00,0x00,0x00,0x03,
+  0x20,0xEB,0x8D,0x01,0xE2,0x6C,0xE7,0x0A,0xD9,0x01,0x50,0x3F,0xAC,0x00,0x10,0x6F,
+  0xCA,0x00,0x20,0x4F,0xF5,0x17,0xC2,0x1D,0x70,0xFF,0xDF,0x03,0x00,0x41,0x03,0x00,
+  0xFD,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xEF,0xFD,0xBB,0xBB,0xBB,0xBB,
+  0xBB,0xBB,0xBB,0xBB,0xBB,0xEF,0xFD,0x00,0x00,0x01,0x00,0x88,0x00,0x20,0x00,0x00,
+  0xEF,0xFD,0x00,0x80,0x1D,0x00,0xBE,0x00,0xF3,0x07,0x00,0xEF,0xFD,0x00,0x10,0x9E,
+  0x40,0x6F,0x00,0xEA,0x01,0x00,0xEF,0xFD,0x00,0x43,0x79,0xA4,0x6F,0x54,0x9F,0x44,
+  0x00,0xEF,0xFD,0x00,0xFA,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0xEF,0xFD,0x00,0x00,
+  0x00,0xF8,0x05,0x00,0x00,0x00,0x00,0xEF,0xFD,0x40,0x44,0x54,0xEF,0x44,0x44,0x44,
+  0x44,0x04,0xEF,0xFD,0xD0,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x0F,0xEF,0xFD,0x00,
+  0x10,0xFB,0x06,0x00,0x40,0xAF,0x00,0x00,0xEF,0xFD,0x00,0xB1,0x9F,0x00,0x00,0x00,
+  0xF8,0x09,0x00,0xEF,0xFD,0x50,0xFD,0xFD,0xFF,0xFF,0xFF,0x97,0xCF,0x04,0xEF,0xFD,
+  0xF5,0x4D,0xF6,0x47,0x44,0xF5,0x06,0xE6,0x4F,0xEF,0xFD,0x60,0x01,0xF6,0x03,0x00,
+  0xF3,0x04,0x10,0x05,0xEF,0xFD,0x00,0x00,0xF6,0x03,0xF8,0xDF,0x11,0x00,0x00,0xEF,
+  0xFD,0x00,0x00,0xF6,0x03,0x21,0x02,0x80,0x0C,0x00,0xEF,0xFD,0x00,0x00,0xF5,0x06,
+  0x00,0x00,0xC1,0x0B,0x00,0xEF,0xFD,0x00,0x00,0xE1,0xFF,0xFF,0xFF,0xFF,0x06,0x00,
+  0xEF,0xFD,0x00,0x00,0x10,0x54,0x55,0x55,0x24,0x00,0x00,0xEF,0xFD,0x99,0x99,0x99,
+  0x99,0x99,0x99,0x99,0x99,0x99,0xEF,0xFD,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+  0xFF,0xEF,0xFD,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xEF,0x43,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x34,0x00,0x00,0x00,0x02,0x00,0x00,0x00,0x00,
+  0x20,0x00,0x00,0x00,0x00,0x00,0x80,0x6F,0x00,0x00,0x00,0x00,0xE1,0x4D,0x00,0x00,
+  0x00,0x00,0x30,0xEF,0x03,0x00,0x00,0x00,0xF7,0x0C,0x00,0x00,0x00,0x00,0x00,0xF7,
+  0x0C,0x00,0x00,0x10,0xFE,0x03,0x00,0x00,0x00,0x00,0x00,0xD0,0x5F,0x00,0x00,0xA0,
+  0x8F,0x00,0x00,0x00,0x00,0xA2,0xAA,0xCA,0xAE,0xAA,0xAA,0xFA,0xAF,0xAA,0x4A,0x00,
+  0x00,0xF2,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x6F,0x00,0x00,0xF2,0x0B,0x00,
+  0x00,0xF1,0x0E,0x00,0x00,0x90,0x6F,0x00,0x00,0xF2,0x0B,0x00,0x00,0xF1,0x0E,0x00,
+  0x00,0x90,0x6F,0x00,0x00,0xF2,0x0B,0x00,0x00,0xF1,0x0E,0x00,0x00,0x90,0x6F,0x00,
+  0x00,0xF2,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x6F,0x00,0x00,0xF2,0x8D,0x88,
+  0x88,0xF9,0x8F,0x88,0x88,0xC8,0x6F,0x00,0x00,0xF2,0x0B,0x00,0x00,0xF1,0x0E,0x00,
+  0x00,0x90,0x6F,0x00,0x00,0xF2,0x0B,0x00,0x00,0xF1,0x0E,0x00,0x00,0x90,0x6F,0x00,
+  0x00,0xF2,0xAE,0xAA,0xAA,0xFA,0xAF,0xAA,0xAA,0xDA,0x6F,0x00,0x00,0xF2,0xFF,0xFF,
+  0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x6F,0x00,0x00,0x00,0x00,0x00,0x00,0xF1,0x0E,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xF1,0x0E,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0xF1,0x0E,0x00,0x00,0x00,0x00,0x00,0xF9,0xFF,0xFF,0xFF,
+  0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xAF,0xC8,0xCC,0xCC,0xCC,0xCC,0xFD,0xCF,0xCC,
+  0xCC,0xCC,0xCC,0x8C,0x00,0x00,0x00,0x00,0x00,0xF1,0x0E,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0xF1,0x0E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0xF1,0x0E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xF1,0x0E,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x71,0x06,0x00,0x00,0x00,0x00,0x00,
 };
 
-static const dial_glyph_t star_cjk_glyphs[4] = {
+static const dial_glyph_t star_cjk_glyphs[7] = {
   {0xC0, 1, 10, 25, 26, 1664, &star_cjk_bits[0]},  /* 梅 */
   {0xC1, 2, 10, 24, 26, 1664, &star_cjk_bits[325]},  /* 花 */
   {0xC2, 2, 10, 24, 26, 1664, &star_cjk_bits[637]},  /* 轮 */
   {0xC3, 3, 10, 23, 26, 1664, &star_cjk_bits[949]},  /* 帧 */
+  {0xB0, 2, 13, 8, 8, 616, &star_cjk_bits[1248]},  /* ° */
+  {0xC4, 3, 12, 22, 24, 1664, &star_cjk_bits[1280]},  /* 圈 */
+  {0xC5, 2, 10, 24, 26, 1664, &star_cjk_bits[1544]},  /* 单 */
 };
 
 
@@ -1089,6 +1206,9 @@ static const dial_glyph_t star_cjk_glyphs[4] = {
 #define CH_LUN   "\xC2"
 #define CH_ZHEN  "\xC3"
 #define CH_CHI   "\xD7"
+#define CH_DEG   "\xB0"
+#define CH_QUAN  "\xC4"
+#define CH_DAN   "\xC5"
 
 static const dial_glyph_t *glyph(uint8_t code)
 {
@@ -1101,7 +1221,7 @@ static const dial_glyph_t *glyph(uint8_t code)
   {
     if (star_extra_glyphs[i].code == code) { return &star_extra_glyphs[i]; }
   }
-  for (i = 0; i < 4U; i++)
+  for (i = 0; i < 7U; i++)
   {
     if (star_cjk_glyphs[i].code == code) { return &star_cjk_glyphs[i]; }
   }
@@ -1228,6 +1348,7 @@ void StarTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h, int16_t ox, int
   char l1[48];
   char l2[48];
   char l3[48];
+  char l4[48];
   char rows[STAR_MEAS_HIST][56];
   int W = (int)fb_w, H = (int)fb_h;
   const int hx = 12, hy = 8, gap = 28, pad = 8;
@@ -1300,7 +1421,7 @@ void StarTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h, int16_t ox, int
   *p = 0;
 
   p = l3;
-  if ((phase >= 2U) && (g_star_tps_e3 > 0))
+  if ((phase >= 2U) && (s_have_prev != 0U))
   {
     if (g_star_meas_n >= 3U)
     {
@@ -1312,8 +1433,10 @@ void StarTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h, int16_t ox, int
       p = put_str(p, "---");
     }
     *p++ = ' ';
-    p = put_frac(p, (uint32_t)g_star_tps_e3, 1000U, 3);
-    p = put_str(p, CH_CHI "/s");
+    p = put_frac(p, (uint32_t)(g_star_ang_mdeg / 10), 100U, 2);
+    p = put_str(p, CH_DEG " ");
+    p = put_frac(p, (uint32_t)g_star_dps_e3, 1000U, 3);
+    p = put_str(p, CH_DEG "/s");
   }
   else
   {
@@ -1321,10 +1444,33 @@ void StarTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h, int16_t ox, int
   }
   *p = 0;
 
+  /* 第 4 行：单圈用时、本窗圈数进度、本圈已转角度 */
+  p = l4;
+  p = put_str(p, CH_DAN CH_QUAN " ");
+  if (g_star_lap_us != 0U)
+  {
+    p = put_frac(p, (g_star_lap_us + 500U) / 1000U, 1000U, 3);
+    *p++ = 's';
+  }
+  else
+  {
+    p = put_str(p, "---");
+  }
+  *p++ = ' ';
+  p = put_uv(p, (uint32_t)g_star_mw_laps);
+  *p++ = '/';
+  if (g_star_mw_target == 0U) { p = put_str(p, ">30s"); }
+  else { p = put_uv(p, (uint32_t)g_star_mw_target); p = put_str(p, CH_QUAN); }
+  *p++ = ' ';
+  p = put_frac(p, (uint32_t)(g_star_lap_deg * 10.0), 10U, 1);
+  p = put_str(p, CH_DEG);
+  *p = 0;
+
   nk = (int)g_star_meas_n;
   tw = measure_str(l1);
   xv = measure_str(l2); if (xv > tw) { tw = xv; }
   xv = measure_str(l3); if (xv > tw) { tw = xv; }
+  xv = measure_str(l4); if (xv > tw) { tw = xv; }
   for (k = 0; k < nk; k++)
   {
     int idx = (int)g_star_meas_i - 1 - k;
@@ -1335,16 +1481,16 @@ void StarTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h, int16_t ox, int
     *p++ = ']'; *p++ = ' ';
     p = put_frac(p, (g_star_meas_dt_us[idx] + 5U) / 10U, 100000U, 5);
     *p++ = 's'; *p++ = ' ';
-    p = put_frac(p, (uint32_t)iabs32(g_star_meas_teeth_e3[idx]), 1000U, 3);
-    p = put_str(p, CH_CHI " ");
-    p = put_frac(p, (uint32_t)g_star_meas_tps_e3[idx], 1000U, 3);
-    p = put_str(p, CH_CHI "/s");
+    p = put_frac(p, (uint32_t)iabs32(g_star_meas_ang_mdeg[idx]), 1000U, 3);
+    p = put_str(p, CH_DEG " ");
+    p = put_frac(p, (uint32_t)g_star_meas_dps_e3[idx], 1000U, 3);
+    p = put_str(p, CH_DEG "/s");
     *p = 0;
     xv = measure_str(rows[k]);
     if (xv > tw) { tw = xv; }
   }
   x1 = hx + tw + pad;
-  y1 = hy + ((3 + nk) * gap) + pad + 12;
+  y1 = hy + ((4 + nk) * gap) + pad + 12;
   if ((ox > 0) && (x1 > (int)ox) && (phase >= 1U)) { x1 = (int)ox; }
   if (x1 >= W) { x1 = W - 1; }
   if (y1 >= H) { y1 = H - 1; }
@@ -1354,8 +1500,9 @@ void StarTrack_Paint(uint16_t *fb, uint16_t fb_w, uint16_t fb_h, int16_t ox, int
   (void)draw_str_ink(fb, W, H, hx, hy, l1, TXT_INK);
   (void)draw_str_ink(fb, W, H, hx, hy + gap, l2, TXT_INK);
   draw_line_split(fb, W, H, hx, hy + (2 * gap), l3);
+  (void)draw_str_ink(fb, W, H, hx, hy + (3 * gap), l4, TXT_INK);
   for (k = 0; k < nk; k++)
   {
-    draw_line_split(fb, W, H, hx, hy + ((3 + k) * gap), rows[k]);
+    draw_line_split(fb, W, H, hx, hy + ((4 + k) * gap), rows[k]);
   }
 }
