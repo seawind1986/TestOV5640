@@ -55,12 +55,12 @@
 #define DIAL_READ_ON           1U
 /* 功能模式：0 四指针读体积（源文件不改，只作为可切换模式保留），1 升针转速跟踪，
  * 2 梅花轮齿频（star_track.c），3 只显示全幅画面、不做识别。
- * 开机默认四指针；也可由按键或截屏工具切换。 */
+ * 开机默认只显示画面；也可由按键或截屏工具切换。 */
 #define METER_MODE_VOLUME      0U
 #define METER_MODE_SPEED       1U
 #define METER_MODE_STAR        2U
 #define METER_MODE_VIEW        3U
-#define METER_MODE_DEFAULT     METER_MODE_VOLUME
+#define METER_MODE_DEFAULT     METER_MODE_VIEW
 #define MODE_REQUEST_NONE      0xFFFFFFFFUL
 volatile uint32_t g_meter_mode = METER_MODE_DEFAULT;
 volatile uint32_t g_meter_request = MODE_REQUEST_NONE; /* 0/1/2/3；调试写此值与按键走同一路径 */
