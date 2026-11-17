@@ -54,11 +54,11 @@
 /* 1: run the new dial-read pipeline (seam + rectify + 4-dial reading) on each LCD frame. */
 #define DIAL_READ_ON           1U
 /* 功能模式：0 四指针读体积（源文件不改，只作为可切换模式保留），1 升针转速跟踪，
- * 2 梅花轮齿频（star_track.c）。切回升针测速只改下面一行为 METER_MODE_SPEED。 */
+ * 2 梅花轮齿频（star_track.c）。开机默认四指针；也可由按键或截屏工具切换。 */
 #define METER_MODE_VOLUME      0U
 #define METER_MODE_SPEED       1U
 #define METER_MODE_STAR        2U
-#define METER_MODE_DEFAULT     METER_MODE_SPEED
+#define METER_MODE_DEFAULT     METER_MODE_VOLUME
 #define MODE_REQUEST_NONE      0xFFFFFFFFUL
 volatile uint32_t g_meter_mode = METER_MODE_DEFAULT;
 volatile uint32_t g_meter_request = MODE_REQUEST_NONE; /* 0/1/2；调试写此值与按键走同一路径 */
@@ -130,6 +130,17 @@ volatile meter_failed_raw_t g_meter_failed_raw;
 #define af_mail_start          (*(volatile uint32_t *)AF_MAIL_START_ADDR)
 #define af_mail_state          (*(volatile uint32_t *)AF_MAIL_STATE_ADDR)
 #define af_mail_status         (*(volatile uint32_t *)AF_MAIL_STATUS_ADDR)
+
+/* 模式切换邮箱：工具写 request=0/1/2 并置 start=1，与按键走同一路径。 */
+#define MODE_MAIL_ADDR         0xC1FFF040UL
+#define MODE_MAIL_MAGIC        0x4D4F4431UL
+#define MODE_MAIL_REQUEST_ADDR (MODE_MAIL_ADDR + 4UL)
+#define MODE_MAIL_START_ADDR   (MODE_MAIL_ADDR + 8UL)
+#define MODE_MAIL_CURRENT_ADDR (MODE_MAIL_ADDR + 12UL)
+#define mode_mail_magic        (*(volatile uint32_t *)MODE_MAIL_ADDR)
+#define mode_mail_request      (*(volatile uint32_t *)MODE_MAIL_REQUEST_ADDR)
+#define mode_mail_start        (*(volatile uint32_t *)MODE_MAIL_START_ADDR)
+#define mode_mail_current      (*(volatile uint32_t *)MODE_MAIL_CURRENT_ADDR)
 /* SDCLK=100MHz，COUNT=64*1000*100/8192-20 */
 #define SDRAM_REFRESH_COUNT  761U
 #define SDRAM_TIMEOUT_MS     100U
@@ -298,7 +309,18 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    if (mode_mail_start != 0U)
+    {
+      uint32_t want = mode_mail_request;
+      mode_mail_start = 0U;
+      if (want <= METER_MODE_STAR)
+      {
+        g_meter_req_source = 2U;
+        g_meter_request = want;
+      }
+    }
     MeterMode_Service();
+    mode_mail_current = g_meter_mode;
     Shutter_Service(1U);
     CAM_ScaleToLcd();
     CAM_Service();
@@ -1347,6 +1369,10 @@ static void Shutter_Init(void)
   af_mail_start = 0U;
   af_mail_state = 0U;
   af_mail_status = 0U;
+  mode_mail_magic = MODE_MAIL_MAGIC;
+  mode_mail_request = METER_MODE_DEFAULT;
+  mode_mail_start = 0U;
+  mode_mail_current = METER_MODE_DEFAULT;
 }
 
 /* 快门或定位冻结时，不再把新的镜头画面写到液晶或换屏。 */
