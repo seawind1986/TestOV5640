@@ -1564,8 +1564,6 @@ void OV5640_RgbLcdNativeWindow(uint16_t x, uint16_t y, uint16_t width, uint16_t 
   OV5640_RgbLcdFinish();
 }
 
-/* 下载完成后立刻单次对焦；失败时再试几次，不再先拉到最远。 */
-
 int OV5640_SensorInit(void)
 {
   uint8_t id_hi = 0U;
@@ -1616,13 +1614,13 @@ int OV5640_SensorInit(void)
   {
     return -1;
   }
-  /* 预览寄存器由 OV5640_RgbLcdPreview 写。对焦固件不在初始化里下载。 */
+  /* 预览寄存器由 OV5640_RgbLcdPreview 写。对焦固件在预览启动后再由状态机下载。 */
   HAL_Delay(50);
   OV5640_FocusReset();
   return 0;
 }
 
-/* J-Link 把 focus_start 写成 1，状态机开始下载对焦固件并单次对焦，不预先读版本。 */
+/* 预览启动后置位 focus_start；状态机下载对焦固件并单次对焦。也可用 J-Link 再置位一次。 */
 uint8_t focus_start;
 uint8_t focus_state;
 uint16_t focus_index;
