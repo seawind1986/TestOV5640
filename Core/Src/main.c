@@ -3166,6 +3166,10 @@ static void SpeedTrack_ApplyRefine(int16_t rox, int16_t roy, uint16_t rnw, uint1
 
 static void SpeedTrack_ApplyCrop(void)
 {
+  if ((g_speed.crop.w <= 80U) || (g_speed.crop.h <= 80U))
+  {
+    return;
+  }
   OV5640_GetWindow((uint16_t *)&g_cam_dbg.win_x, (uint16_t *)&g_cam_dbg.win_y,
                    (uint16_t *)&g_cam_dbg.win_w, (uint16_t *)&g_cam_dbg.win_h);
   OV5640_GetView((uint16_t *)&g_cam_dbg.view_x, (uint16_t *)&g_cam_dbg.view_y,

@@ -1496,17 +1496,25 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
   int cy;
 
   if ((st == 0) || (st->needle.found == 0U)) { return; }
-  /* 次左针约在一个表盘距外，则最左就是升针；否则最左多半是 ×0.001。 */
+  /* 次左针约在一个表盘距外，则最左就是升针；否则最左多半是 ×0.001。
+   * 但再左移一个表盘距会把窗口裁出画面时，说明最左已经是升针，不要再减。 */
   {
     int gap = (int)g_left2_cx - (int)st->needle.cx;
+    int use_left = 0;
     if ((g_left2_cx != 0U) && (gap >= 160) && (gap <= 280))
     {
-      cx = (int)st->needle.cx;
+      use_left = 1;
     }
     else
     {
-      cx = (int)st->needle.cx - SHENG_PITCH;
+      int trial = (int)st->needle.cx - SHENG_PITCH;
+      int half = (int)st->needle.r + m;
+      if ((trial - half) < 0)
+      {
+        use_left = 1;
+      }
     }
+    cx = use_left ? (int)st->needle.cx : ((int)st->needle.cx - SHENG_PITCH);
   }
   cy = (int)st->needle.cy;
   x0 = cx - (int)st->needle.r - m;
@@ -1534,6 +1542,18 @@ void SpeedTrack_FinishLocate(speed_state_t *st, uint16_t frame_w, uint16_t frame
     y0 -= (y1 - (int)frame_h);
     y1 = (int)frame_h;
     if (y0 < 0) { y0 = 0; }
+  }
+  /* 窗口几乎被夹成下限窄条时不要裁，留在全幅再找，避免画面飞到屏幕边缘。 */
+  {
+    int expect = 2 * ((int)st->needle.r + m);
+    if (expect < 160) { expect = 160; }
+    if (((x1 - x0) <= 80) || ((y1 - y0) <= 80) ||
+        ((x1 - x0) < (expect / 2)) || ((y1 - y0) < (expect / 2)))
+    {
+      st->loc_ok = 0U;
+      st->track_ok = 0U;
+      return;
+    }
   }
   st->crop.x = (uint16_t)x0;
   st->crop.y = (uint16_t)y0;
