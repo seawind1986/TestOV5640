@@ -104,6 +104,19 @@ volatile meter_failed_raw_t g_meter_failed_raw;
 #define SHUTTER_MAIL_MAGIC     0x53485554UL
 #define SHUTTER_FLAG_ADDR      (SHUTTER_MAIL_ADDR + 4UL)
 #define shutter_flag           (*(volatile uint32_t *)SHUTTER_FLAG_ADDR)
+
+/* 音圈邮箱紧挨快门邮箱，同样在非缓存 SDRAM 末段，供截屏工具写入。 */
+#define VCM_MAIL_ADDR          0xC1FFF010UL
+#define VCM_MAIL_MAGIC         0x56434D31UL
+#define VCM_MAIL_TARGET_ADDR   (VCM_MAIL_ADDR + 4UL)
+#define VCM_MAIL_START_ADDR    (VCM_MAIL_ADDR + 8UL)
+#define VCM_MAIL_VALUE_ADDR    (VCM_MAIL_ADDR + 12UL)
+#define VCM_MAIL_STATE_ADDR    (VCM_MAIL_ADDR + 16UL)
+#define vcm_mail_magic         (*(volatile uint32_t *)VCM_MAIL_ADDR)
+#define vcm_mail_target        (*(volatile uint32_t *)VCM_MAIL_TARGET_ADDR)
+#define vcm_mail_start         (*(volatile uint32_t *)VCM_MAIL_START_ADDR)
+#define vcm_mail_value         (*(volatile uint32_t *)VCM_MAIL_VALUE_ADDR)
+#define vcm_mail_state         (*(volatile uint32_t *)VCM_MAIL_STATE_ADDR)
 /* SDCLK=100MHz，COUNT=64*1000*100/8192-20 */
 #define SDRAM_REFRESH_COUNT  761U
 #define SDRAM_TIMEOUT_MS     100U
@@ -277,7 +290,20 @@ int main(void)
     CAM_ScaleToLcd();
     CAM_Service();
     OV5640_FocusSweep();
+    if (vcm_mail_start != 0U)
+    {
+      uint32_t code = vcm_mail_target;
+      if (code > 1023U)
+      {
+        code = 1023U;
+      }
+      vcm_target = (uint16_t)code;
+      vcm_start = 1U;
+      vcm_mail_start = 0U;
+    }
     OV5640_VcmSweep();
+    vcm_mail_value = (uint32_t)vcm_value;
+    vcm_mail_state = (uint32_t)vcm_state;
     LCD_DemoFrame();
     if (g_meter_mode == METER_MODE_VOLUME)
     {
@@ -1285,6 +1311,12 @@ static void Shutter_Init(void)
   mail[1] = 0U;
   shutter_armed = 0U;
   shutter_done = 0U;
+
+  vcm_mail_magic = VCM_MAIL_MAGIC;
+  vcm_mail_target = 0U;
+  vcm_mail_start = 0U;
+  vcm_mail_value = 0U;
+  vcm_mail_state = 0U;
 }
 
 /* 快门或定位冻结时，不再把新的镜头画面写到液晶或换屏。 */
