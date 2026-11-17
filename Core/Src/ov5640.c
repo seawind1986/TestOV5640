@@ -50,7 +50,7 @@ extern const uint8_t cam_gain;
 
 static void SCCB_Delay(void)
 {
-  volatile uint32_t count = 2000U;
+  volatile uint32_t count = 8000U;
 
   while (count > 0U)
   {
