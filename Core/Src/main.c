@@ -160,6 +160,7 @@ static void MX_TIM2_Init(void);
 static void MPU_Config(void);
 static void SDRAM_InitSequence(void);
 static void LCD_DemoInit(void);
+static void LCD_FillBoth(uint32_t packed);
 static void LCD_DemoFrame(void);
 static void LCD_PresentLive(void);
 static void Shutter_Init(void);
@@ -238,22 +239,8 @@ int main(void)
   MX_DCMI_Init();
   MX_ETH_Init();
   /* USER CODE BEGIN 2 */
-  {
-    uint32_t n = ((uint32_t)LCD_WIDTH * (uint32_t)LCD_HEIGHT) / 2U;
-    uint32_t i;
-    volatile uint32_t *fb;
-    /* 开机把前后两块显存都铺成蓝屏，避免扫到 SDRAM 残留画面。 */
-    fb = (volatile uint32_t *)LCD_FB_ADDR;
-    for (i = 0U; i < n; i++)
-    {
-      fb[i] = 0x001F001FUL;
-    }
-    fb = (volatile uint32_t *)LCD_FB_BACK;
-    for (i = 0U; i < n; i++)
-    {
-      fb[i] = 0x001F001FUL;
-    }
-  }
+  /* 开机先蓝屏 1 秒，再白屏 1 秒，然后进入工作状态。 */
+  LCD_FillBoth(0x001F001FUL);
   if (LCD_PANEL_ON == 0U)
   {
     __HAL_LTDC_DISABLE(&hltdc);
@@ -263,6 +250,9 @@ int main(void)
   {
     HAL_GPIO_WritePin(LCD_BL_GPIO_Port, LCD_BL_Pin, GPIO_PIN_SET);
   }
+  HAL_Delay(1000);
+  LCD_FillBoth(0xFFFFFFFFUL);
+  HAL_Delay(1000);
   LCD_DemoInit();
   MX_RTC_Init();
   MX_TIM2_Init();
@@ -1222,17 +1212,34 @@ static void LCD_DrawStar(const LCD_Star *star, uint16_t scale)
   }
 }
 
+static void LCD_FillBoth(uint32_t packed)
+{
+  uint32_t n = ((uint32_t)LCD_WIDTH * (uint32_t)LCD_HEIGHT) / 2U;
+  uint32_t i;
+  volatile uint32_t *fb;
+
+  fb = (volatile uint32_t *)LCD_FB_ADDR;
+  for (i = 0U; i < n; i++)
+  {
+    fb[i] = packed;
+  }
+  fb = (volatile uint32_t *)LCD_FB_BACK;
+  for (i = 0U; i < n; i++)
+  {
+    fb[i] = packed;
+  }
+}
+
 static void LCD_FillBackground(void)
 {
-  /* RGB565 纯蓝，两像素打包。摄像头没起来时保持蓝底，用来确认 LCD 已工作。 */
+  /* 工作间隙和切模式铺黑底。开机开场另用 LCD_FillBoth 做蓝、白屏。 */
   volatile uint32_t *fb = (volatile uint32_t *)lcd_draw;
   uint32_t i;
-  uint32_t n = (LCD_WIDTH * LCD_HEIGHT) / 2U;
-  uint32_t blue = 0x001F001FUL;
+  uint32_t n = ((uint32_t)LCD_WIDTH * (uint32_t)LCD_HEIGHT) / 2U;
 
   for (i = 0U; i < n; i++)
   {
-    fb[i] = blue;
+    fb[i] = 0U;
   }
 }
 
@@ -1406,10 +1413,8 @@ static void LCD_DemoInit(void)
   }
   if (lcd_stars_on == 0U)
   {
-    LCD_FillBackground();
+    /* 开机开场已铺过显存，这里不再覆盖，等摄像头画面。 */
     lcd_draw = LCD_FB_BACK;
-    LCD_FillBackground();
-    /* 前缓冲给屏幕显示，摄像头写到后缓冲，写完一整帧再交换。 */
   }
   LCD_DemoFrame();
 }
