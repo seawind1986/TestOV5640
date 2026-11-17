@@ -2566,7 +2566,20 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *dcmi)
   uint8_t idx;
 
   (void)dcmi;
-  if (g_meter_switching != 0U) { return; }
+  /* HAL 在场中断里会关掉 FRAME IE。切换期间也必须重新打开并重对准 DMA，否则回来一直黑屏。 */
+  if (g_meter_switching != 0U)
+  {
+    if (hdcmi.Init.JPEGMode != DCMI_JPEG_ENABLE)
+    {
+      CAM_ResyncRgbDma();
+      __HAL_DCMI_ENABLE_IT(&hdcmi, DCMI_IT_FRAME);
+    }
+    else
+    {
+      cam_arm = 1U;
+    }
+    return;
+  }
   cam_frame_count++;
   if (hdcmi.Init.JPEGMode != DCMI_JPEG_ENABLE)
   {
@@ -3931,13 +3944,17 @@ static void MeterMode_Service(void)
   cam_hold = 0U;
   __DMB();
   g_meter_switching = 0U;
+  if (cam_ok != 0U)
+  {
+    /* 切换窗口里若已有一场中断，HAL 可能已关掉 FRAME IE，这里补开。 */
+    __HAL_DCMI_ENABLE_IT(&hdcmi, DCMI_IT_FRAME);
+  }
   g_meter_status = (cam_ok != 0U) ? 4U : 0xEU;
 }
 
 void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *dcmi)
 {
   (void)dcmi;
-  if (g_meter_switching != 0U) { return; }
   /* 预览是连续 RGB565。溢出只重开 DMA，不要重写传感器，否则画面会停在上一帧。 */
   if (hdcmi.Init.JPEGMode != DCMI_JPEG_ENABLE)
   {
