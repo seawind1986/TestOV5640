@@ -54,14 +54,16 @@
 /* 1: run the new dial-read pipeline (seam + rectify + 4-dial reading) on each LCD frame. */
 #define DIAL_READ_ON           1U
 /* 功能模式：0 四指针读体积（源文件不改，只作为可切换模式保留），1 升针转速跟踪，
- * 2 梅花轮齿频（star_track.c）。开机默认四指针；也可由按键或截屏工具切换。 */
+ * 2 梅花轮齿频（star_track.c），3 只显示全幅画面、不做识别。
+ * 开机默认四指针；也可由按键或截屏工具切换。 */
 #define METER_MODE_VOLUME      0U
 #define METER_MODE_SPEED       1U
 #define METER_MODE_STAR        2U
+#define METER_MODE_VIEW        3U
 #define METER_MODE_DEFAULT     METER_MODE_VOLUME
 #define MODE_REQUEST_NONE      0xFFFFFFFFUL
 volatile uint32_t g_meter_mode = METER_MODE_DEFAULT;
-volatile uint32_t g_meter_request = MODE_REQUEST_NONE; /* 0/1/2；调试写此值与按键走同一路径 */
+volatile uint32_t g_meter_request = MODE_REQUEST_NONE; /* 0/1/2/3；调试写此值与按键走同一路径 */
 volatile uint32_t g_meter_switching;
 volatile uint32_t g_meter_switch_n;
 volatile uint32_t g_meter_epoch;
@@ -131,7 +133,7 @@ volatile meter_failed_raw_t g_meter_failed_raw;
 #define af_mail_state          (*(volatile uint32_t *)AF_MAIL_STATE_ADDR)
 #define af_mail_status         (*(volatile uint32_t *)AF_MAIL_STATUS_ADDR)
 
-/* 模式切换邮箱：工具写 request=0/1/2 并置 start=1，与按键走同一路径。 */
+/* 模式切换邮箱：工具写 request=0/1/2/3 并置 start=1，与按键走同一路径。 */
 #define MODE_MAIL_ADDR         0xC1FFF040UL
 #define MODE_MAIL_MAGIC        0x4D4F4431UL
 #define MODE_MAIL_REQUEST_ADDR (MODE_MAIL_ADDR + 4UL)
@@ -313,7 +315,7 @@ int main(void)
     {
       uint32_t want = mode_mail_request;
       mode_mail_start = 0U;
-      if (want <= METER_MODE_STAR)
+      if (want <= METER_MODE_VIEW)
       {
         g_meter_req_source = 2U;
         g_meter_request = want;
@@ -360,7 +362,7 @@ int main(void)
     {
       StarMode_Service();
     }
-    else
+    else if (g_meter_mode == METER_MODE_SPEED)
     {
       SpeedTrack_Service();
     }
@@ -1453,7 +1455,7 @@ static void LCD_PresentLive(void)
     StarTrack_Paint((uint16_t *)lcd_draw, (uint16_t)LCD_WIDTH, (uint16_t)LCD_HEIGHT,
                     (int16_t)cam_ox, (int16_t)cam_oy, cam_stamp_us, &now, g_star_phase);
   }
-  else
+  else if (g_meter_mode == METER_MODE_SPEED)
   {
     dial_time_t now;
     dial_get_time(&now);
@@ -3866,7 +3868,7 @@ static void MeterMode_Service(void)
   }
   if (primask == 0U) { __enable_irq(); }
   if (want == MODE_REQUEST_NONE) { return; }
-  if (want > METER_MODE_STAR) { g_meter_status = 0xEU; return; }
+  if (want > METER_MODE_VIEW) { g_meter_status = 0xEU; return; }
   g_meter_last_from = g_meter_mode;
   g_meter_last_to = want;
   g_meter_status = 1U;
@@ -3920,7 +3922,7 @@ static void MeterMode_Service(void)
   LCD_FillBothBlack();
   OV5640_PowerCycle();
   cam_ok = 0U;
-  CAM_Init(); /* 全幅、默认自动曝光：volume 居中；speed/star 左移，随后各自原裁窗流程 */
+  CAM_Init(); /* 全幅、默认自动曝光：volume/只显示居中；speed/star 左移，随后各自原裁窗流程 */
   if (cam_ok != 0U) { CamDbg_SnapSensor(); }
   g_crop_settling = 1U;
   g_cam_settle_us = FULL_SETTLE_US;
