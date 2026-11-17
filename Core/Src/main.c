@@ -143,7 +143,22 @@ volatile meter_failed_raw_t g_meter_failed_raw;
 #define mode_mail_request      (*(volatile uint32_t *)MODE_MAIL_REQUEST_ADDR)
 #define mode_mail_start        (*(volatile uint32_t *)MODE_MAIL_START_ADDR)
 #define mode_mail_current      (*(volatile uint32_t *)MODE_MAIL_CURRENT_ADDR)
+
+/* 识别参数邮箱：工具写 val[] 后置 start=1 应用，start=2 只回读当前值。 */
+#define PARAM_MAIL_ADDR        0xC1FFF050UL
+#define PARAM_MAIL_MAGIC       0x50415231UL /* PAR1 */
+#define PARAM_MAIL_N           35U
+#define PARAM_MAIL_START_ADDR  (PARAM_MAIL_ADDR + 4UL)
+#define PARAM_MAIL_N_ADDR      (PARAM_MAIL_ADDR + 8UL)
+#define PARAM_MAIL_SEQ_ADDR    (PARAM_MAIL_ADDR + 12UL)
+#define PARAM_MAIL_VAL_ADDR    (PARAM_MAIL_ADDR + 16UL)
+#define param_mail_magic       (*(volatile uint32_t *)PARAM_MAIL_ADDR)
+#define param_mail_start       (*(volatile uint32_t *)PARAM_MAIL_START_ADDR)
+#define param_mail_n           (*(volatile uint32_t *)PARAM_MAIL_N_ADDR)
+#define param_mail_seq         (*(volatile uint32_t *)PARAM_MAIL_SEQ_ADDR)
+#define param_mail_val         ((volatile int32_t *)PARAM_MAIL_VAL_ADDR)
 /* SDCLK=100MHz，COUNT=64*1000*100/8192-20 */
+
 #define SDRAM_REFRESH_COUNT  761U
 #define SDRAM_TIMEOUT_MS     100U
 
@@ -203,6 +218,8 @@ static void LCD_FillBoth(uint32_t packed);
 static void LCD_DemoFrame(void);
 static void LCD_PresentLive(void);
 static void Shutter_Init(void);
+static void ParamMail_Init(void);
+static void ParamMail_Service(void);
 static void Shutter_Service(uint8_t allow_present);
 static int CamLcdFrozen(void);
 static void DialRead_Service(void);
@@ -323,6 +340,7 @@ int main(void)
     }
     MeterMode_Service();
     mode_mail_current = g_meter_mode;
+    ParamMail_Service();
     Shutter_Service(1U);
     CAM_ScaleToLcd();
     CAM_Service();
@@ -1353,6 +1371,129 @@ static int LCD_Present(void)
   return 0;
 }
 
+static int32_t Param_Clamp(int32_t v, int32_t lo, int32_t hi)
+{
+  if (v < lo) { return lo; }
+  if (v > hi) { return hi; }
+  return v;
+}
+
+static void ParamMail_Snap(void)
+{
+  param_mail_val[0]  = g_search_mul;
+  param_mail_val[1]  = g_search_min;
+  param_mail_val[2]  = g_search_max;
+  param_mail_val[3]  = g_b_rmin_div;
+  param_mail_val[4]  = g_b_rmin_min;
+  param_mail_val[5]  = g_b_rmin_max;
+  param_mail_val[6]  = g_tip_gap;
+  param_mail_val[7]  = g_red_min;
+  param_mail_val[8]  = g_red_over_g;
+  param_mail_val[9]  = g_red_over_b;
+  param_mail_val[10] = g_red_g_max;
+  param_mail_val[11] = g_red_b_max;
+  param_mail_val[12] = g_min_area;
+  param_mail_val[13] = g_pale_min;
+  param_mail_val[14] = g_gold_max;
+  param_mail_val[15] = g_track_near_min;
+  param_mail_val[16] = g_ang_alpha_num;
+  param_mail_val[17] = g_ang_jump_milli;
+  param_mail_val[18] = g_ang_jump_div;
+  param_mail_val[19] = g_dial_rmul_min;
+  param_mail_val[20] = g_dial_rmul_max;
+  param_mail_val[21] = g_dial_rmin;
+  param_mail_val[22] = g_dial_rmax;
+  param_mail_val[23] = g_dial_ink_luma;
+  param_mail_val[24] = g_dial_ink_chroma;
+  param_mail_val[25] = g_tick_n;
+  param_mail_val[26] = g_tick_n_left;
+  param_mail_val[27] = g_tick_len_major;
+  param_mail_val[28] = g_tick_len_minor;
+  param_mail_val[29] = (int32_t)g_color_ab;
+  param_mail_val[30] = (int32_t)g_color_search;
+  param_mail_val[31] = (int32_t)g_color_dial;
+  param_mail_val[32] = (int32_t)g_color_dial_est;
+  param_mail_val[33] = (int32_t)g_color_text;
+  param_mail_val[34] = (int32_t)g_color_text_bg;
+  param_mail_n = PARAM_MAIL_N;
+}
+
+static void ParamMail_Apply(void)
+{
+  g_search_mul       = (int)Param_Clamp(param_mail_val[0],  2, 8);
+  g_search_min       = (int)Param_Clamp(param_mail_val[1],  16, 200);
+  g_search_max       = (int)Param_Clamp(param_mail_val[2],  32, 400);
+  g_b_rmin_div       = (int)Param_Clamp(param_mail_val[3],  2, 12);
+  g_b_rmin_min       = (int)Param_Clamp(param_mail_val[4],  1, 20);
+  g_b_rmin_max       = (int)Param_Clamp(param_mail_val[5],  4, 40);
+  g_tip_gap          = (int)Param_Clamp(param_mail_val[6],  0, 20);
+  g_red_min          = (int)Param_Clamp(param_mail_val[7],  40, 255);
+  g_red_over_g       = (int)Param_Clamp(param_mail_val[8],  0, 80);
+  g_red_over_b       = (int)Param_Clamp(param_mail_val[9],  0, 80);
+  g_red_g_max        = (int)Param_Clamp(param_mail_val[10], 80, 255);
+  g_red_b_max        = (int)Param_Clamp(param_mail_val[11], 80, 255);
+  g_min_area         = (int)Param_Clamp(param_mail_val[12], 50, 2000);
+  g_pale_min         = (int)Param_Clamp(param_mail_val[13], 100, 1000);
+  g_gold_max         = (int)Param_Clamp(param_mail_val[14], 10, 400);
+  g_track_near_min   = (int)Param_Clamp(param_mail_val[15], 1, 100);
+  g_ang_alpha_num    = (int)Param_Clamp(param_mail_val[16], 1, 10);
+  g_ang_jump_milli   = (int)Param_Clamp(param_mail_val[17], 200, 4000);
+  g_ang_jump_div     = (int)Param_Clamp(param_mail_val[18], 2, 16);
+  g_dial_rmul_min    = (int)Param_Clamp(param_mail_val[19], 4, 30);
+  g_dial_rmul_max    = (int)Param_Clamp(param_mail_val[20], 10, 60);
+  g_dial_rmin        = (int)Param_Clamp(param_mail_val[21], 4, 80);
+  g_dial_rmax        = (int)Param_Clamp(param_mail_val[22], 40, 400);
+  g_dial_ink_luma    = (int)Param_Clamp(param_mail_val[23], 20, 220);
+  g_dial_ink_chroma  = (int)Param_Clamp(param_mail_val[24], 5, 120);
+  g_tick_n           = (int)Param_Clamp(param_mail_val[25], 5, 20);
+  g_tick_n_left      = (int)Param_Clamp(param_mail_val[26], 10, 40);
+  g_tick_len_major   = (int)Param_Clamp(param_mail_val[27], 2, 30);
+  g_tick_len_minor   = (int)Param_Clamp(param_mail_val[28], 1, 20);
+  g_color_ab         = (uint16_t)Param_Clamp(param_mail_val[29], 0, 0xFFFF);
+  g_color_search     = (uint16_t)Param_Clamp(param_mail_val[30], 0, 0xFFFF);
+  g_color_dial       = (uint16_t)Param_Clamp(param_mail_val[31], 0, 0xFFFF);
+  g_color_dial_est   = (uint16_t)Param_Clamp(param_mail_val[32], 0, 0xFFFF);
+  g_color_text       = (uint16_t)Param_Clamp(param_mail_val[33], 0, 0xFFFF);
+  g_color_text_bg    = (uint16_t)Param_Clamp(param_mail_val[34], 0, 0xFFFF);
+}
+
+static void ParamMail_Init(void)
+{
+  param_mail_magic = PARAM_MAIL_MAGIC;
+  param_mail_start = 0U;
+  param_mail_n = PARAM_MAIL_N;
+  param_mail_seq = 0U;
+  ParamMail_Snap();
+}
+
+static void ParamMail_Service(void)
+{
+  uint32_t cmd;
+
+  if (param_mail_magic != PARAM_MAIL_MAGIC)
+  {
+    ParamMail_Init();
+    return;
+  }
+
+  cmd = param_mail_start;
+  if (cmd == 1U)
+  {
+    ParamMail_Apply();
+    ParamMail_Snap();
+    param_mail_seq++;
+    __DMB();
+    param_mail_start = 0U;
+  }
+  else if (cmd == 2U)
+  {
+    ParamMail_Snap();
+    param_mail_seq++;
+    __DMB();
+    param_mail_start = 0U;
+  }
+}
+
 static void Shutter_Init(void)
 {
   volatile uint32_t *mail = (volatile uint32_t *)SHUTTER_MAIL_ADDR;
@@ -1375,6 +1516,7 @@ static void Shutter_Init(void)
   mode_mail_request = METER_MODE_DEFAULT;
   mode_mail_start = 0U;
   mode_mail_current = METER_MODE_DEFAULT;
+  ParamMail_Init();
 }
 
 /* 快门或定位冻结时，不再把新的镜头画面写到液晶或换屏。 */
