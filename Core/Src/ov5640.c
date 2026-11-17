@@ -231,39 +231,154 @@ static int OV5640_WriteList(const uint16_t *table, uint32_t count)
   return 0;
 }
 
-/* 新板不再用 PCF8574。开发板上 P2 是摄像头掉电，改接到 PH4；P7 是网口复位，改接到 PH5。
-   PWDN 高电平掉电，低电平工作。PHY 复位低有效，空闲为高。 */
-#define BOARD_PORT   GPIOH
-#define CAM_PWDN     GPIO_PIN_4
-#define ETH_RST      GPIO_PIN_5
+/* 开发板摄像头掉电走 PCF8574：P2=PWDN（高掉电，低工作），P7=网口复位（低有效，空闲为高）。
+   扩展芯片 I2C：PH4=SCL，PH5=SDA，写地址 0x40（A0/A1/A2 接地）。默认先写 0xFF，再拉低 P2。 */
+#define PCF_PORT      GPIOH
+#define PCF_SCL       GPIO_PIN_4
+#define PCF_SDA       GPIO_PIN_5
+#define PCF_ADDR      0x40U
+#define PCF_PWDN_BIT  2U
+#define PCF_ETH_BIT   7U
 
-static void Board_Pin(uint16_t pin)
+uint8_t pcf_ok;
+uint8_t pcf_shadow = 0xFFU;
+
+static void Pcf_Delay(void)
+{
+  volatile uint32_t count = 8000U;
+
+  while (count > 0U)
+  {
+    count--;
+  }
+}
+
+static void Pcf_Sda(uint8_t high)
+{
+  HAL_GPIO_WritePin(PCF_PORT, PCF_SDA, high ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void Pcf_Scl(uint8_t high)
+{
+  HAL_GPIO_WritePin(PCF_PORT, PCF_SCL, high ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void Pcf_Pins(void)
 {
   GPIO_InitTypeDef gpio = {0};
 
   __HAL_RCC_GPIOH_CLK_ENABLE();
-  gpio.Pin = pin;
-  gpio.Mode = GPIO_MODE_OUTPUT_PP;
+  gpio.Pin = PCF_SCL | PCF_SDA;
+  gpio.Mode = GPIO_MODE_OUTPUT_OD;
   gpio.Pull = GPIO_PULLUP;
-  gpio.Speed = GPIO_SPEED_FREQ_LOW;
+  gpio.Speed = GPIO_SPEED_FREQ_HIGH;
   gpio.Alternate = 0U;
-  HAL_GPIO_Init(BOARD_PORT, &gpio);
+  HAL_GPIO_Init(PCF_PORT, &gpio);
+  Pcf_Sda(1U);
+  Pcf_Scl(1U);
+}
+
+static void Pcf_Start(void)
+{
+  Pcf_Sda(1U);
+  Pcf_Scl(1U);
+  Pcf_Delay();
+  Pcf_Sda(0U);
+  Pcf_Delay();
+  Pcf_Scl(0U);
+}
+
+static void Pcf_Stop(void)
+{
+  Pcf_Sda(0U);
+  Pcf_Delay();
+  Pcf_Scl(1U);
+  Pcf_Delay();
+  Pcf_Sda(1U);
+  Pcf_Delay();
+}
+
+static uint8_t Pcf_WriteByte(uint8_t data)
+{
+  uint8_t bit;
+  uint8_t ack;
+
+  for (bit = 0U; bit < 8U; bit++)
+  {
+    Pcf_Sda((data & 0x80U) ? 1U : 0U);
+    data <<= 1;
+    Pcf_Delay();
+    Pcf_Scl(1U);
+    Pcf_Delay();
+    Pcf_Scl(0U);
+  }
+  Pcf_Sda(1U);
+  Pcf_Delay();
+  Pcf_Scl(1U);
+  Pcf_Delay();
+  ack = (HAL_GPIO_ReadPin(PCF_PORT, PCF_SDA) == GPIO_PIN_RESET) ? 1U : 0U;
+  Pcf_Scl(0U);
+  return ack;
+}
+
+static int Pcf_Write(uint8_t data)
+{
+  uint32_t primask = __get_PRIMASK();
+  int result = -1;
+
+  __disable_irq();
+  Pcf_Start();
+  if (Pcf_WriteByte(PCF_ADDR) != 0U)
+  {
+    if (Pcf_WriteByte(data) != 0U)
+    {
+      pcf_shadow = data;
+      result = 0;
+    }
+  }
+  Pcf_Stop();
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+  return result;
+}
+
+static int Pcf_WriteBit(uint8_t bit, uint8_t high)
+{
+  uint8_t data = pcf_shadow;
+
+  if (high != 0U)
+  {
+    data = (uint8_t)(data | (uint8_t)(1U << bit));
+  }
+  else
+  {
+    data = (uint8_t)(data & (uint8_t)~(1U << bit));
+  }
+  return Pcf_Write(data);
+}
+
+static int Pcf_Init(void)
+{
+  Pcf_Pins();
+  pcf_shadow = 0xFFU;
+  pcf_ok = (Pcf_Write(0xFFU) == 0) ? 1U : 0U;
+  return (pcf_ok != 0U) ? 0 : -1;
 }
 
 static void Cam_Pwdn(uint8_t power_down)
 {
-  HAL_GPIO_WritePin(BOARD_PORT, CAM_PWDN, power_down ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  (void)Pcf_WriteBit(PCF_PWDN_BIT, power_down);
 }
 
 void OV5640_BoardIo(uint8_t bit, uint8_t high)
 {
-  if (bit != 7U)
+  if (bit > 7U)
   {
     return;
   }
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  HAL_GPIO_WritePin(BOARD_PORT, ETH_RST, high ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  Board_Pin(ETH_RST);
+  (void)Pcf_WriteBit(bit, high);
 }
 
 static void OV5640_Pins(void)
@@ -291,10 +406,7 @@ static void OV5640_Pins(void)
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_RESET);
   HAL_Delay(20);
 
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  HAL_GPIO_WritePin(BOARD_PORT, ETH_RST, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(BOARD_PORT, CAM_PWDN, GPIO_PIN_SET);
-  Board_Pin(CAM_PWDN | ETH_RST);
+  (void)Pcf_Init();
   Cam_Pwdn(0U);
   HAL_Delay(5);
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET);

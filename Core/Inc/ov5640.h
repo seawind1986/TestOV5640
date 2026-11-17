@@ -52,7 +52,7 @@ void OV5640_FocusLoad(void);
 void OV5640_FocusSweep(void);
 /* 0 没写入或写入失败，1 松开已确认，2 对焦已完成，3 固件已写入但命令未确认。 */
 uint8_t OV5640_FocusState(void);
-/* bit7 是以太网 PHY 复位，高电平为退出复位。新板这根线直连 PH5。 */
+/* bit7 是以太网 PHY 复位，高电平为退出复位。开发板走 PCF8574 的 P7。 */
 void OV5640_BoardIo(uint8_t bit, uint8_t high);
 
 #endif
