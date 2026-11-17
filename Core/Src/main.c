@@ -1224,13 +1224,15 @@ static void LCD_DrawStar(const LCD_Star *star, uint16_t scale)
 
 static void LCD_FillBackground(void)
 {
+  /* RGB565 纯蓝，两像素打包。摄像头没起来时保持蓝底，用来确认 LCD 已工作。 */
   volatile uint32_t *fb = (volatile uint32_t *)lcd_draw;
   uint32_t i;
   uint32_t n = (LCD_WIDTH * LCD_HEIGHT) / 2U;
+  uint32_t blue = 0x001F001FUL;
 
   for (i = 0U; i < n; i++)
   {
-    fb[i] = 0U;
+    fb[i] = blue;
   }
 }
 
