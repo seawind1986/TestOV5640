@@ -48,9 +48,17 @@ void OV5640_SetJpeg(uint8_t on);
 void OV5640_GetSize(uint16_t *width, uint16_t *height);
 int OV5640_Zoom(int direction);
 int OV5640_Pan(int direction);
+/* J-Link 置位 focus_start 后，由 FocusSweep 状态机下载固件并单次对焦。 */
+extern uint8_t focus_start;
+extern uint8_t focus_state;
+extern uint16_t focus_index;
+extern uint8_t focus_ready;
+extern uint8_t focus_phase;
+extern uint8_t focus_status;
+void OV5640_FocusReset(void);
 void OV5640_FocusLoad(void);
 void OV5640_FocusSweep(void);
-/* 0 没写入或写入失败，1 松开已确认，2 对焦已完成，3 固件已写入但命令未确认。 */
+/* 0 未启动，1 失败，2 对焦完成，3 进行中。 */
 uint8_t OV5640_FocusState(void);
 /* bit7 是以太网 PHY 复位，高电平为退出复位。开发板走 PCF8574 的 P7。 */
 void OV5640_BoardIo(uint8_t bit, uint8_t high);
