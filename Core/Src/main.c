@@ -3055,7 +3055,6 @@ static void SpeedTrack_OpenFull(void)
   CAM_LoadView();
   HAL_Delay(20);
   CAM_Start();
-  OV5640_FocusLoad();
   HAL_Delay(20);
   CamDbg_SnapSensor();
   HAL_Delay(80);
@@ -3124,7 +3123,6 @@ static void SpeedTrack_ApplyRefine(int16_t rox, int16_t roy, uint16_t rnw, uint1
   CAM_LoadView();
   HAL_Delay(20);
   CAM_Start();
-  OV5640_FocusLoad();
   HAL_Delay(20);
   CamDbg_SnapSensor();
   HAL_Delay(80);
@@ -3213,7 +3211,6 @@ static void SpeedTrack_ApplyCrop(void)
   HAL_Delay(20);
   CamDbg_Mark(4U);
   CAM_Start();
-  OV5640_FocusLoad();
   HAL_Delay(20);
   CamDbg_Mark(5U);
   CamDbg_SnapSensor();
@@ -3350,7 +3347,6 @@ static void StarMode_OpenFull(void)
   CAM_LoadView();
   HAL_Delay(20);
   CAM_Start();
-  OV5640_FocusLoad();
   HAL_Delay(20);
   CamDbg_SnapSensor();
   HAL_Delay(80);
@@ -3424,7 +3420,6 @@ static void StarMode_ApplyCrop(uint16_t lx, uint16_t ly, uint16_t lw, uint16_t l
   HAL_Delay(20);
   CamDbg_Mark(4U);
   CAM_Start();
-  OV5640_FocusLoad();
   HAL_Delay(20);
   CamDbg_Mark(5U);
   CamDbg_SnapSensor();
@@ -3948,7 +3943,6 @@ static void CAM_Init(void)
   if (g_meter_switching == 0U) { g_meter_status = 4U; }
   cam_hold = 1U;
   CAM_Start();
-  OV5640_FocusLoad();
   cam_hold = 0U;
   meter_next_ms = HAL_GetTick() + 1500U;
   if ((g_meter_mode == METER_MODE_SPEED) || (g_meter_mode == METER_MODE_STAR))

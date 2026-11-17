@@ -1614,13 +1614,13 @@ int OV5640_SensorInit(void)
   {
     return -1;
   }
-  /* 预览寄存器由 OV5640_RgbLcdPreview 写。对焦固件在预览启动后再由状态机下载。 */
+  /* 预览寄存器由 OV5640_RgbLcdPreview 写。对焦固件不自动下载。 */
   HAL_Delay(50);
   OV5640_FocusReset();
   return 0;
 }
 
-/* 预览启动后置位 focus_start；状态机下载对焦固件并单次对焦。也可用 J-Link 再置位一次。 */
+/* J-Link 把 focus_start 写成 1，状态机才下载对焦固件并单次对焦。 */
 uint8_t focus_start;
 uint8_t focus_state;
 uint16_t focus_index;

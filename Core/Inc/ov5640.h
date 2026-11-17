@@ -48,7 +48,7 @@ void OV5640_SetJpeg(uint8_t on);
 void OV5640_GetSize(uint16_t *width, uint16_t *height);
 int OV5640_Zoom(int direction);
 int OV5640_Pan(int direction);
-/* 预览启动后自动下载对焦固件并单次对焦；也可用 J-Link 置位 focus_start 再跑一次。 */
+/* J-Link 置位 focus_start 后，由 FocusSweep 状态机下载固件并单次对焦。 */
 extern uint8_t focus_start;
 extern uint8_t focus_state;
 extern uint16_t focus_index;
