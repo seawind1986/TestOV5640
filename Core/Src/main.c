@@ -1313,7 +1313,7 @@ static void Shutter_Init(void)
   shutter_done = 0U;
 
   vcm_mail_magic = VCM_MAIL_MAGIC;
-  vcm_mail_target = 0U;
+  vcm_mail_target = 255U;
   vcm_mail_start = 0U;
   vcm_mail_value = 0U;
   vcm_mail_state = 0U;

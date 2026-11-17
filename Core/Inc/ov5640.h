@@ -60,7 +60,7 @@ void OV5640_FocusLoad(void);
 void OV5640_FocusSweep(void);
 /* 0 未启动，1 失败，2 对焦完成，3 进行中。 */
 uint8_t OV5640_FocusState(void);
-/* J-Link 写 vcm_target(0..1023) 再置位 vcm_start，状态机写入音圈 DAC。 */
+/* 上电默认 vcm_target=255；传感器复位后状态机会再写一次。也可由邮箱或 J-Link 改 0..1023。 */
 extern uint16_t vcm_target;
 extern uint16_t vcm_value;
 extern uint8_t vcm_start;

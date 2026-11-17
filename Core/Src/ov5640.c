@@ -1550,7 +1550,8 @@ static void OV5640_ReloadBase(void)
                          (uint32_t)(sizeof(ov5640_dvp) / sizeof(ov5640_dvp[0]) / 2U));
   HAL_Delay(50);
   OV5640_FocusReset();
-  vcm_start = 0U;
+  /* 传感器复位后音圈 DAC 回到硬件默认，按当前目标（上电为 255）再写一次。 */
+  vcm_start = 1U;
   vcm_state = 0U;
 }
 
@@ -1619,7 +1620,8 @@ int OV5640_SensorInit(void)
   /* 预览寄存器由 OV5640_RgbLcdPreview 写。对焦固件不自动下载。 */
   HAL_Delay(50);
   OV5640_FocusReset();
-  vcm_start = 0U;
+  /* 传感器复位后音圈 DAC 回到硬件默认，按当前目标（上电为 255）再写一次。 */
+  vcm_start = 1U;
   vcm_state = 0U;
   return 0;
 }
@@ -1631,7 +1633,7 @@ uint16_t focus_index;
 uint8_t focus_ready;
 uint8_t focus_phase;
 uint8_t focus_status;
-uint16_t vcm_target;
+uint16_t vcm_target = 255U;
 uint16_t vcm_value;
 uint8_t vcm_start;
 uint8_t vcm_state;
