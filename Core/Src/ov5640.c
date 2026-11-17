@@ -1881,6 +1881,21 @@ static int OV5640_VcmRead(uint16_t *code)
   return 0;
 }
 
+void OV5640_VcmRefresh(void)
+{
+  uint16_t code;
+
+  if (OV5640_VcmRead(&code) == 0)
+  {
+    vcm_value = code;
+    vcm_state = 1U;
+  }
+  else
+  {
+    vcm_state = 2U;
+  }
+}
+
 void OV5640_VcmSweep(void)
 {
   uint16_t code;

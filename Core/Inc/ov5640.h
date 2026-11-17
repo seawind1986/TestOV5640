@@ -66,6 +66,7 @@ extern uint16_t vcm_value;
 extern uint8_t vcm_start;
 extern uint8_t vcm_state;
 void OV5640_VcmSweep(void);
+void OV5640_VcmRefresh(void);
 /* bit7 是以太网 PHY 复位，高电平为退出复位。开发板走 PCF8574 的 P7。 */
 void OV5640_BoardIo(uint8_t bit, uint8_t high);
 

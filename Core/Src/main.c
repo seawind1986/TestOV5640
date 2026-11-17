@@ -112,11 +112,24 @@ volatile meter_failed_raw_t g_meter_failed_raw;
 #define VCM_MAIL_START_ADDR    (VCM_MAIL_ADDR + 8UL)
 #define VCM_MAIL_VALUE_ADDR    (VCM_MAIL_ADDR + 12UL)
 #define VCM_MAIL_STATE_ADDR    (VCM_MAIL_ADDR + 16UL)
+#define VCM_MAIL_READ_ADDR     (VCM_MAIL_ADDR + 20UL)
 #define vcm_mail_magic         (*(volatile uint32_t *)VCM_MAIL_ADDR)
 #define vcm_mail_target        (*(volatile uint32_t *)VCM_MAIL_TARGET_ADDR)
 #define vcm_mail_start         (*(volatile uint32_t *)VCM_MAIL_START_ADDR)
 #define vcm_mail_value         (*(volatile uint32_t *)VCM_MAIL_VALUE_ADDR)
 #define vcm_mail_state         (*(volatile uint32_t *)VCM_MAIL_STATE_ADDR)
+#define vcm_mail_read          (*(volatile uint32_t *)VCM_MAIL_READ_ADDR)
+
+/* 自动对焦邮箱：工具写 start=1，只发一次对焦（必要时先下载固件），不持续对焦。 */
+#define AF_MAIL_ADDR           0xC1FFF030UL
+#define AF_MAIL_MAGIC          0x41463031UL
+#define AF_MAIL_START_ADDR     (AF_MAIL_ADDR + 4UL)
+#define AF_MAIL_STATE_ADDR     (AF_MAIL_ADDR + 8UL)
+#define AF_MAIL_STATUS_ADDR    (AF_MAIL_ADDR + 12UL)
+#define af_mail_magic          (*(volatile uint32_t *)AF_MAIL_ADDR)
+#define af_mail_start          (*(volatile uint32_t *)AF_MAIL_START_ADDR)
+#define af_mail_state          (*(volatile uint32_t *)AF_MAIL_STATE_ADDR)
+#define af_mail_status         (*(volatile uint32_t *)AF_MAIL_STATUS_ADDR)
 /* SDCLK=100MHz，COUNT=64*1000*100/8192-20 */
 #define SDRAM_REFRESH_COUNT  761U
 #define SDRAM_TIMEOUT_MS     100U
@@ -289,6 +302,11 @@ int main(void)
     Shutter_Service(1U);
     CAM_ScaleToLcd();
     CAM_Service();
+    if (af_mail_start != 0U)
+    {
+      af_mail_start = 0U;
+      focus_start = 1U;
+    }
     OV5640_FocusSweep();
     if (vcm_mail_start != 0U)
     {
@@ -301,9 +319,16 @@ int main(void)
       vcm_start = 1U;
       vcm_mail_start = 0U;
     }
+    if (vcm_mail_read != 0U)
+    {
+      vcm_mail_read = 0U;
+      OV5640_VcmRefresh();
+    }
     OV5640_VcmSweep();
     vcm_mail_value = (uint32_t)vcm_value;
     vcm_mail_state = (uint32_t)vcm_state;
+    af_mail_state = (uint32_t)focus_phase;
+    af_mail_status = (uint32_t)focus_status;
     LCD_DemoFrame();
     if (g_meter_mode == METER_MODE_VOLUME)
     {
@@ -1317,6 +1342,11 @@ static void Shutter_Init(void)
   vcm_mail_start = 0U;
   vcm_mail_value = 0U;
   vcm_mail_state = 0U;
+  vcm_mail_read = 0U;
+  af_mail_magic = AF_MAIL_MAGIC;
+  af_mail_start = 0U;
+  af_mail_state = 0U;
+  af_mail_status = 0U;
 }
 
 /* 快门或定位冻结时，不再把新的镜头画面写到液晶或换屏。 */
