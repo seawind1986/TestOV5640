@@ -48,9 +48,11 @@ static volatile uint8_t ov5640_rb_bright;
 extern const uint32_t cam_shutter_us;
 extern const uint8_t cam_gain;
 
+static uint32_t sccb_delay_n = 8000U;
+
 static void SCCB_Delay(void)
 {
-  volatile uint32_t count = 8000U;
+  volatile uint32_t count = sccb_delay_n;
 
   while (count > 0U)
   {
@@ -1547,6 +1549,7 @@ static void OV5640_ReloadBase(void)
   (void)OV5640_WriteList(ov5640_dvp,
                          (uint32_t)(sizeof(ov5640_dvp) / sizeof(ov5640_dvp[0]) / 2U));
   HAL_Delay(50);
+  OV5640_FocusLoad();
 }
 
 void OV5640_RgbLcdNativeWindow(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
@@ -1561,8 +1564,7 @@ void OV5640_RgbLcdNativeWindow(uint16_t x, uint16_t y, uint16_t width, uint16_t 
   OV5640_RgbLcdFinish();
 }
 
-/* 10 秒一个来回：前 5 秒释放到最远，后 5 秒单次对焦。 */
-#define OV5640_FOCUS_PERIOD_MS 10000U
+/* 下载完成后立刻单次对焦；失败时再试几次，不再先拉到最远。 */
 
 int OV5640_SensorInit(void)
 {
@@ -1614,13 +1616,14 @@ int OV5640_SensorInit(void)
   {
     return -1;
   }
-  /* 预览寄存器由 OV5640_RgbLcdPreview 写。对焦固件不上电下载，AF 电源没接。 */
+  /* 预览寄存器由 OV5640_RgbLcdPreview 写。对焦固件在初始化成功后下载。 */
   HAL_Delay(50);
+  OV5640_FocusLoad();
   return 0;
 }
 
-static uint8_t focus_ready;
-static uint8_t focus_phase;
+uint8_t focus_ready;
+uint8_t focus_phase;
 static uint8_t focus_cmd;
 static uint8_t focus_kick;
 
@@ -1652,13 +1655,19 @@ static int OV5640_FocusDownload(void)
     return -1;
   }
   HAL_Delay(5);
-  for (i = 0U; i < n; i++)
   {
-    if (OV5640_WriteRetry(addr, OV5640_AF_Config[i]) != 0)
+    uint32_t saved_delay = sccb_delay_n;
+    sccb_delay_n = 400U;
+    for (i = 0U; i < n; i++)
     {
-      return -1;
+      if (OV5640_WriteRetry(addr, OV5640_AF_Config[i]) != 0)
+      {
+        sccb_delay_n = saved_delay;
+        return -1;
+      }
+      addr++;
     }
-    addr++;
+    sccb_delay_n = saved_delay;
   }
   (void)SCCB_WriteReg(0x3022U, 0x00U);
   (void)SCCB_WriteReg(0x3023U, 0x00U);
@@ -1703,57 +1712,52 @@ void OV5640_FocusLoad(void)
 
 void OV5640_FocusSweep(void)
 {
-  uint32_t half;
   uint8_t state = 0xFFU;
-  static uint32_t sent = 0xFFFFFFFFU;
   static uint32_t cmd_tick;
   static uint32_t poll_tick;
+  static uint8_t retries;
 
   if (focus_ready == 0U)
   {
     return;
   }
-  half = (HAL_GetTick() / (OV5640_FOCUS_PERIOD_MS / 2U)) & 1U;
-  if ((half != sent) || (focus_kick != 0U))
+  if (focus_kick != 0U)
   {
     focus_kick = 0U;
-    sent = half;
+    retries = 0U;
     focus_phase = 3U;
+    focus_cmd = 3U;
+    (void)SCCB_WriteReg(0x3022U, 0x03U);
     cmd_tick = HAL_GetTick();
-    if (half == 0U)
-    {
-      focus_cmd = 8U;
-      (void)SCCB_WriteReg(0x3023U, 0x01U);
-      (void)SCCB_WriteReg(0x3022U, 0x08U);
-    }
-    else
-    {
-      focus_cmd = 3U;
-      (void)SCCB_WriteReg(0x3022U, 0x03U);
-    }
-    poll_tick = HAL_GetTick();
+    poll_tick = cmd_tick;
+    return;
   }
   if ((focus_cmd == 0U) || ((HAL_GetTick() - poll_tick) < 50U))
   {
     return;
   }
   poll_tick = HAL_GetTick();
-  if (focus_cmd == 8U)
+  if ((SCCB_ReadReg(0x3029U, &state) == 0) && (state == 0x10U))
   {
-    if ((SCCB_ReadReg(0x3023U, &state) == 0) && (state == 0x00U))
+    focus_phase = 2U;
+    focus_cmd = 0U;
+    return;
+  }
+  if ((state == 0x20U) || ((HAL_GetTick() - cmd_tick) > 2000U))
+  {
+    if (retries < 4U)
+    {
+      retries++;
+      focus_phase = 3U;
+      focus_cmd = 3U;
+      (void)SCCB_WriteReg(0x3022U, 0x03U);
+      cmd_tick = HAL_GetTick();
+    }
+    else
     {
       focus_phase = 1U;
       focus_cmd = 0U;
     }
-  }
-  else if ((SCCB_ReadReg(0x3029U, &state) == 0) && (state == 0x10U))
-  {
-    focus_phase = 2U;
-    focus_cmd = 0U;
-  }
-  if ((focus_cmd != 0U) && ((HAL_GetTick() - cmd_tick) > 2000U))
-  {
-    focus_cmd = 0U;
   }
 }
 
