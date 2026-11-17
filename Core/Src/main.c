@@ -3241,6 +3241,7 @@ static void SpeedTrack_ApplyCrop(void)
                             g_cam_dbg.crop_sw, g_cam_dbg.crop_sh);
   CamDbg_Mark(3U);
   CAM_LoadView();
+  OV5640_VcmSweep();
   HAL_Delay(20);
   CamDbg_Mark(4U);
   CAM_Start();
@@ -3450,6 +3451,7 @@ static void StarMode_ApplyCrop(uint16_t lx, uint16_t ly, uint16_t lw, uint16_t l
                             g_cam_dbg.crop_sw, g_cam_dbg.crop_sh);
   CamDbg_Mark(3U);
   CAM_LoadView();
+  OV5640_VcmSweep();
   HAL_Delay(20);
   CamDbg_Mark(4U);
   CAM_Start();

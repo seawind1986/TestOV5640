@@ -1688,6 +1688,8 @@ void OV5640_FocusReset(void)
   focus_retries = 0U;
 }
 
+static int OV5640_VcmRead(uint16_t *code);
+
 void OV5640_FocusLoad(void)
 {
   focus_start = 1U;
@@ -1818,6 +1820,14 @@ void OV5640_FocusSweep(void)
       }
       if (state == 0x10U)
       {
+        uint16_t code;
+        /* 单次对焦锁定后记下音圈位置，裁窗复位后按此值再写回去。 */
+        if (OV5640_VcmRead(&code) == 0)
+        {
+          vcm_target = code;
+          vcm_value = code;
+          vcm_state = 1U;
+        }
         focus_phase = 2U;
         focus_state = FOCUS_ST_DONE;
         break;
@@ -1851,6 +1861,24 @@ uint8_t OV5640_FocusState(void)
     return 0U;
   }
   return focus_phase;
+}
+
+static int OV5640_VcmRead(uint16_t *code)
+{
+  uint8_t r3602;
+  uint8_t r3603;
+
+  if ((code == 0) || (SCCB_ReadReg(0x3602U, &r3602) != 0) || (SCCB_ReadReg(0x3603U, &r3603) != 0))
+  {
+    return -1;
+  }
+  /* 与写入格式相反：D[9:4] 在 0x3603[5:0]，D[3:0] 在 0x3602[7:4]。 */
+  *code = (uint16_t)((((uint16_t)r3603 & 0x3FU) << 4) | (((uint16_t)r3602 >> 4) & 0x0FU));
+  if (*code > 1023U)
+  {
+    *code = 1023U;
+  }
+  return 0;
 }
 
 void OV5640_VcmSweep(void)
