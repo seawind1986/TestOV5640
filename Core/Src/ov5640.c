@@ -1550,6 +1550,8 @@ static void OV5640_ReloadBase(void)
                          (uint32_t)(sizeof(ov5640_dvp) / sizeof(ov5640_dvp[0]) / 2U));
   HAL_Delay(50);
   OV5640_FocusReset();
+  vcm_start = 0U;
+  vcm_state = 0U;
 }
 
 void OV5640_RgbLcdNativeWindow(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
@@ -1617,6 +1619,8 @@ int OV5640_SensorInit(void)
   /* 预览寄存器由 OV5640_RgbLcdPreview 写。对焦固件不自动下载。 */
   HAL_Delay(50);
   OV5640_FocusReset();
+  vcm_start = 0U;
+  vcm_state = 0U;
   return 0;
 }
 
@@ -1627,6 +1631,10 @@ uint16_t focus_index;
 uint8_t focus_ready;
 uint8_t focus_phase;
 uint8_t focus_status;
+uint16_t vcm_target;
+uint16_t vcm_value;
+uint8_t vcm_start;
+uint8_t vcm_state;
 static uint32_t focus_tick;
 static uint32_t focus_poll;
 static uint8_t focus_retries;
@@ -1841,4 +1849,32 @@ uint8_t OV5640_FocusState(void)
     return 0U;
   }
   return focus_phase;
+}
+
+void OV5640_VcmSweep(void)
+{
+  uint16_t code;
+  uint8_t r3602;
+  uint8_t r3603;
+
+  if (vcm_start == 0U)
+  {
+    return;
+  }
+  vcm_start = 0U;
+  code = vcm_target;
+  if (code > 1023U)
+  {
+    code = 1023U;
+  }
+  /* 0x3602[7:4]=D[3:0]，[3:0]=S=0000 直接跳变；0x3603[5:0]=D[9:4]，bit7=PWDN=0。 */
+  r3602 = (uint8_t)((code & 0x0FU) << 4);
+  r3603 = (uint8_t)((code >> 4) & 0x3FU);
+  if ((OV5640_WriteRetry(0x3602U, r3602) != 0) || (OV5640_WriteRetry(0x3603U, r3603) != 0))
+  {
+    vcm_state = 2U;
+    return;
+  }
+  vcm_value = code;
+  vcm_state = 1U;
 }

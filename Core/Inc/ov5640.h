@@ -60,6 +60,12 @@ void OV5640_FocusLoad(void);
 void OV5640_FocusSweep(void);
 /* 0 未启动，1 失败，2 对焦完成，3 进行中。 */
 uint8_t OV5640_FocusState(void);
+/* J-Link 写 vcm_target(0..1023) 再置位 vcm_start，状态机写入音圈 DAC。 */
+extern uint16_t vcm_target;
+extern uint16_t vcm_value;
+extern uint8_t vcm_start;
+extern uint8_t vcm_state;
+void OV5640_VcmSweep(void);
 /* bit7 是以太网 PHY 复位，高电平为退出复位。开发板走 PCF8574 的 P7。 */
 void OV5640_BoardIo(uint8_t bit, uint8_t high);
 

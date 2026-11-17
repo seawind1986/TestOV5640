@@ -277,6 +277,7 @@ int main(void)
     CAM_ScaleToLcd();
     CAM_Service();
     OV5640_FocusSweep();
+    OV5640_VcmSweep();
     LCD_DemoFrame();
     if (g_meter_mode == METER_MODE_VOLUME)
     {
