@@ -58,7 +58,7 @@
 #define METER_MODE_VOLUME      0U
 #define METER_MODE_SPEED       1U
 #define METER_MODE_STAR        2U
-#define METER_MODE_DEFAULT     METER_MODE_STAR
+#define METER_MODE_DEFAULT     METER_MODE_SPEED
 #define MODE_REQUEST_NONE      0xFFFFFFFFUL
 volatile uint32_t g_meter_mode = METER_MODE_DEFAULT;
 volatile uint32_t g_meter_request = MODE_REQUEST_NONE; /* 0/1/2；调试写此值与按键走同一路径 */
